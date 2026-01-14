@@ -21,6 +21,7 @@ class result_info {
     fl cnnaffinity = 0;
     fl cnnvariance = 0;
     fl rmsd = -1;
+    fl referenceRMSD = -1;
     std::string molstr;
     std::string flexstr;
     std::string atominfo;
@@ -30,8 +31,8 @@ class result_info {
 
   public:
     result_info() { }
-    result_info(fl e, fl c, fl ca, fl cv, fl r, const model& m)
-        : energy(e), cnnscore(c), cnnaffinity(ca), cnnvariance(cv), rmsd(r), sdfvalid(false) {
+    result_info(fl e, fl c, fl ca, fl cv, fl r, fl refRMSD, const model& m)
+        : energy(e), cnnscore(c), cnnaffinity(ca), cnnvariance(cv), rmsd(r), referenceRMSD(refRMSD), sdfvalid(false) {
       setMolecule(m);
     }
 

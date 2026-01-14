@@ -252,13 +252,16 @@ void createSDFContext(OBMol& mol, vector<OBAtom*> atoms, sdfcontext& sc) {
   static boost::unordered_set<string> ignored_data =
       boost::assign::list_of("OpenBabel Symmetry Classes")("LSSR")("SSSR")
       ("MOL Chiral Flag")("SMILES Atom Order")("PartialCharges")
-      ("minimizedAffinity")("minimizedRMSD")("CNNscore")("CNNaffinity")
+      ("minimizedAffinity")("minimizedRMSD")("referenceRMSD")("CNNscore")("CNNaffinity")
       ("CNN_VS")("CNNaffinity_variance");
 
   sc.atoms.clear();
   sc.bonds.clear();
   sc.properties.clear();
   sc.name = mol.GetTitle();
+  if (sc.name.empty()) {
+    sc.name = "ligand";
+  }
 
   //setup mapping between atom indices (getIdx) and position in atoms
   boost::unordered_map<unsigned, unsigned> idx2atompos;

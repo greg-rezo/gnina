@@ -265,19 +265,24 @@ target_link_libraries(tognina   gninalib ${Boost_LIBRARIES} ${OpenBabel3_LIBRARI
 
 install(TARGETS gnina gninagrid gninatyper fromgnina tognina RUNTIME DESTINATION bin)
 
-# gninavis uses rdkit, which can be a pain to install, so gracefully deal with its absence 
-find_package(RDKit)
+# RDKit is required for symmetry-aware RMSD calculations
+find_package(RDKit REQUIRED)
+include_directories(${RDKIT_INCLUDE_DIR})
 
-if(RDKIT_FOUND)
-    include_directories(${RDKIT_INCLUDE_DIR})
-    set(rdkit_lib_line "-lFileParsers -lSmilesParse -lDepictor -lGraphMol -lRDGeometryLib -lRDGeneral -lSubstructMatch -lSubgraphs -lDataStructs")
-    
-    add_executable(gninavis gninavis/gninavis.cpp lib/CommandLine2/CommandLine.cpp gninavis/cnn_visualization.cpp gninavis/cnn_visualization.hpp)
-    target_link_libraries(gninavis  gninalib ${LIBMOLGRID_LIBRARY} ${Boost_LIBRARIES} ${OpenBabel3_LIBRARIES} ${RDKIT_LIBRARIES})
-    install(TARGETS gninavis RUNTIME DESTINATION bin)
-    
-else()
-    message(WARNING "RDKIT not found.  gninavis will NOT be built.")
-endif()
+# Link RDKit libraries for symmetry-aware RMSD calculations
+# We need MolAlign for getBestRMS, GraphMol for molecule handling, and their dependencies
+target_link_libraries(gnina
+    RDKitMolAlign
+    RDKitMolTransforms
+    RDKitSubstructMatch
+    RDKitGraphMol
+    RDKitFileParsers
+    RDKitSmilesParse
+    RDKitRDGeneral
+)
+
+add_executable(gninavis gninavis/gninavis.cpp lib/CommandLine2/CommandLine.cpp gninavis/cnn_visualization.cpp gninavis/cnn_visualization.hpp)
+target_link_libraries(gninavis  gninalib ${LIBMOLGRID_LIBRARY} ${Boost_LIBRARIES} ${OpenBabel3_LIBRARIES} ${RDKIT_LIBRARIES})
+install(TARGETS gninavis RUNTIME DESTINATION bin)
 
 

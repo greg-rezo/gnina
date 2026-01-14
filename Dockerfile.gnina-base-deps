@@ -1,6 +1,7 @@
 # Base image with all gnina dependencies pre-installed
 # This image is built once and reused for incremental builds
-FROM --platform=linux/amd64 nvidia/cuda:12.2.0-devel-ubuntu22.04
+# Using CUDA 12.1 to match libtorch cu121
+FROM --platform=linux/amd64 nvidia/cuda:12.1.0-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 

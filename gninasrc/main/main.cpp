@@ -30,6 +30,12 @@
 #include <torch/torch.h>
 #include <vector> // ligand paths
 
+// RDKit for symmetry-aware RMSD calculation
+#include <GraphMol/GraphMol.h>
+#include <GraphMol/MolOps.h>
+#include <GraphMol/MolAlign/AlignMolecules.h>
+#include <GraphMol/FileParsers/MolSupplier.h>
+
 #include "array3d.h"
 #include "box.h"
 #include "builtinscoring.h"
@@ -67,7 +73,7 @@
 
 #include <cuda_profiler_api.h>
 
-using namespace boost::iostreams;
+// Note: NOT using namespace boost::iostreams to avoid conflict with local tee class
 using boost::filesystem::path;
 
 void doing(int verbosity, const std::string &str, tee &log) {
@@ -181,6 +187,68 @@ std::string vina_remark(fl e, fl lb, fl ub) {
   return remark.str();
 }
 
+// Compute symmetry-aware RMSD between two coordinate sets using RDKit
+// Returns max_fl if calculation fails
+static fl compute_symmetry_rmsd(const vecv& coords_a, const vecv& coords_b,
+                                 const std::shared_ptr<RDKit::ROMol>& rdkit_mol) {
+  if (!rdkit_mol || coords_a.size() != coords_b.size() ||
+      coords_a.size() != rdkit_mol->getNumAtoms()) {
+    // Fall back to naive RMSD
+    return rmsd_upper_bound(coords_a, coords_b);
+  }
+
+  try {
+    // Create probe molecule with coords_a
+    RDKit::RWMol probe_mol(*rdkit_mol);
+    RDKit::Conformer& probe_conf = probe_mol.getConformer();
+    for (size_t i = 0; i < coords_a.size(); i++) {
+      probe_conf.setAtomPos(i, RDGeom::Point3D(coords_a[i][0], coords_a[i][1], coords_a[i][2]));
+    }
+
+    // Create reference molecule with coords_b
+    RDKit::RWMol ref_mol(*rdkit_mol);
+    RDKit::Conformer& ref_conf = ref_mol.getConformer();
+    for (size_t i = 0; i < coords_b.size(); i++) {
+      ref_conf.setAtomPos(i, RDGeom::Point3D(coords_b[i][0], coords_b[i][1], coords_b[i][2]));
+    }
+
+    // Use getBestRMS for symmetry-aware comparison
+    double rmsd = RDKit::MolAlign::getBestRMS(probe_mol, ref_mol);
+    return static_cast<fl>(rmsd);
+  } catch (...) {
+    // Fall back to naive RMSD
+    return rmsd_upper_bound(coords_a, coords_b);
+  }
+}
+
+// Find closest pose in container using symmetry-aware RMSD
+static std::pair<sz, fl> find_closest_symmetry(const vecv& coords, const output_container& out,
+                                                const std::shared_ptr<RDKit::ROMol>& rdkit_mol) {
+  std::pair<sz, fl> result(out.size(), max_fl);
+  VINA_FOR_IN(i, out) {
+    fl rmsd = compute_symmetry_rmsd(coords, out[i].coords, rdkit_mol);
+    if (i == 0 || rmsd < result.second) {
+      result = std::make_pair(i, rmsd);
+    }
+  }
+  return result;
+}
+
+// Remove redundant poses using symmetry-aware RMSD
+output_container remove_redundant(const output_container& in, fl min_rmsd,
+                                   const std::shared_ptr<RDKit::ROMol>& rdkit_mol) {
+  output_container tmp;
+
+  VINA_FOR_IN(i, in) {
+    std::pair<sz, fl> closest_rmsd = find_closest_symmetry(in[i].coords, tmp, rdkit_mol);
+    if (closest_rmsd.first >= tmp.size() || closest_rmsd.second > min_rmsd) {
+      tmp.push_back(new output_type(in[i])); // not redundant
+    }
+  }
+  return tmp;
+}
+
+// Legacy version without RDKit (for compatibility)
 output_container remove_redundant(const output_container &in, fl min_rmsd) {
   output_container tmp;
 
@@ -208,8 +276,55 @@ static void get_cnn_info(model &m, DLScorer &cnn, tee &log, float &cnnscore, flo
   }
 }
 
+// Reference data for symmetry-aware RMSD calculation using RDKit
+struct reference_data {
+  vecv coords;
+  std::shared_ptr<RDKit::ROMol> rdkit_mol;
+};
+
+// Compute symmetry-aware RMSD between current model pose and reference coordinates
+// Uses RDKit's getBestRMS which handles molecular symmetry via graph automorphisms
+// Returns -1 if reference is not available or calculation fails
+static fl compute_reference_rmsd(const model &m, const boost::optional<reference_data> &ref) {
+  if (!ref || !ref->rdkit_mol || ref->coords.empty()) return -1;
+
+  try {
+    // Get current heavy atom coordinates from model
+    vecv current_coords;
+    const atomv& atoms = m.get_movable_atoms();
+    const vecv& coords = m.coordinates();
+    for (size_t i = 0; i < m.num_movable_atoms(); i++) {
+      if (!atoms[i].is_hydrogen()) {
+        current_coords.push_back(coords[i]);
+      }
+    }
+
+    if (current_coords.size() != ref->coords.size()) return -1;
+    if (current_coords.size() != ref->rdkit_mol->getNumAtoms()) return -1;
+
+    // Create a copy of the reference molecule for the probe (current pose)
+    RDKit::RWMol probe_mol(*ref->rdkit_mol);
+
+    // Update probe molecule coordinates with current pose
+    RDKit::Conformer &conf = probe_mol.getConformer();
+    for (size_t i = 0; i < current_coords.size(); i++) {
+      conf.setAtomPos(i, RDGeom::Point3D(current_coords[i][0],
+                                          current_coords[i][1],
+                                          current_coords[i][2]));
+    }
+
+    // Use getBestRMS which accounts for molecular symmetry
+    // It finds the optimal atom mapping that minimizes RMSD
+    double rmsd = RDKit::MolAlign::getBestRMS(probe_mol, *ref->rdkit_mol);
+    return static_cast<fl>(rmsd);
+  } catch (...) {
+    return -1;
+  }
+}
+
 // dkoes - return all energies and rmsds to original conf with result
-void do_search(model &m, const boost::optional<model> &ref, const weighted_terms &sf, const precalculate &prec,
+void do_search(model &m, const boost::optional<model> &ref, const boost::optional<reference_data> &ref_data,
+               const weighted_terms &sf, const precalculate &prec,
                igrid &ig,
                non_cache &nc, // nc.slope is changed
                const vec &corner1, const vec &corner2, const parallel_mc &par, const user_settings &settings,
@@ -265,7 +380,7 @@ void do_search(model &m, const boost::optional<model> &ref, const weighted_terms
       }
       log << '\n';
 
-      results.push_back(result_info(e, cnnscore, cnnaffinity, cnnvariance, -1, m));
+      results.push_back(result_info(e, cnnscore, cnnaffinity, cnnvariance, -1, compute_reference_rmsd(m, ref_data), m));
 
       if (compute_atominfo)
         results.back().setAtomValues(m, &sf);
@@ -273,17 +388,15 @@ void do_search(model &m, const boost::optional<model> &ref, const weighted_terms
       // Parallel BFGS minimize from input pose
       if (!settings.gpu_docking) {
         log << "ERROR: --bfgs_only --local_only requires GPU docking.\n";
-        log << "Falling back to standard local_only mode.\n";
         log.endl();
-        goto standard_local_only;
+        throw std::runtime_error("--bfgs_only requires GPU docking");
       }
 
       cache_gpu* cgpu = dynamic_cast<cache_gpu*>(&ig);
       if (!cgpu) {
         log << "ERROR: --bfgs_only --local_only requires grid caching.\n";
-        log << "Falling back to standard local_only mode.\n";
         log.endl();
-        goto standard_local_only;
+        throw std::runtime_error("--bfgs_only requires grid caching");
       }
 
       vecv origcoords = m.get_heavy_atom_movable_coords();
@@ -352,7 +465,7 @@ void do_search(model &m, const boost::optional<model> &ref, const weighted_terms
         log << "WARNING: not all movable atoms are within the search space\n";
 
       done(settings.verbosity, log);
-      results.push_back(result_info(e, cnnscore, cnnaffinity, cnnvariance, rmsd, m));
+      results.push_back(result_info(e, cnnscore, cnnaffinity, cnnvariance, rmsd, compute_reference_rmsd(m, ref_data), m));
 
       if (compute_atominfo)
         results.back().setAtomValues(m, &sf);
@@ -395,7 +508,7 @@ void do_search(model &m, const boost::optional<model> &ref, const weighted_terms
         log << "WARNING: not all movable atoms are within the search space\n";
 
       done(settings.verbosity, log);
-      results.push_back(result_info(e, cnnscore, cnnaffinity, cnnvariance, rmsd, m));
+      results.push_back(result_info(e, cnnscore, cnnaffinity, cnnvariance, rmsd, compute_reference_rmsd(m, ref_data), m));
 
       if (compute_atominfo)
         results.back().setAtomValues(m, &sf);
@@ -403,18 +516,16 @@ void do_search(model &m, const boost::optional<model> &ref, const weighted_terms
       // Parallel BFGS without Monte Carlo - requires GPU
       if (!settings.gpu_docking) {
         log << "ERROR: --bfgs_only requires GPU docking (--gpu_docking flag or cnn scoring).\n";
-        log << "Falling back to standard docking.\n";
         log.endl();
-        goto standard_docking;
+        throw std::runtime_error("--bfgs_only requires GPU docking");
       }
 
       // Try to get cache_gpu info
       cache_gpu* cgpu = dynamic_cast<cache_gpu*>(&ig);
       if (!cgpu) {
         log << "ERROR: --bfgs_only requires grid caching. Cannot use with no_cache mode.\n";
-        log << "Falling back to standard docking.\n";
         log.endl();
-        goto standard_docking;
+        throw std::runtime_error("--bfgs_only requires grid caching");
       }
 
       log << "Running parallel BFGS (exhaustiveness=" << settings.exhaustiveness
@@ -532,7 +643,12 @@ void do_search(model &m, const boost::optional<model> &ref, const weighted_terms
       };
 
       out_cont.sort(sorter);
-      out_cont = remove_redundant(out_cont, settings.out_min_rmsd);
+      // Use symmetry-aware RMSD for clustering if RDKit mol is available
+      if (ref_data && ref_data->rdkit_mol) {
+        out_cont = remove_redundant(out_cont, settings.out_min_rmsd, ref_data->rdkit_mol);
+      } else {
+        out_cont = remove_redundant(out_cont, settings.out_min_rmsd);
+      }
       done(settings.verbosity, log);
 
       log.setf(std::ios::fixed, std::ios::floatfield);
@@ -561,7 +677,7 @@ void do_search(model &m, const boost::optional<model> &ref, const weighted_terms
         log.endl();
 
         results.push_back(
-            result_info(out_cont[i].e, out_cont[i].cnnscore, out_cont[i].cnnaffinity, out_cont[i].cnnvariance, -1, m));
+            result_info(out_cont[i].e, out_cont[i].cnnscore, out_cont[i].cnnaffinity, out_cont[i].cnnvariance, -1, compute_reference_rmsd(m, ref_data), m));
 
         if (compute_atominfo)
           results.back().setAtomValues(m, &sf);
@@ -621,7 +737,12 @@ void do_search(model &m, const boost::optional<model> &ref, const weighted_terms
       };
 
       out_cont.sort(sorter);
-      out_cont = remove_redundant(out_cont, settings.out_min_rmsd);
+      // Use symmetry-aware RMSD for clustering if RDKit mol is available
+      if (ref_data && ref_data->rdkit_mol) {
+        out_cont = remove_redundant(out_cont, settings.out_min_rmsd, ref_data->rdkit_mol);
+      } else {
+        out_cont = remove_redundant(out_cont, settings.out_min_rmsd);
+      }
 
       done(settings.verbosity, log);
 
@@ -652,7 +773,7 @@ void do_search(model &m, const boost::optional<model> &ref, const weighted_terms
 
         // dkoes - setup result_info
         results.push_back(
-            result_info(out_cont[i].e, out_cont[i].cnnscore, out_cont[i].cnnaffinity, out_cont[i].cnnvariance, -1, m));
+            result_info(out_cont[i].e, out_cont[i].cnnscore, out_cont[i].cnnaffinity, out_cont[i].cnnvariance, -1, compute_reference_rmsd(m, ref_data), m));
 
         if (compute_atominfo)
           results.back().setAtomValues(m, &sf);
@@ -693,6 +814,50 @@ void main_procedure(model &m, precalculate &prec,
                     const user_settings &settings, bool no_cache, bool compute_atominfo, const grid_dims &gd,
                     minimization_params minparm, const weighted_terms &wt, tee &log, std::vector<result_info> &results,
                     grid &user_grid, DLScorer &cnn) {
+  // Store reference data from initial ligand pose for symmetry-aware RMSD calculation
+  boost::optional<reference_data> ref_data;
+  {
+    const atomv& atoms = m.get_movable_atoms();
+    const vecv& coords = m.coordinates();
+    reference_data data;
+    for (size_t i = 0; i < m.num_movable_atoms(); i++) {
+      if (!atoms[i].is_hydrogen()) {
+        data.coords.push_back(coords[i]);
+      }
+    }
+    if (!data.coords.empty()) {
+      // Create RDKit molecule from model for symmetry-aware RMSD
+      try {
+        // Write model to SDF string then parse with RDKit
+        std::stringstream sdf_ss;
+        bool sdfvalid = false;
+        m.write_ligand(sdf_ss, sdfvalid);
+        std::string sdf_str = sdf_ss.str();
+        // Add SDF terminator if not present
+        if (sdf_str.find("$$$$") == std::string::npos) {
+          sdf_str += "$$$$\n";
+        }
+        // Parse SDF with RDKit, removing hydrogens for heavy atom RMSD
+        RDKit::SDMolSupplier supplier;
+        supplier.setData(sdf_str);
+        if (!supplier.atEnd()) {
+          RDKit::ROMol *mol = supplier.next();
+          if (mol) {
+            // Remove hydrogens to match heavy atom RMSD
+            data.rdkit_mol = std::shared_ptr<RDKit::ROMol>(
+                RDKit::MolOps::removeHs(*mol));
+            delete mol;
+          }
+        }
+      } catch (...) {
+        // Failed to create RDKit mol, referenceRMSD will be -1
+      }
+      if (data.rdkit_mol) {
+        ref_data = data;
+      }
+    }
+  }
+
   doing(settings.verbosity, "Setting up the scoring function", log);
 
   done(settings.verbosity, log);
@@ -730,7 +895,7 @@ void main_procedure(model &m, precalculate &prec,
   if (settings.randomize_only) {
     for (unsigned i = 0; i < settings.num_modes; i++) {
       fl e = do_randomization(m, corner1, corner2, settings.seed + i, settings.verbosity, log);
-      results.push_back(result_info(e, -1, 0, 0, -1, m));
+      results.push_back(result_info(e, -1, 0, 0, -1, compute_reference_rmsd(m, ref_data), m));
     }
     return;
   } else {
@@ -748,7 +913,7 @@ void main_procedure(model &m, precalculate &prec,
     }
 
     if (no_cache || settings.cnnopts.cnn_scoring == CNNall) {
-      do_search(m, ref, wt, prec, *nc, *nc, corner1, corner2, par, settings, compute_atominfo, log,
+      do_search(m, ref, ref_data, wt, prec, *nc, *nc, corner1, corner2, par, settings, compute_atominfo, log,
                 wt.unweighted_terms(), user_grid, cnn, results, gridcache, gd, slope);
     } else {
       // Cache is needed for bfgs_only mode even with local_only
@@ -806,7 +971,7 @@ void main_procedure(model &m, precalculate &prec,
         }
       }
 
-      do_search(m, ref, wt, prec, *c, *nc, corner1, corner2, par, settings, compute_atominfo, log,
+      do_search(m, ref, ref_data, wt, prec, *c, *nc, corner1, corner2, par, settings, compute_atominfo, log,
                 wt.unweighted_terms(), user_grid, cnn, results, gridcache, gd, slope);
     }
 

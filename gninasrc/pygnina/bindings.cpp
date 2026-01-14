@@ -190,7 +190,7 @@ public:
     cnn->set_center_from_model(m);
     cnnscore = cnn->score(m, false, cnnaffinity, loss, cnnvariance);
 
-    return result_info(e, cnnscore, cnnaffinity, cnnvariance, -1, m);
+    return result_info(e, cnnscore, cnnaffinity, cnnvariance, -1, -1, m);
   }
 
   result_info minimize(const std::string &ligand, const std::string &format, float scale = 0) {

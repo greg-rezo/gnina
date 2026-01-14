@@ -130,6 +130,11 @@ void result_info::write(std::ostream& out, const std::string& ext,
       out << std::fixed << std::setprecision(5) << rmsd << "\n\n";
     }
 
+    if (referenceRMSD >= 0) {
+      out << "> <referenceRMSD>\n";
+      out << std::fixed << std::setprecision(5) << referenceRMSD << "\n\n";
+    }
+
     if (cnnscore >= 0) {
       out << "> <CNNscore>\n";
       out << std::fixed << std::setprecision(10) << cnnscore << "\n\n";
@@ -163,6 +168,9 @@ void result_info::write(std::ostream& out, const std::string& ext,
       if (rmsd >= 0)
         out << "REMARK minimizedRMSD "
             << boost::lexical_cast<std::string>((float) rmsd) << "\n";
+      if (referenceRMSD >= 0)
+        out << "REMARK referenceRMSD "
+            << boost::lexical_cast<std::string>((float) referenceRMSD) << "\n";
       if (cnnscore >= 0)
         out << "REMARK CNNscore "
             << boost::lexical_cast<std::string>((float) cnnscore) << "\n";
@@ -188,6 +196,10 @@ void result_info::write(std::ostream& out, const std::string& ext,
       if (rmsd >= 0) {
         setMolData(format, mol, "minimizedRMSD",
             boost::lexical_cast<std::string>((float) rmsd));
+      }
+      if (referenceRMSD >= 0) {
+        setMolData(format, mol, "referenceRMSD",
+            boost::lexical_cast<std::string>((float) referenceRMSD));
       }
       if (cnnscore >= 0) {
         setMolData(format, mol, "CNNscore",
