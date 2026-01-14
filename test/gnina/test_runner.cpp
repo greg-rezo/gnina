@@ -70,6 +70,27 @@ BOOST_AUTO_TEST_CASE(numerical_gradient) {
   boost_loop_test(&test_bfgs_numerical_gradient);
 }
 
+// CPU vs GPU comparison tests (tight tolerances)
+BOOST_AUTO_TEST_CASE(search_direction_cpu_vs_gpu) {
+  boost_loop_test(&test_bfgs_search_direction_cpu_vs_gpu);
+}
+
+BOOST_AUTO_TEST_CASE(hessian_update_cpu_vs_gpu) {
+  boost_loop_test(&test_bfgs_hessian_update_cpu_vs_gpu);
+}
+
+BOOST_AUTO_TEST_CASE(line_search_cpu_vs_gpu) {
+  boost_loop_test(&test_bfgs_line_search_cpu_vs_gpu);
+}
+
+BOOST_AUTO_TEST_CASE(single_step_cpu_vs_gpu) {
+  boost_loop_test(&test_bfgs_single_step_cpu_vs_gpu);
+}
+
+BOOST_AUTO_TEST_CASE(trajectory_cpu_vs_gpu) {
+  boost_loop_test(&test_bfgs_trajectory_cpu_vs_gpu);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 
