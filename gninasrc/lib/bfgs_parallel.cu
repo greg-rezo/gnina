@@ -7,6 +7,7 @@
 
 #include "bfgs_parallel.h"
 #include "model.h"
+#include "conf.h"
 #include "quaternion.h"
 #include "curl.h"
 #include "gpu_util.h"
@@ -1441,4 +1442,286 @@ void run_parallel_bfgs_docking(
     free_batch_memory(mem);
     cudaFree(d_contexts);
     cudaFree(d_optimizer_to_ligand);
+}
+
+// ============================================================================
+// Conf <-> Flat Array Conversion Helpers
+// ============================================================================
+
+void conf_to_flat(
+    const conf& c,
+    unsigned nlig_roots,
+    unsigned n_torsions,
+    float* flat_conf
+) {
+    // Convert ligand rigid bodies
+    for (unsigned i = 0; i < nlig_roots && i < c.ligands.size(); i++) {
+        const rigid_conf& rc = c.ligands[i].rigid;
+        // Position
+        flat_conf[i * 7 + 0] = rc.position[0];
+        flat_conf[i * 7 + 1] = rc.position[1];
+        flat_conf[i * 7 + 2] = rc.position[2];
+        // Quaternion (w, x, y, z)
+        flat_conf[i * 7 + 3] = rc.orientation.R_component_1();
+        flat_conf[i * 7 + 4] = rc.orientation.R_component_2();
+        flat_conf[i * 7 + 5] = rc.orientation.R_component_3();
+        flat_conf[i * 7 + 6] = rc.orientation.R_component_4();
+    }
+
+    // Convert torsions
+    unsigned torsion_idx = 0;
+    for (unsigned i = 0; i < c.ligands.size() && torsion_idx < n_torsions; i++) {
+        for (unsigned j = 0; j < c.ligands[i].torsions.size() && torsion_idx < n_torsions; j++) {
+            flat_conf[nlig_roots + 6 * nlig_roots + torsion_idx] = c.ligands[i].torsions[j];
+            torsion_idx++;
+        }
+    }
+}
+
+void flat_to_conf(
+    const float* flat_conf,
+    unsigned nlig_roots,
+    unsigned n_torsions,
+    conf& c
+) {
+    // Convert ligand rigid bodies
+    for (unsigned i = 0; i < nlig_roots && i < c.ligands.size(); i++) {
+        rigid_conf& rc = c.ligands[i].rigid;
+        // Position
+        rc.position[0] = flat_conf[i * 7 + 0];
+        rc.position[1] = flat_conf[i * 7 + 1];
+        rc.position[2] = flat_conf[i * 7 + 2];
+        // Quaternion
+        rc.orientation = qt(
+            flat_conf[i * 7 + 3],
+            flat_conf[i * 7 + 4],
+            flat_conf[i * 7 + 5],
+            flat_conf[i * 7 + 6]
+        );
+    }
+
+    // Convert torsions
+    unsigned torsion_idx = 0;
+    for (unsigned i = 0; i < c.ligands.size() && torsion_idx < n_torsions; i++) {
+        for (unsigned j = 0; j < c.ligands[i].torsions.size() && torsion_idx < n_torsions; j++) {
+            c.ligands[i].torsions[j] = flat_conf[nlig_roots + 6 * nlig_roots + torsion_idx];
+            torsion_idx++;
+        }
+    }
+}
+
+// ============================================================================
+// Single-Pose Minimize Kernel
+// ============================================================================
+
+// Kernel for minimizing a single pose (or N copies of the same pose)
+__global__ void bfgs_minimize_kernel(
+    const float* initial_conf,
+    const ScoringContext* contexts,
+    BFGSBatchMemory mem,
+    int max_iterations,
+    int n_optimizers
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n_optimizers) return;
+
+    // All optimizers use the same ligand (ligand 0)
+    const ScoringContext& ctx = contexts[0];
+
+    // Set up pointers into batch memory
+    BFGSState state;
+    state.x = &mem.all_x[tid * mem.max_conf_size];
+    state.x_new = &mem.all_x_new[tid * mem.max_conf_size];
+    state.g = &mem.all_g[tid * mem.max_change_size];
+    state.g_new = &mem.all_g_new[tid * mem.max_change_size];
+    state.p = &mem.all_p[tid * mem.max_change_size];
+    state.y = &mem.all_y[tid * mem.max_change_size];
+    state.h = &mem.all_h[tid * mem.max_hessian_size];
+    state.coords = &mem.all_coords[tid * mem.max_atoms * 3];
+    state.forces = &mem.all_forces[tid * mem.max_atoms * 3];
+    state.node_forces = &mem.all_node_forces[tid * mem.max_nodes * 3];
+    state.node_torques = &mem.all_node_torques[tid * mem.max_nodes * 3];
+    state.ligand_id = 0;
+
+    // Initialize from input conf (same for all threads in minimize mode)
+    for (int i = 0; i < ctx.n_conf; i++) {
+        state.x[i] = initial_conf[i];
+    }
+
+    // Scratch for node state during set_conf
+    float node_origins[PARALLEL_MAX_TORSIONS * 3];
+    float node_orientations[PARALLEL_MAX_TORSIONS * 9];
+
+    // Initial energy and gradient
+    set_conf_single_thread(ctx, state.x, state.coords, node_origins, node_orientations);
+    state.energy = eval_energy_grid_single_thread(ctx, state.coords, state.forces);
+    state.energy += eval_intramolecular_single_thread(ctx, state.coords, state.forces);
+    compute_gradient_single_thread(ctx, state.coords, state.forces, node_origins,
+                                   state.node_forces, state.node_torques, state.g);
+    state.best_energy = state.energy;
+
+    // Save best conf
+    for (int i = 0; i < ctx.n_conf; i++) {
+        mem.all_best_confs[tid * mem.max_conf_size + i] = state.x[i];
+    }
+
+    // Initialize Hessian to identity
+    int hess_size = ctx.n_change * (ctx.n_change + 1) / 2;
+    for (int i = 0; i < hess_size; i++) {
+        state.h[i] = 0;
+    }
+    for (int i = 0; i < ctx.n_change; i++) {
+        int idx = i + i * (i + 1) / 2;
+        state.h[idx] = 1.0f;
+    }
+
+    // BFGS iterations
+    for (int iter = 0; iter < max_iterations; iter++) {
+        // Compute search direction: p = -H * g
+        for (int i = 0; i < ctx.n_change; i++) {
+            state.p[i] = 0;
+            for (int j = 0; j < ctx.n_change; j++) {
+                int idx = (i <= j) ? (i + j * (j + 1) / 2) : (j + i * (i + 1) / 2);
+                state.p[i] += state.h[idx] * state.g[j];
+            }
+            state.p[i] = -state.p[i];
+        }
+
+        // Line search
+        float f_new;
+        float alpha = accurate_line_search_single_thread(
+            ctx, state.x, state.x_new, state.g, state.p,
+            state.energy, state.coords, state.forces,
+            state.node_forces, state.node_torques, state.g_new, f_new
+        );
+
+        // Check for line search failure
+        if (alpha == 0) {
+            break;
+        }
+
+        // y = g_new - g
+        for (int i = 0; i < ctx.n_change; i++) {
+            state.y[i] = state.g_new[i] - state.g[i];
+        }
+
+        // Shanno-Phua scaling on first iteration
+        if (iter == 0) {
+            float yy = 0;
+            float yp = 0;
+            for (int i = 0; i < ctx.n_change; i++) {
+                yy += state.y[i] * state.y[i];
+                yp += state.y[i] * state.p[i];
+            }
+            if (yy > epsilon_fl) {
+                float scale = alpha * yp / yy;
+                int hess_size = ctx.n_change * (ctx.n_change + 1) / 2;
+                for (int i = 0; i < hess_size; i++) {
+                    state.h[i] = 0;
+                }
+                for (int i = 0; i < ctx.n_change; i++) {
+                    int idx = i + i * (i + 1) / 2;
+                    state.h[idx] = scale;
+                }
+            }
+        }
+
+        // BFGS Hessian update
+        bfgs_hessian_update_single_thread(state.h, state.p, state.y, alpha, ctx.n_change);
+
+        // Accept step
+        for (int i = 0; i < ctx.n_conf; i++) {
+            state.x[i] = state.x_new[i];
+        }
+        for (int i = 0; i < ctx.n_change; i++) {
+            state.g[i] = state.g_new[i];
+        }
+        state.energy = f_new;
+
+        // Track best
+        if (state.energy < state.best_energy) {
+            state.best_energy = state.energy;
+            for (int i = 0; i < ctx.n_conf; i++) {
+                mem.all_best_confs[tid * mem.max_conf_size + i] = state.x[i];
+            }
+        }
+    }
+
+    // Store final results
+    mem.all_energies[tid] = state.energy;
+    mem.all_best_energies[tid] = state.best_energy;
+}
+
+// ============================================================================
+// Local Minimization Interface
+// ============================================================================
+
+void run_parallel_bfgs_minimize(
+    const gpu_data& gdata,
+    const GPUCacheInfo& cacheInfo,
+    const std::vector<float>& input_conf,
+    int max_iterations,
+    float& out_energy,
+    float& out_intramolecular,
+    std::vector<float>& out_conf
+) {
+    // Create scoring context
+    ScoringContext ctx;
+    create_scoring_context(ctx, gdata, cacheInfo);
+
+    // Allocate context on device
+    ScoringContext* d_contexts;
+    CUDA_CHECK_GNINA(cudaMalloc(&d_contexts, sizeof(ScoringContext)));
+    CUDA_CHECK_GNINA(cudaMemcpy(d_contexts, &ctx, sizeof(ScoringContext), cudaMemcpyHostToDevice));
+
+    // Copy input conf to device
+    float* d_input_conf;
+    CUDA_CHECK_GNINA(cudaMalloc(&d_input_conf, input_conf.size() * sizeof(float)));
+    CUDA_CHECK_GNINA(cudaMemcpy(d_input_conf, input_conf.data(),
+                                input_conf.size() * sizeof(float), cudaMemcpyHostToDevice));
+
+    // For minimize, we just need 1 optimizer
+    int n_optimizers = 1;
+
+    // Allocate batch memory
+    BFGSBatchMemory mem;
+    int max_conf = ctx.n_conf > 0 ? ctx.n_conf : PARALLEL_MAX_CONF_SIZE;
+    int max_change = ctx.n_change > 0 ? ctx.n_change : PARALLEL_MAX_CHANGE_SIZE;
+    int max_atoms = ctx.num_atoms > 0 ? ctx.num_atoms : PARALLEL_MAX_ATOMS;
+    int max_nodes = ctx.num_nodes > 0 ? ctx.num_nodes : PARALLEL_MAX_TORSIONS;
+
+    allocate_batch_memory(mem, n_optimizers, max_conf, max_change, max_atoms, max_nodes);
+
+    // Launch minimize kernel (single thread is fine)
+    bfgs_minimize_kernel<<<1, 1>>>(
+        d_input_conf,
+        d_contexts,
+        mem,
+        max_iterations,
+        n_optimizers
+    );
+
+    // Synchronize
+    CUDA_CHECK_GNINA(cudaDeviceSynchronize());
+
+    // Collect results
+    float best_energy;
+    CUDA_CHECK_GNINA(cudaMemcpy(&best_energy, mem.all_best_energies,
+                                sizeof(float), cudaMemcpyDeviceToHost));
+
+    out_conf.resize(max_conf);
+    CUDA_CHECK_GNINA(cudaMemcpy(out_conf.data(), mem.all_best_confs,
+                                max_conf * sizeof(float), cudaMemcpyDeviceToHost));
+
+    // The energy from BFGS is total (inter + intra)
+    // We need to compute intramolecular separately for reporting
+    // For now, return the total energy as inter-adjusted
+    // (TODO: compute proper intramolecular on final pose)
+    out_energy = best_energy;
+    out_intramolecular = 0;  // Will be computed by caller using model
+
+    // Cleanup
+    free_batch_memory(mem);
+    cudaFree(d_contexts);
+    cudaFree(d_input_conf);
 }

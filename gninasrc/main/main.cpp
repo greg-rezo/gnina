@@ -269,7 +269,95 @@ void do_search(model &m, const boost::optional<model> &ref, const weighted_terms
 
       if (compute_atominfo)
         results.back().setAtomValues(m, &sf);
+    } else if (settings.bfgs_only && settings.local_only) {
+      // Parallel BFGS minimize from input pose
+      if (!settings.gpu_docking) {
+        log << "ERROR: --bfgs_only --local_only requires GPU docking.\n";
+        log << "Falling back to standard local_only mode.\n";
+        log.endl();
+        goto standard_local_only;
+      }
+
+      cache_gpu* cgpu = dynamic_cast<cache_gpu*>(&ig);
+      if (!cgpu) {
+        log << "ERROR: --bfgs_only --local_only requires grid caching.\n";
+        log << "Falling back to standard local_only mode.\n";
+        log.endl();
+        goto standard_local_only;
+      }
+
+      vecv origcoords = m.get_heavy_atom_movable_coords();
+
+      log << "Running parallel BFGS minimize (iterations=" << settings.bfgs_iterations << ")\n";
+      log.endl();
+
+      doing(settings.verbosity, "Performing parallel BFGS local search", log);
+
+      const GPUCacheInfo& cacheInfo = cgpu->get_info();
+
+      // Convert conf to flat array format
+      unsigned nlig_roots = 1;  // Typically 1 for single ligand
+      unsigned n_torsions = 0;
+      if (!c.ligands.empty()) {
+        n_torsions = c.ligands[0].torsions.size();
+      }
+      int conf_size = 7 * nlig_roots + n_torsions;
+
+      std::vector<float> input_conf(conf_size);
+      conf_to_flat(c, nlig_roots, n_torsions, input_conf.data());
+
+      // Run parallel BFGS minimize
+      float out_energy, out_intramolecular;
+      std::vector<float> out_conf;
+
+      run_parallel_bfgs_minimize(
+          m.gdata, cacheInfo,
+          input_conf,
+          settings.bfgs_iterations,
+          out_energy, out_intramolecular,
+          out_conf
+      );
+
+      done(settings.verbosity, log);
+
+      // Convert result back to conf
+      flat_to_conf(out_conf.data(), nlig_roots, n_torsions, c);
+      m.set(c);
+
+      // Compute proper energies using model for accurate reporting
+      naive_non_cache nnc(&exact_prec);
+      fl intramolecular_energy = m.eval_intramolecular(exact_prec, authentic_v, c);
+      e = m.eval_adjusted(sf, exact_prec, nnc, authentic_v, c, intramolecular_energy, user_grid);
+
+      get_cnn_info(m, cnn, log, cnnscore, cnnaffinity, cnnvariance);
+
+      vecv newcoords = m.get_heavy_atom_movable_coords();
+      assert(newcoords.size() == origcoords.size());
+      for (unsigned i = 0, n = newcoords.size(); i < n; i++) {
+        rmsd += (newcoords[i] - origcoords[i]).norm_sqr();
+      }
+      rmsd /= newcoords.size();
+      rmsd = sqrt(rmsd);
+
+      log << "Affinity: " << std::fixed << std::setprecision(5) << e << "  " << intramolecular_energy
+          << " (kcal/mol)\nRMSD: " << rmsd << "\n";
+      log << "CNNscore: " << std::fixed << std::setprecision(5) << cnnscore << " "
+          << "\nCNNaffinity: " << cnnaffinity;
+      if (cnnvariance > 0) {
+        log << "\nCNNvariance: " << std::fixed << std::setprecision(5) << cnnvariance;
+      }
+      log.endl();
+
+      if (!nc.within(m))
+        log << "WARNING: not all movable atoms are within the search space\n";
+
+      done(settings.verbosity, log);
+      results.push_back(result_info(e, cnnscore, cnnaffinity, cnnvariance, rmsd, m));
+
+      if (compute_atominfo)
+        results.back().setAtomValues(m, &sf);
     } else if (settings.local_only) {
+      standard_local_only:
       vecv origcoords = m.get_heavy_atom_movable_coords();
       output_type out(c, e);
       doing(settings.verbosity, "Performing local search", log);
@@ -663,7 +751,9 @@ void main_procedure(model &m, precalculate &prec,
       do_search(m, ref, wt, prec, *nc, *nc, corner1, corner2, par, settings, compute_atominfo, log,
                 wt.unweighted_terms(), user_grid, cnn, results, gridcache, gd, slope);
     } else {
-      bool cache_needed = !(settings.score_only || settings.randomize_only || settings.local_only);
+      // Cache is needed for bfgs_only mode even with local_only
+      bool cache_needed = !(settings.score_only || settings.randomize_only ||
+                           (settings.local_only && !settings.bfgs_only));
 
       // For bfgs_only mode, use a static cache to avoid recreating for each molecule
       // This significantly speeds up multi-ligand docking with the same receptor

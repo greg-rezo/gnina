@@ -192,6 +192,36 @@ void run_parallel_bfgs_docking(
     std::vector<std::vector<float>>& out_conformations
 );
 
+// High-level interface for local minimization from input pose
+// Returns: final energy (inter-adjusted), intramolecular energy
+// out_conf: optimized conformation in flat format
+void run_parallel_bfgs_minimize(
+    const struct gpu_data& gdata,
+    const struct GPUCacheInfo& cacheInfo,
+    const std::vector<float>& input_conf,  // Initial conformation in flat format
+    int max_iterations,
+    float& out_energy,
+    float& out_intramolecular,
+    std::vector<float>& out_conf
+);
+
+// Helper: convert conf struct to flat array format
+// flat_conf must be pre-allocated with size >= 7 * nlig_roots + n_torsions
+void conf_to_flat(
+    const struct conf& c,
+    unsigned nlig_roots,
+    unsigned n_torsions,
+    float* flat_conf
+);
+
+// Helper: convert flat array format back to conf struct
+void flat_to_conf(
+    const float* flat_conf,
+    unsigned nlig_roots,
+    unsigned n_torsions,
+    struct conf& c
+);
+
 // Launch parallel BFGS kernel
 void launch_parallel_bfgs(
     const LigandBatch& batch,
