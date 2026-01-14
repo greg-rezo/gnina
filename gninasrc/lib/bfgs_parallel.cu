@@ -169,14 +169,7 @@ __device__ void set_conf_single_thread(
             origin[2] = parent_origin[2] + local_origin[2];
 
             // Compute orientation: rotation about axis by torsion, then parent orientation
-            qt torsion_q = angle_to_quaternion_device(axis[0] * torsion,
-                                                       axis[1] * torsion,
-                                                       axis[2] * torsion);
-            // Get parent quaternion from matrix (reconstruct)
-            // Actually, we should store quaternions. For now, compute full rotation matrix
-            qt parent_q(node.orientation_q); // Use node's stored orientation as starting point
-            // Apply torsion rotation
-            // For simplicity, directly compute rotation matrix for axis-angle
+            // Using Rodrigues' formula to directly compute the rotation matrix
             float c = cosf(torsion);
             float s = sinf(torsion);
             float t = 1.0f - c;
@@ -334,15 +327,15 @@ __device__ inline void trilinear_interp_core(
                f001 * mx * my + f101 * fx_frac * my +
                f011 * mx * fy_frac + f111 * fx_frac * fy_frac;
 
-    // Apply curl (cap energy and gradient)
-    if (f > 0 && v < 1000) {
-        float cap = v;
-        if (f > cap) {
-            f = cap;
-            gx = 0;
-            gy = 0;
-            gz = 0;
-        }
+    // Apply soft curl (matches curl.h in standard gnina)
+    // Smoothly scales energy and gradient for positive energies
+    if (f > 0) {
+        float tmp = v / (v + f);
+        f *= tmp;
+        float tmp_sq = tmp * tmp;
+        gx *= tmp_sq;
+        gy *= tmp_sq;
+        gz *= tmp_sq;
     }
 
     // Scale gradient by factor and add penalty gradient
@@ -435,6 +428,109 @@ __device__ float eval_energy_grid_single_thread(
 // Single-Thread Intramolecular Energy
 // ============================================================================
 
+// Helper: evaluate a single spline at distance r
+// Returns energy value and sets deriv to derivative
+__device__ inline float evaluate_spline_device(
+    float* spline,
+    float r,
+    float fraction,
+    float cutoff,
+    float& deriv
+) {
+    if (r >= cutoff || r < 0) {
+        deriv = 0;
+        return 0;
+    }
+
+    unsigned index = (unsigned)(r / fraction);
+    unsigned base = 5 * index;
+
+    float x = spline[base];
+    float a = spline[base + 1];
+    float b = spline[base + 2];
+    float c = spline[base + 3];
+    float d = spline[base + 4];
+
+    float lx = r - x;
+    float val = ((a * lx + b) * lx + c) * lx + d;
+    deriv = (3 * a * lx + 2 * b) * lx + c;
+
+    return val;
+}
+
+// Evaluate intramolecular pair interaction with charge-dependent components
+// Matches gpucode.cu eval_deriv_gpu()
+__device__ inline float eval_pair_deriv_gpu(
+    const GPUSplineInfo* splineInfo,
+    unsigned t,       // atom A type
+    float charge,     // atom A charge
+    unsigned rt,      // atom B type
+    float rcharge,    // atom B charge
+    float r2,         // distance squared
+    float& dor        // output: derivative/r for force computation
+) {
+    float r = sqrtf(r2);
+
+    // Sort types so t1 <= t2, and sort charges accordingly
+    unsigned t1, t2;
+    float charge1, charge2;
+    if (t < rt) {
+        t1 = t;
+        t2 = rt;
+        charge1 = fabsf(charge);
+        charge2 = fabsf(rcharge);
+    } else {
+        t1 = rt;
+        t2 = t;
+        charge1 = fabsf(rcharge);
+        charge2 = fabsf(charge);
+    }
+
+    // Symmetric indexing for spline lookup
+    unsigned tindex = t1 + t2 * (t2 + 1) / 2;
+    const GPUSplineInfo& spInfo = splineInfo[tindex];
+    unsigned n = spInfo.n;  // number of charge-dependent components
+
+    float ret = 0, d = 0;
+
+    // Evaluate up to 4 charge-dependent spline components
+    // (matches gpucode.cu eval_deriv_gpu)
+    if (n > 0) {
+        float fraction = spInfo.fraction;
+        float cutoff = spInfo.cutoff;
+        float val, deriv;
+
+        // Component 0: TypeDependentOnly (no charge adjustment)
+        val = evaluate_spline_device(spInfo.splines[0], r, fraction, cutoff, deriv);
+        ret += val;
+        d += deriv;
+
+        // Component 1: AbsAChargeDependent (multiply by abs(chargeA))
+        if (n > 1) {
+            val = evaluate_spline_device(spInfo.splines[1], r, fraction, cutoff, deriv);
+            ret += val * charge1;
+            d += deriv * charge1;
+
+            // Component 2: AbsBChargeDependent (multiply by abs(chargeB))
+            if (n > 2) {
+                val = evaluate_spline_device(spInfo.splines[2], r, fraction, cutoff, deriv);
+                ret += val * charge2;
+                d += deriv * charge2;
+
+                // Component 3: ABChargeDependent (multiply by chargeA * chargeB)
+                if (n > 3) {
+                    val = evaluate_spline_device(spInfo.splines[3], r, fraction, cutoff, deriv);
+                    ret += val * charge2 * charge1;
+                    d += deriv * charge2 * charge1;
+                }
+            }
+        }
+    }
+
+    dor = d / r;  // Divide by distance to normalize for force computation
+    return ret;
+}
+
 __device__ float eval_intramolecular_single_thread(
     const ScoringContext& ctx,
     const float* coords,
@@ -446,6 +542,9 @@ __device__ float eval_intramolecular_single_thread(
     if (ctx.pairs == nullptr || ctx.splineInfo == nullptr || ctx.num_pairs == 0) {
         return total_energy;
     }
+
+    // Curl parameter (matches standard gnina)
+    const float v = 1000.0f;
 
     for (unsigned i = 0; i < ctx.num_pairs; i++) {
         const interacting_pair& ip = ctx.pairs[i];
@@ -459,62 +558,41 @@ __device__ float eval_intramolecular_single_thread(
 
         if (r2 >= ctx.cutoff_sq) continue;
 
-        float r = sqrtf(r2);
-
-        // Evaluate spline for this pair type
+        // Get atom types and charges
         unsigned t1 = ip.t1;
         unsigned t2 = ip.t2;
+        float charge_a = (ctx.atom_params_data != nullptr) ? ctx.atom_params_data[ip.a].charge : 0;
+        float charge_b = (ctx.atom_params_data != nullptr) ? ctx.atom_params_data[ip.b].charge : 0;
 
-        // Get spline info (symmetric indexing)
-        unsigned tindex;
-        if (t1 <= t2) {
-            tindex = t1 + t2 * (t2 + 1) / 2;
-        } else {
-            tindex = t2 + t1 * (t1 + 1) / 2;
+        // Evaluate pair interaction with all charge-dependent components
+        float dor;
+        float energy = eval_pair_deriv_gpu(ctx.splineInfo, t1, charge_a, t2, charge_b, r2, dor);
+
+        // Compute derivative vector
+        float deriv_x = r_x * dor;
+        float deriv_y = r_y * dor;
+        float deriv_z = r_z * dor;
+
+        // Apply soft curl (matches curl.h in standard gnina)
+        if (energy > 0) {
+            float tmp = v / (v + energy);
+            energy *= tmp;
+            float tmp_sq = tmp * tmp;
+            deriv_x *= tmp_sq;
+            deriv_y *= tmp_sq;
+            deriv_z *= tmp_sq;
         }
 
-        const GPUSplineInfo& spInfo = ctx.splineInfo[tindex];
+        total_energy += energy;
 
-        if (spInfo.n == 0 || r >= spInfo.cutoff) continue;
+        // Add forces (deriv points from a to b)
+        forces[ip.b * 3 + 0] += deriv_x;
+        forces[ip.b * 3 + 1] += deriv_y;
+        forces[ip.b * 3 + 2] += deriv_z;
 
-        // Evaluate spline
-        unsigned index = (unsigned)(r / spInfo.fraction);
-        unsigned base = 5 * index;
-        float* spline = spInfo.splines[0];
-
-        float lx = r - spline[base];
-        float a = spline[base + 1];
-        float b = spline[base + 2];
-        float c = spline[base + 3];
-        float d = spline[base + 4];
-
-        float val = ((a * lx + b) * lx + c) * lx + d;
-        float deriv = (3 * a * lx + 2 * b) * lx + c;
-
-        // Curl
-        float v = 1000.0f;  // curl parameter
-        if (val > 0 && v < 1000) {
-            if (val > v) {
-                val = v;
-                deriv = 0;
-            }
-        }
-
-        total_energy += val;
-
-        // Force (normalized by r)
-        float dor = deriv / r;
-        float fx = r_x * dor;
-        float fy = r_y * dor;
-        float fz = r_z * dor;
-
-        forces[ip.b * 3 + 0] += fx;
-        forces[ip.b * 3 + 1] += fy;
-        forces[ip.b * 3 + 2] += fz;
-
-        forces[ip.a * 3 + 0] -= fx;
-        forces[ip.a * 3 + 1] -= fy;
-        forces[ip.a * 3 + 2] -= fz;
+        forces[ip.a * 3 + 0] -= deriv_x;
+        forces[ip.a * 3 + 1] -= deriv_y;
+        forces[ip.a * 3 + 2] -= deriv_z;
     }
 
     return total_energy;
@@ -524,13 +602,16 @@ __device__ float eval_intramolecular_single_thread(
 // Single-Thread Gradient Computation
 // ============================================================================
 
+// Matches tree_gpu.cu _derivative()
+// Computes gradient from Cartesian forces using the tree structure
 __device__ void compute_gradient_single_thread(
     const ScoringContext& ctx,
-    const float* coords,
-    const float* forces,
-    float* node_forces,   // [num_nodes × 3]
-    float* node_torques,  // [num_nodes × 3]
-    float* gradient       // [n_change]
+    const float* coords,        // Cartesian atom coordinates [num_atoms × 3]
+    const float* forces,        // Cartesian atom forces [num_atoms × 3]
+    const float* node_origins,  // Node origins from set_conf [num_nodes × 3]
+    float* node_forces,         // Scratch: [num_nodes × 3]
+    float* node_torques,        // Scratch: [num_nodes × 3]
+    float* gradient             // Output: [n_change]
 ) {
     // Initialize node forces and torques to zero
     for (unsigned i = 0; i < ctx.num_nodes * 3; i++) {
@@ -538,24 +619,39 @@ __device__ void compute_gradient_single_thread(
         node_torques[i] = 0;
     }
 
-    // NOTE: We need node origins for torque computation
-    // For now, we assume they're available in ctx or we recompute them
-    // This is a simplification - in practice we'd pass them in
-
-    // Accumulate atom forces to their owner nodes
-    // (This is simplified - full implementation needs node origins)
+    // Step 1: Accumulate atom forces AND torques to their owner nodes
+    // Matches tree_gpu.cu lines 283-285:
+    //   pseudoAtomicAdd(&force_torques[nid].first, forces[tid]);
+    //   pseudoAtomicAdd(&force_torques[nid].second,
+    //       cross_product(coords[tid] - owner.origin, forces[tid]));
     for (unsigned atom = 0; atom < ctx.num_atoms; atom++) {
         unsigned owner = ctx.atom_owners[atom];
 
-        node_forces[owner * 3 + 0] += forces[atom * 3 + 0];
-        node_forces[owner * 3 + 1] += forces[atom * 3 + 1];
-        node_forces[owner * 3 + 2] += forces[atom * 3 + 2];
+        float fx = forces[atom * 3 + 0];
+        float fy = forces[atom * 3 + 1];
+        float fz = forces[atom * 3 + 2];
 
-        // Torque = r × F (r = atom_pos - node_origin)
-        // Simplified: would need node origins
+        // Add force to owner node
+        node_forces[owner * 3 + 0] += fx;
+        node_forces[owner * 3 + 1] += fy;
+        node_forces[owner * 3 + 2] += fz;
+
+        // Compute r = atom_pos - node_origin
+        float rx = coords[atom * 3 + 0] - node_origins[owner * 3 + 0];
+        float ry = coords[atom * 3 + 1] - node_origins[owner * 3 + 1];
+        float rz = coords[atom * 3 + 2] - node_origins[owner * 3 + 2];
+
+        // Add torque = r × F to owner node
+        node_torques[owner * 3 + 0] += ry * fz - rz * fy;
+        node_torques[owner * 3 + 1] += rz * fx - rx * fz;
+        node_torques[owner * 3 + 2] += rx * fy - ry * fx;
     }
 
-    // Propagate from leaves to root (reverse BFS)
+    // Step 2: Propagate from leaves to root (reverse BFS)
+    // Matches tree_gpu.cu lines 304-312:
+    //   pseudoAtomicAdd(&force_torques[parent_id].first, ft.first);
+    //   pseudoAtomicAdd(&force_torques[parent_id].second,
+    //       cross_product(r, ft.first) + ft.second);
     for (int layer = ctx.num_layers - 1; layer > 0; layer--) {
         for (unsigned nid = ctx.nlig_roots; nid < ctx.num_nodes; nid++) {
             const segment_node& node = ctx.tree_nodes[nid];
@@ -564,18 +660,32 @@ __device__ void compute_gradient_single_thread(
             int parent = node.parent;
             if (parent < 0) continue;
 
-            // Add this node's force/torque to parent
-            node_forces[parent * 3 + 0] += node_forces[nid * 3 + 0];
-            node_forces[parent * 3 + 1] += node_forces[nid * 3 + 1];
-            node_forces[parent * 3 + 2] += node_forces[nid * 3 + 2];
+            float child_fx = node_forces[nid * 3 + 0];
+            float child_fy = node_forces[nid * 3 + 1];
+            float child_fz = node_forces[nid * 3 + 2];
 
-            node_torques[parent * 3 + 0] += node_torques[nid * 3 + 0];
-            node_torques[parent * 3 + 1] += node_torques[nid * 3 + 1];
-            node_torques[parent * 3 + 2] += node_torques[nid * 3 + 2];
+            float child_tx = node_torques[nid * 3 + 0];
+            float child_ty = node_torques[nid * 3 + 1];
+            float child_tz = node_torques[nid * 3 + 2];
+
+            // r = child_origin - parent_origin
+            float rx = node_origins[nid * 3 + 0] - node_origins[parent * 3 + 0];
+            float ry = node_origins[nid * 3 + 1] - node_origins[parent * 3 + 1];
+            float rz = node_origins[nid * 3 + 2] - node_origins[parent * 3 + 2];
+
+            // parent_force += child_force
+            node_forces[parent * 3 + 0] += child_fx;
+            node_forces[parent * 3 + 1] += child_fy;
+            node_forces[parent * 3 + 2] += child_fz;
+
+            // parent_torque += cross(r, child_force) + child_torque
+            node_torques[parent * 3 + 0] += (ry * child_fz - rz * child_fy) + child_tx;
+            node_torques[parent * 3 + 1] += (rz * child_fx - rx * child_fz) + child_ty;
+            node_torques[parent * 3 + 2] += (rx * child_fy - ry * child_fx) + child_tz;
         }
     }
 
-    // Extract gradient components
+    // Step 3: Extract gradient components
     // Rigid body roots: 3 position + 3 orientation
     for (unsigned i = 0; i < ctx.nlig_roots; i++) {
         gradient[i * 6 + 0] = node_forces[i * 3 + 0];
@@ -587,6 +697,7 @@ __device__ void compute_gradient_single_thread(
     }
 
     // Torsion nodes: dot(torque, axis)
+    // Note: uses node.axis which is in lab frame (set by set_conf)
     for (unsigned nid = ctx.nlig_roots; nid < ctx.num_nodes; nid++) {
         const segment_node& node = ctx.tree_nodes[nid];
         float axis[3] = {node.axis.x, node.axis.y, node.axis.z};
@@ -600,8 +711,72 @@ __device__ void compute_gradient_single_thread(
 // Single-Thread BFGS Components
 // ============================================================================
 
-// Line search (simplified backtracking)
-__device__ float line_search_single_thread(
+// Helper: increment configuration by alpha * p
+__device__ void increment_conf_single_thread(
+    const ScoringContext& ctx,
+    const float* x,
+    float* x_new,
+    const float* p,
+    float alpha
+) {
+    // Copy and increment position
+    for (int i = 0; i < ctx.n_conf; i++) {
+        x_new[i] = x[i];
+    }
+
+    // Increment rigid body positions and orientations
+    for (unsigned i = 0; i < ctx.nlig_roots; i++) {
+        for (int j = 0; j < 3; j++) {
+            x_new[i * 7 + j] += alpha * p[i * 6 + j];
+        }
+        // Increment orientation via quaternion
+        float rot[3] = {alpha * p[i * 6 + 3],
+                       alpha * p[i * 6 + 4],
+                       alpha * p[i * 6 + 5]};
+        qt dq = angle_to_quaternion_device(rot[0], rot[1], rot[2]);
+        qt q(x_new[i * 7 + 3], x_new[i * 7 + 4],
+             x_new[i * 7 + 5], x_new[i * 7 + 6]);
+        qt qnew = quat_mult(dq, q);
+        // Normalize
+        float qn = sqrtf(qnew.R_component_1()*qnew.R_component_1() +
+                        qnew.R_component_2()*qnew.R_component_2() +
+                        qnew.R_component_3()*qnew.R_component_3() +
+                        qnew.R_component_4()*qnew.R_component_4());
+        if (qn > epsilon_fl) {
+            x_new[i * 7 + 3] = qnew.R_component_1() / qn;
+            x_new[i * 7 + 4] = qnew.R_component_2() / qn;
+            x_new[i * 7 + 5] = qnew.R_component_3() / qn;
+            x_new[i * 7 + 6] = qnew.R_component_4() / qn;
+        }
+    }
+
+    // Increment torsions
+    for (unsigned i = ctx.nlig_roots; i < ctx.num_nodes; i++) {
+        float dt = alpha * p[i + 5 * ctx.nlig_roots];
+        x_new[i + 6 * ctx.nlig_roots] += normalize_angle_device(dt);
+        x_new[i + 6 * ctx.nlig_roots] = normalize_angle_device(x_new[i + 6 * ctx.nlig_roots]);
+    }
+}
+
+// Helper: evaluate energy at configuration
+__device__ float eval_conf_single_thread(
+    const ScoringContext& ctx,
+    const float* conf,
+    float* coords,
+    float* forces,
+    float* node_origins,
+    float* node_orientations
+) {
+    set_conf_single_thread(ctx, conf, coords, node_origins, node_orientations);
+    float e = eval_energy_grid_single_thread(ctx, coords, forces);
+    e += eval_intramolecular_single_thread(ctx, coords, forces);
+    return e;
+}
+
+// Accurate line search (matches bfgs.h accurate_line_search)
+// Based on Numerical Recipes lnsrch with quadratic/cubic interpolation
+// Returns alpha=0 on failure (not a descent direction or step too small)
+__device__ float accurate_line_search_single_thread(
     const ScoringContext& ctx,
     float* x,
     float* x_new,
@@ -615,78 +790,128 @@ __device__ float line_search_single_thread(
     float* g_new,
     float& f_new
 ) {
-    const float c0 = 0.0001f;
-    const unsigned max_trials = 10;
-    const float multiplier = 0.5f;
-    float alpha = 1.0f;
-
-    // Compute pg = p · g
-    float pg = 0;
-    for (int i = 0; i < ctx.n_change; i++) {
-        pg += p[i] * g[i];
-    }
+    const float ALF = 1.0e-4f;  // Armijo coefficient
 
     // Scratch for node state
     float node_origins[PARALLEL_MAX_TORSIONS * 3];
     float node_orientations[PARALLEL_MAX_TORSIONS * 9];
 
-    for (unsigned trial = 0; trial < max_trials; trial++) {
-        // x_new = x + alpha * p
+    // Compute slope = g · p
+    float slope = 0;
+    for (int i = 0; i < ctx.n_change; i++) {
+        slope += g[i] * p[i];
+    }
+
+    // Check if p is a descent direction
+    if (slope >= 0) {
+        // Not a descent direction - copy x to x_new and zero gradient
         for (int i = 0; i < ctx.n_conf; i++) {
             x_new[i] = x[i];
         }
+        for (int i = 0; i < ctx.n_change; i++) {
+            g_new[i] = 0;
+        }
+        f_new = f0;
+        return 0;  // Signal failure
+    }
 
-        // Increment position
-        for (unsigned i = 0; i < ctx.nlig_roots; i++) {
-            for (int j = 0; j < 3; j++) {
-                x_new[i * 7 + j] += alpha * p[i * 6 + j];
+    // Compute minimum step size (lambdamin)
+    // test = max_i(|p[i]| / max(|x[i]|, 1))
+    float test = 0;
+    for (int i = 0; i < ctx.n_change; i++) {
+        // For change vector, we need corresponding x values
+        // This is approximate - use 1.0 as reference scale
+        float temp = fabsf(p[i]);  // Simplified: assume x scale ~ 1
+        if (temp > test) test = temp;
+    }
+    float alamin = (test > 0) ? (epsilon_fl / test) : epsilon_fl;
+
+    float alpha = 1.0f;  // Start with full Newton step
+    float alpha2 = 0, f2 = 0;
+    bool first_backtrack = true;
+
+    for (;;) {
+        // Check for too small step
+        if (alpha < alamin || !isfinite(alpha)) {
+            // Step too small - copy x to x_new and zero gradient
+            for (int i = 0; i < ctx.n_conf; i++) {
+                x_new[i] = x[i];
             }
-            // Increment orientation via quaternion
-            float rot[3] = {alpha * p[i * 6 + 3],
-                           alpha * p[i * 6 + 4],
-                           alpha * p[i * 6 + 5]};
-            qt dq = angle_to_quaternion_device(rot[0], rot[1], rot[2]);
-            qt q(x_new[i * 7 + 3], x_new[i * 7 + 4],
-                 x_new[i * 7 + 5], x_new[i * 7 + 6]);
-            qt qnew = quat_mult(dq, q);
-            // Normalize
-            float qn = sqrtf(qnew.R_component_1()*qnew.R_component_1() +
-                            qnew.R_component_2()*qnew.R_component_2() +
-                            qnew.R_component_3()*qnew.R_component_3() +
-                            qnew.R_component_4()*qnew.R_component_4());
-            if (qn > epsilon_fl) {
-                x_new[i * 7 + 3] = qnew.R_component_1() / qn;
-                x_new[i * 7 + 4] = qnew.R_component_2() / qn;
-                x_new[i * 7 + 5] = qnew.R_component_3() / qn;
-                x_new[i * 7 + 6] = qnew.R_component_4() / qn;
+            for (int i = 0; i < ctx.n_change; i++) {
+                g_new[i] = 0;
             }
+            f_new = f0;
+            return 0;  // Signal failure
         }
 
-        // Increment torsions
-        for (unsigned i = ctx.nlig_roots; i < ctx.num_nodes; i++) {
-            float dt = alpha * p[i + 5 * ctx.nlig_roots];
-            x_new[i + 6 * ctx.nlig_roots] += normalize_angle_device(dt);
-            x_new[i + 6 * ctx.nlig_roots] = normalize_angle_device(x_new[i + 6 * ctx.nlig_roots]);
-        }
+        // Try step: x_new = x + alpha * p
+        increment_conf_single_thread(ctx, x, x_new, p, alpha);
 
         // Evaluate at new point
-        set_conf_single_thread(ctx, x_new, coords, node_origins, node_orientations);
-        f_new = eval_energy_grid_single_thread(ctx, coords, forces);
-        f_new += eval_intramolecular_single_thread(ctx, coords, forces);
+        f_new = eval_conf_single_thread(ctx, x_new, coords, forces,
+                                        node_origins, node_orientations);
 
-        // Armijo condition
-        if (f_new - f0 < c0 * alpha * pg) {
-            // Compute gradient at new point
-            compute_gradient_single_thread(ctx, coords, forces, node_forces, node_torques, g_new);
+        // Check Armijo sufficient decrease condition
+        if (f_new <= f0 + ALF * alpha * slope) {
+            // Success - compute gradient and return
+            compute_gradient_single_thread(ctx, coords, forces, node_origins,
+                                          node_forces, node_torques, g_new);
             return alpha;
         }
 
-        alpha *= multiplier;
-    }
+        // Need to backtrack - use interpolation
+        float tmplam;
+        if (first_backtrack) {
+            // First backtrack: quadratic interpolation
+            // tmplam = -slope / (2 * (f_new - f0 - slope))
+            float denom = 2.0f * (f_new - f0 - slope);
+            if (fabsf(denom) > epsilon_fl) {
+                tmplam = -slope / denom;
+            } else {
+                tmplam = 0.5f * alpha;
+            }
+            first_backtrack = false;
+        } else {
+            // Subsequent backtracks: cubic interpolation
+            float rhs1 = f_new - f0 - alpha * slope;
+            float rhs2 = f2 - f0 - alpha2 * slope;
+            float alpha_diff = alpha - alpha2;
 
-    // Line search failed
-    compute_gradient_single_thread(ctx, coords, forces, node_forces, node_torques, g_new);
-    return alpha;
+            if (fabsf(alpha_diff) < epsilon_fl) {
+                tmplam = 0.5f * alpha;
+            } else {
+                float a = (rhs1 / (alpha * alpha) - rhs2 / (alpha2 * alpha2)) / alpha_diff;
+                float b = (-alpha2 * rhs1 / (alpha * alpha) +
+                           alpha * rhs2 / (alpha2 * alpha2)) / alpha_diff;
+
+                if (fabsf(a) < epsilon_fl) {
+                    // Quadratic case
+                    tmplam = -slope / (2.0f * b);
+                } else {
+                    float disc = b * b - 3.0f * a * slope;
+                    if (disc < 0) {
+                        tmplam = 0.5f * alpha;
+                    } else if (b <= 0) {
+                        tmplam = (-b + sqrtf(disc)) / (3.0f * a);
+                    } else {
+                        tmplam = -slope / (b + sqrtf(disc));
+                    }
+                }
+
+                // Always at least cut in half
+                if (tmplam > 0.5f * alpha) {
+                    tmplam = 0.5f * alpha;
+                }
+            }
+        }
+
+        // Save current values for next cubic interpolation
+        alpha2 = alpha;
+        f2 = f_new;
+
+        // Update alpha, but never smaller than a tenth of previous
+        alpha = fmaxf(tmplam, 0.1f * alpha);
+    }
 }
 
 // BFGS Hessian update
@@ -782,7 +1007,7 @@ __global__ void bfgs_parallel_kernel(
     set_conf_single_thread(ctx, state.x, state.coords, node_origins, node_orientations);
     state.energy = eval_energy_grid_single_thread(ctx, state.coords, state.forces);
     state.energy += eval_intramolecular_single_thread(ctx, state.coords, state.forces);
-    compute_gradient_single_thread(ctx, state.coords, state.forces,
+    compute_gradient_single_thread(ctx, state.coords, state.forces, node_origins,
                                    state.node_forces, state.node_torques, state.g);
     state.best_energy = state.energy;
 
@@ -801,7 +1026,7 @@ __global__ void bfgs_parallel_kernel(
         state.h[idx] = 1.0f;
     }
 
-    // BFGS iterations - NO EARLY STOPPING
+    // BFGS iterations (with early stopping on line search failure, matching bfgs.h)
     for (int iter = 0; iter < max_iterations; iter++) {
         // Compute search direction: p = -H * g
         for (int i = 0; i < ctx.n_change; i++) {
@@ -813,17 +1038,44 @@ __global__ void bfgs_parallel_kernel(
             state.p[i] = -state.p[i];
         }
 
-        // Line search
+        // Line search (accurate, matching bfgs.h default)
         float f_new;
-        float alpha = line_search_single_thread(
+        float alpha = accurate_line_search_single_thread(
             ctx, state.x, state.x_new, state.g, state.p,
             state.energy, state.coords, state.forces,
             state.node_forces, state.node_torques, state.g_new, f_new
         );
 
+        // Check for line search failure (matches bfgs.h behavior)
+        if (alpha == 0) {
+            break;  // Line direction was wrong or step too small, give up
+        }
+
         // y = g_new - g
         for (int i = 0; i < ctx.n_change; i++) {
             state.y[i] = state.g_new[i] - state.g[i];
+        }
+
+        // Shanno-Phua scaling on first iteration (matches bfgs.h behavior)
+        if (iter == 0) {
+            float yy = 0;
+            float yp = 0;
+            for (int i = 0; i < ctx.n_change; i++) {
+                yy += state.y[i] * state.y[i];
+                yp += state.y[i] * state.p[i];
+            }
+            if (yy > epsilon_fl) {
+                float scale = alpha * yp / yy;
+                // Reset Hessian diagonal to scaled identity
+                int hess_size = ctx.n_change * (ctx.n_change + 1) / 2;
+                for (int i = 0; i < hess_size; i++) {
+                    state.h[i] = 0;
+                }
+                for (int i = 0; i < ctx.n_change; i++) {
+                    int idx = i + i * (i + 1) / 2;
+                    state.h[idx] = scale;
+                }
+            }
         }
 
         // BFGS Hessian update

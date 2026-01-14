@@ -6,6 +6,7 @@
 #include "test_tree.h"
 #include "test_cache.h"
 #include "test_utils.h"
+#include "test_bfgs_parallel.h"
 #define N_ITERS 5
 #define BOOST_TEST_DYN_LINK
 #define BOOST_TEST_NO_MAIN
@@ -51,6 +52,22 @@ BOOST_AUTO_TEST_SUITE(cache_gpu)
 
 BOOST_AUTO_TEST_CASE(eval_deriv) {
   boost_loop_test(&test_cache_eval_deriv);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+BOOST_AUTO_TEST_SUITE(bfgs_parallel)
+
+BOOST_AUTO_TEST_CASE(energy_consistency) {
+  boost_loop_test(&test_bfgs_energy_consistency);
+}
+
+BOOST_AUTO_TEST_CASE(step_consistency) {
+  boost_loop_test(&test_bfgs_step_consistency);
+}
+
+BOOST_AUTO_TEST_CASE(numerical_gradient) {
+  boost_loop_test(&test_bfgs_numerical_gradient);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
