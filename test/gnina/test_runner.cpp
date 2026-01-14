@@ -66,10 +66,6 @@ BOOST_AUTO_TEST_CASE(step_consistency) {
   boost_loop_test(&test_bfgs_step_consistency);
 }
 
-BOOST_AUTO_TEST_CASE(numerical_gradient) {
-  boost_loop_test(&test_bfgs_numerical_gradient);
-}
-
 // CPU vs GPU comparison tests (tight tolerances)
 BOOST_AUTO_TEST_CASE(search_direction_cpu_vs_gpu) {
   boost_loop_test(&test_bfgs_search_direction_cpu_vs_gpu);

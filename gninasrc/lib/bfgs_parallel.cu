@@ -931,31 +931,31 @@ __device__ void bfgs_hessian_update_single_thread(
 
     if (alpha * yp < epsilon_fl) return;  // Skip update
 
-    // Compute H * y
-    float hy[PARALLEL_MAX_CHANGE_SIZE];
+    // Compute -H * y (minus_hy), same as CPU version
+    float minus_hy[PARALLEL_MAX_CHANGE_SIZE];
     for (int i = 0; i < n; i++) {
-        hy[i] = 0;
+        minus_hy[i] = 0;
         for (int j = 0; j < n; j++) {
             // Triangular indexing
             int idx = (i <= j) ? (i + j * (j + 1) / 2) : (j + i * (i + 1) / 2);
-            hy[i] += h[idx] * y[j];
+            minus_hy[i] -= h[idx] * y[j];  // Note: negation to match CPU
         }
     }
 
-    // Compute y · H · y
+    // Compute y · H · y = -y · minus_hy
     float yhy = 0;
     for (int i = 0; i < n; i++) {
-        yhy += y[i] * hy[i];
+        yhy -= y[i] * minus_hy[i];  // Note: negation since minus_hy = -H*y
     }
 
     float r = 1.0f / (alpha * yp);
     float coef = alpha * alpha * (r * r * yhy + r);
 
-    // Update H
+    // Update H (matching CPU formula exactly)
     for (int i = 0; i < n; i++) {
         for (int j = i; j < n; j++) {
             int idx = i + j * (j + 1) / 2;
-            h[idx] += alpha * r * (hy[i] * p[j] + hy[j] * p[i]) + coef * p[i] * p[j];
+            h[idx] += alpha * r * (minus_hy[i] * p[j] + minus_hy[j] * p[i]) + coef * p[i] * p[j];
         }
     }
 }

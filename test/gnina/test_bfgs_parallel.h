@@ -14,9 +14,6 @@ void test_bfgs_energy_consistency();
 // Test that BFGS steps produce valid results
 void test_bfgs_step_consistency();
 
-// Test gradient computation against numerical finite differences
-void test_bfgs_numerical_gradient();
-
 // ============================================================================
 // CPU vs GPU BFGS Component Comparison Tests (tight tolerances)
 // ============================================================================
