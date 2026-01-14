@@ -39,6 +39,7 @@ set(LIB_SRCS
 ${CMAKE_CURRENT_BINARY_DIR}/version.cpp
 lib/atom_constants.cpp
 lib/bfgs.cu
+lib/bfgs_parallel.cu
 lib/box.cpp
 lib/builtinscoring.cpp
 lib/cache.cpp

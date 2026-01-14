@@ -84,6 +84,8 @@ struct user_settings {
     bool gpu_docking; //use gpu for non-CNN operations too
     bool no_gpu;
     bool no_lig;
+    bool bfgs_only; //skip Monte Carlo, run parallel BFGS directly
+    int bfgs_iterations; //max BFGS iterations when bfgs_only
 
 
     cnn_options cnnopts;
@@ -95,7 +97,8 @@ struct user_settings {
             exhaustiveness(10), num_mc_steps(0), max_mc_steps(0), num_mc_saved(50), temperature(0),
             sort_order(CNNscore), score_only(false),
             randomize_only(false), local_only(false), dominimize(false),
-            include_atom_info(false), gpu_docking(false), no_gpu(false), no_lig(false) {
+            include_atom_info(false), gpu_docking(false), no_gpu(false), no_lig(false),
+            bfgs_only(false), bfgs_iterations(100) {
 
     }
 };

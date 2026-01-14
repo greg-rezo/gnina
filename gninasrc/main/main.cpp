@@ -21,6 +21,7 @@
 #include <exception>
 #include <iostream>
 #include <iterator>
+#include <memory>
 #include <openbabel/babelconfig.h>
 #include <openbabel/mol.h>
 #include <openbabel/obconversion.h>
@@ -43,6 +44,7 @@
 #include "file.h"
 #include "flexinfo.h"
 #include "gpucode.h"
+#include "bfgs_parallel.h"
 #include "grid.h"
 #include "molgetter.h"
 #include "naive_non_cache.h"
@@ -309,8 +311,181 @@ void do_search(model &m, const boost::optional<model> &ref, const weighted_terms
 
       if (compute_atominfo)
         results.back().setAtomValues(m, &sf);
-    } else // docking
-    {
+    } else if (settings.bfgs_only) {
+      // Parallel BFGS without Monte Carlo - requires GPU
+      if (!settings.gpu_docking) {
+        log << "ERROR: --bfgs_only requires GPU docking (--gpu_docking flag or cnn scoring).\n";
+        log << "Falling back to standard docking.\n";
+        log.endl();
+        goto standard_docking;
+      }
+
+      // Try to get cache_gpu info
+      cache_gpu* cgpu = dynamic_cast<cache_gpu*>(&ig);
+      if (!cgpu) {
+        log << "ERROR: --bfgs_only requires grid caching. Cannot use with no_cache mode.\n";
+        log << "Falling back to standard docking.\n";
+        log.endl();
+        goto standard_docking;
+      }
+
+      log << "Running parallel BFGS (exhaustiveness=" << settings.exhaustiveness
+          << ", bfgs_iterations=" << settings.bfgs_iterations << ")\n";
+      log << "Using random seed: " << settings.seed;
+      log.endl();
+
+      doing(settings.verbosity, "Running parallel BFGS optimization", log);
+
+      // Get cache info and gpu data
+      const GPUCacheInfo& cacheInfo = cgpu->get_info();
+
+      // Compute box bounds
+      gfloat3 box_min(corner1[0], corner1[1], corner1[2]);
+      gfloat3 box_max(corner2[0], corner2[1], corner2[2]);
+
+      // Run parallel BFGS
+      std::vector<float> energies;
+      std::vector<std::vector<float>> conformations;
+
+      run_parallel_bfgs_docking(
+          m.gdata, cacheInfo,
+          settings.exhaustiveness,
+          settings.bfgs_iterations,
+          box_min, box_max,
+          settings.seed,
+          energies, conformations
+      );
+
+      done(settings.verbosity, log);
+
+      // Convert results to output_container
+      output_container out_cont;
+      for (size_t i = 0; i < energies.size(); i++) {
+        if (energies[i] < 1e10 && std::isfinite(energies[i])) {  // Filter out failed optimizations
+          // Validate conformation data
+          if (conformations[i].empty() || conformations[i].size() < 7) {
+            continue;  // Skip invalid conformations
+          }
+
+          // Check for NaN/Inf in conformation
+          bool valid = true;
+          for (size_t j = 0; j < conformations[i].size() && valid; j++) {
+            if (!std::isfinite(conformations[i][j])) {
+              valid = false;
+            }
+          }
+          if (!valid) {
+            continue;  // Skip conformations with NaN/Inf
+          }
+
+          // Check if position is within reasonable bounds (10x box size)
+          float margin = 100.0f;  // Allow some margin outside box
+          if (conformations[i][0] < box_min.x - margin || conformations[i][0] > box_max.x + margin ||
+              conformations[i][1] < box_min.y - margin || conformations[i][1] > box_max.y + margin ||
+              conformations[i][2] < box_min.z - margin || conformations[i][2] > box_max.z + margin) {
+            continue;  // Skip poses far outside the box
+          }
+
+          conf c_result = m.get_initial_conf(nc.move_receptor());
+          // Copy conformation data back
+          // Note: conformations[i] contains [position, quaternion, torsions]
+          if (c_result.ligands.empty()) {
+            continue;  // Skip if no ligands
+          }
+
+          // Set position
+          c_result.ligands[0].rigid.position[0] = conformations[i][0];
+          c_result.ligands[0].rigid.position[1] = conformations[i][1];
+          c_result.ligands[0].rigid.position[2] = conformations[i][2];
+          // Set orientation quaternion
+          c_result.ligands[0].rigid.orientation = qt(
+              conformations[i][3], conformations[i][4],
+              conformations[i][5], conformations[i][6]);
+          // Set torsions
+          for (size_t t = 0; t < c_result.ligands[0].torsions.size() && (t + 7) < conformations[i].size(); t++) {
+            c_result.ligands[0].torsions[t] = conformations[i][t + 7];
+          }
+
+          output_type out_result(c_result, energies[i]);
+          m.set(out_result.c);
+          out_result.coords = m.get_heavy_atom_movable_coords();
+          add_to_output_container(out_cont, out_result, settings.out_min_rmsd, settings.num_modes * 10);
+        }
+      }
+
+      // Refine and score results
+      doing(settings.verbosity, "Refining results", log);
+      VINA_FOR_IN(i, out_cont) {
+        refine_structure(m, prec, nc, out_cont[i], authentic_v, par.mc.ssd_par.minparm, user_grid, settings.verbosity,
+                         log, nc_new);
+        get_cnn_info(m, cnn, log, cnnscore, cnnaffinity, cnnvariance);
+        out_cont[i].cnnscore = cnnscore;
+        out_cont[i].cnnaffinity = cnnaffinity;
+        out_cont[i].cnnvariance = cnnvariance;
+
+        if (not_max(out_cont[i].e)) {
+          intramolecular_energy = m.eval_intramolecular(exact_prec, authentic_v, out_cont[i].c);
+          out_cont[i].e =
+              m.eval_adjusted(sf, exact_prec, nc_new, authentic_v, out_cont[i].c, intramolecular_energy, user_grid);
+          out_cont[i].intramol = intramolecular_energy;
+        }
+      }
+
+      auto sorter = [settings](const output_type &lhs, const output_type &rhs) {
+        switch (settings.sort_order) {
+        case Energy:
+          return lhs.e < rhs.e;
+        case CNNaffinity:
+          return lhs.cnnaffinity > rhs.cnnaffinity;
+        case CNNscore:
+        default:
+          return lhs.cnnscore > rhs.cnnscore;
+        }
+      };
+
+      out_cont.sort(sorter);
+      out_cont = remove_redundant(out_cont, settings.out_min_rmsd);
+      done(settings.verbosity, log);
+
+      log.setf(std::ios::fixed, std::ios::floatfield);
+      log.setf(std::ios::showpoint);
+      log << '\n';
+      log << "mode |  affinity  |  intramol  |    CNN     |   CNN\n";
+      log << "     | (kcal/mol) | (kcal/mol) | pose score | affinity\n";
+      log << "-----+------------+------------+------------+----------\n";
+
+      model best_mode_model = m;
+      if (!out_cont.empty())
+        best_mode_model.set(out_cont.front().c);
+
+      sz how_many = 0;
+      VINA_FOR_IN(i, out_cont) {
+        if (!not_max(out_cont[i].e))
+          continue;
+        if (how_many >= settings.num_modes)
+          break;
+        ++how_many;
+        m.set(out_cont[i].c);
+        log << std::setw(5) << how_many << std::setw(12) << std::setprecision(2) << out_cont[i].e << std::setw(12)
+            << std::setprecision(2) << out_cont[i].intramol;
+        log << " " << std::setw(12) << std::setprecision(4) << out_cont[i].cnnscore << "  " << std::setw(9)
+            << std::setprecision(3) << out_cont[i].cnnaffinity;
+        log.endl();
+
+        results.push_back(
+            result_info(out_cont[i].e, out_cont[i].cnnscore, out_cont[i].cnnaffinity, out_cont[i].cnnvariance, -1, m));
+
+        if (compute_atominfo)
+          results.back().setAtomValues(m, &sf);
+      }
+      done(settings.verbosity, log);
+
+      if (how_many < 1) {
+        log << "WARNING: Could not find any conformations completely within the search space.\n";
+        log.endl();
+      }
+    } else { // docking
+    standard_docking:
       rng generator(static_cast<rng::result_type>(settings.seed));
       log << "Using random seed: " << settings.seed;
       log.endl();
@@ -490,17 +665,57 @@ void main_procedure(model &m, precalculate &prec,
     } else {
       bool cache_needed = !(settings.score_only || settings.randomize_only || settings.local_only);
 
-      if (cache_needed)
-        doing(settings.verbosity, "Analyzing the binding site", log);
-      std::unique_ptr<cache> c((settings.gpu_docking) ? new cache_gpu("scoring_function_version001", gd, slope,
-                                                                      dynamic_cast<precalculate_gpu *>(&prec))
-                                                      : new cache("scoring_function_version001", gd, slope));
-      if (cache_needed) {
-        std::vector<smt> atom_types_needed;
-        m.get_movable_atom_types(atom_types_needed);
-        c->populate(m, prec, atom_types_needed, user_grid);
-        done(settings.verbosity, log);
+      // For bfgs_only mode, use a static cache to avoid recreating for each molecule
+      // This significantly speeds up multi-ligand docking with the same receptor
+      static std::unique_ptr<cache> bfgs_cache;
+      static grid_dims bfgs_cache_gd;
+      static bool bfgs_cache_initialized = false;
+
+      std::unique_ptr<cache> local_cache;
+      cache* c = nullptr;
+
+      if (settings.bfgs_only && settings.gpu_docking) {
+        // Check if we can reuse the static cache (same grid dimensions)
+        bool can_reuse = bfgs_cache_initialized &&
+                         bfgs_cache_gd[0].begin == gd[0].begin && bfgs_cache_gd[0].end == gd[0].end &&
+                         bfgs_cache_gd[1].begin == gd[1].begin && bfgs_cache_gd[1].end == gd[1].end &&
+                         bfgs_cache_gd[2].begin == gd[2].begin && bfgs_cache_gd[2].end == gd[2].end;
+
+        if (!can_reuse) {
+          // Create new cache for bfgs_only mode
+          if (cache_needed)
+            doing(settings.verbosity, "Analyzing the binding site (creating GPU cache)", log);
+          bfgs_cache.reset(new cache_gpu("scoring_function_version001", gd, slope,
+                                         dynamic_cast<precalculate_gpu *>(&prec)));
+          bfgs_cache_gd = gd;
+          bfgs_cache_initialized = true;
+        }
+        c = bfgs_cache.get();
+
+        // Populate with any new atom types needed by this ligand
+        if (cache_needed) {
+          std::vector<smt> atom_types_needed;
+          m.get_movable_atom_types(atom_types_needed);
+          c->populate(m, prec, atom_types_needed, user_grid);
+          if (!can_reuse)
+            done(settings.verbosity, log);
+        }
+      } else {
+        // Standard path: create a new cache for each molecule
+        if (cache_needed)
+          doing(settings.verbosity, "Analyzing the binding site", log);
+        local_cache.reset((settings.gpu_docking) ? new cache_gpu("scoring_function_version001", gd, slope,
+                                                                 dynamic_cast<precalculate_gpu *>(&prec))
+                                                 : new cache("scoring_function_version001", gd, slope));
+        c = local_cache.get();
+        if (cache_needed) {
+          std::vector<smt> atom_types_needed;
+          m.get_movable_atom_types(atom_types_needed);
+          c->populate(m, prec, atom_types_needed, user_grid);
+          done(settings.verbosity, log);
+        }
       }
+
       do_search(m, ref, wt, prec, *c, *nc, corner1, corner2, par, settings, compute_atominfo, log,
                 wt.unweighted_terms(), user_grid, cnn, results, gridcache, gd, slope);
     }
@@ -978,6 +1193,10 @@ Thank you!\n";
         "score_only", bool_switch(&settings.score_only)->default_value(false),
         "score provided ligand pose")("local_only", bool_switch(&settings.local_only)->default_value(false),
                                       "local search only using autobox (you probably want to use --minimize)")(
+        "bfgs_only", bool_switch(&settings.bfgs_only)->default_value(false),
+        "skip Monte Carlo, run parallel BFGS from random initial poses (experimental)")(
+        "bfgs_iterations", value<int>(&settings.bfgs_iterations)->default_value(100),
+        "max BFGS iterations when using --bfgs_only")(
         "minimize", bool_switch(&settings.dominimize)->default_value(false), "energy minimization")(
         "randomize_only", bool_switch(&settings.randomize_only), "generate random poses, attempting to avoid clashes")(
         "num_mc_steps", value<int>(&settings.num_mc_steps), "fixed number of monte carlo steps to take in each chain")(
