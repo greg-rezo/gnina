@@ -110,3 +110,4 @@ tags
 
 # compile command databases
 compile_commands.json
+build-docker
