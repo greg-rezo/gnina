@@ -39,11 +39,11 @@ struct non_cache : public igrid {
     fl check_bounds_deriv(const grid_dims& dims, const vec& a_coords,
         vec& adjusted_a_coords, vec& out_of_bounds_deriv) const;
 
-    virtual bool within(const model& m, fl margin = 0.0001) const;
-    fl getSlope() {
+    virtual bool within(const model& m, fl margin = 0.0001) const override;
+    virtual fl getSlope() const override {
       return slope;
     }
-    virtual void setSlope(fl sl) {
+    virtual void setSlope(fl sl) override {
       slope = sl;
     }
     virtual const precalculate* get_precalculate() const {

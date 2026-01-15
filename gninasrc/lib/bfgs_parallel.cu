@@ -1467,7 +1467,8 @@ void conf_to_flat(
     const conf& c,
     unsigned nlig_roots,
     unsigned n_torsions,
-    float* flat_conf
+    float* flat_conf,
+    const gpu_data& gdata
 ) {
     // Convert ligand rigid bodies
     for (unsigned i = 0; i < nlig_roots && i < c.ligands.size(); i++) {
@@ -1483,11 +1484,21 @@ void conf_to_flat(
         flat_conf[i * 7 + 6] = rc.orientation.R_component_4();
     }
 
-    // Convert torsions
+    // Convert torsions with DFS-to-BFS index conversion
+    // CPU stores torsions in DFS order, GPU expects BFS order
+    // dfs_node_idx = torsion_idx + nlig_roots (torsion nodes start after root nodes)
+    // bfs_node_idx = gdata.dfs_order_bfs_indices[dfs_node_idx]
+    // bfs_torsion_idx = bfs_node_idx - nlig_roots (in GPU flat array after rigid body values)
     unsigned torsion_idx = 0;
     for (unsigned i = 0; i < c.ligands.size() && torsion_idx < n_torsions; i++) {
         for (unsigned j = 0; j < c.ligands[i].torsions.size() && torsion_idx < n_torsions; j++) {
-            flat_conf[nlig_roots + 6 * nlig_roots + torsion_idx] = c.ligands[i].torsions[j];
+            // Convert DFS torsion index to BFS torsion index
+            unsigned dfs_node_idx = torsion_idx + nlig_roots;  // DFS node index
+            unsigned bfs_node_idx = gdata.dfs_order_bfs_indices[dfs_node_idx];  // Convert to BFS
+            unsigned bfs_torsion_idx = bfs_node_idx - nlig_roots;  // BFS torsion index
+
+            // GPU flat array: [7*nlig_roots rigid body values] + [n_torsions values]
+            flat_conf[7 * nlig_roots + bfs_torsion_idx] = c.ligands[i].torsions[j];
             torsion_idx++;
         }
     }
@@ -1497,7 +1508,8 @@ void flat_to_conf(
     const float* flat_conf,
     unsigned nlig_roots,
     unsigned n_torsions,
-    conf& c
+    conf& c,
+    const gpu_data& gdata
 ) {
     // Convert ligand rigid bodies
     for (unsigned i = 0; i < nlig_roots && i < c.ligands.size(); i++) {
@@ -1515,11 +1527,19 @@ void flat_to_conf(
         );
     }
 
-    // Convert torsions
+    // Convert torsions with BFS-to-DFS index conversion
+    // GPU flat array stores torsions in BFS order, CPU expects DFS order
+    // For each CPU torsion slot (in DFS order), find the corresponding BFS index
     unsigned torsion_idx = 0;
     for (unsigned i = 0; i < c.ligands.size() && torsion_idx < n_torsions; i++) {
         for (unsigned j = 0; j < c.ligands[i].torsions.size() && torsion_idx < n_torsions; j++) {
-            c.ligands[i].torsions[j] = flat_conf[nlig_roots + 6 * nlig_roots + torsion_idx];
+            // Convert DFS torsion index to BFS torsion index
+            unsigned dfs_node_idx = torsion_idx + nlig_roots;  // DFS node index
+            unsigned bfs_node_idx = gdata.dfs_order_bfs_indices[dfs_node_idx];  // Convert to BFS
+            unsigned bfs_torsion_idx = bfs_node_idx - nlig_roots;  // BFS torsion index
+
+            // Read from GPU flat array (BFS order) into CPU conf (DFS order)
+            c.ligands[i].torsions[j] = flat_conf[7 * nlig_roots + bfs_torsion_idx];
             torsion_idx++;
         }
     }
@@ -1570,40 +1590,12 @@ __global__ void bfgs_minimize_kernel(
 
     // Initial energy and gradient
     set_conf_single_thread(ctx, state.x, state.coords, node_origins, node_orientations, node_axes);
-    float inter_energy = eval_energy_grid_single_thread(ctx, state.coords, state.forces, tid == 0);  // Debug on first thread
+    float inter_energy = eval_energy_grid_single_thread(ctx, state.coords, state.forces);
     float intra_energy = eval_intramolecular_single_thread(ctx, state.coords, state.forces);
     state.energy = inter_energy + intra_energy;
     compute_gradient_single_thread(ctx, state.coords, state.forces, node_origins,
                                    node_axes, state.node_forces, state.node_torques, state.g);
     state.best_energy = state.energy;
-
-    // DEBUG: Print initial state
-    if (tid == 0) {
-        printf("GPU DEBUG: forcecap=%f, slope=%f\n", ctx.forcecap, ctx.slope);
-        printf("GPU DEBUG: Initial energy=%f (inter=%f, intra=%f)\n", state.energy, inter_energy, intra_energy);
-        printf("GPU DEBUG: Initial gradient (first 6 rigid): ");
-        for (int i = 0; i < 6 && i < ctx.n_change; i++) {
-            printf("%f ", state.g[i]);
-        }
-        printf("\n");
-        if (ctx.n_change > 6) {
-            printf("GPU DEBUG: Initial gradient (torsions): ");
-            for (int i = 6; i < ctx.n_change; i++) {
-                printf("%f ", state.g[i]);
-            }
-            printf("\n");
-        }
-        printf("GPU DEBUG: n_change=%d, n_conf=%d, num_atoms=%d, num_nodes=%d, ngrids=%d\n",
-               ctx.n_change, ctx.n_conf, ctx.num_atoms, ctx.num_nodes, ctx.ngrids);
-
-        // Print first 5 atom positions, types and per-atom energies
-        printf("GPU DEBUG: First atoms (pos, type):\n");
-        for (unsigned i = 0; i < 5 && i < ctx.num_atoms; i++) {
-            unsigned atom_type = ctx.atom_types[i];
-            printf("  Atom %d: pos=(%f,%f,%f), type=%d\n",
-                   i, state.coords[i*3], state.coords[i*3+1], state.coords[i*3+2], atom_type);
-        }
-    }
 
     // Save best conf
     for (int i = 0; i < ctx.n_conf; i++) {
@@ -1632,15 +1624,6 @@ __global__ void bfgs_minimize_kernel(
             state.p[i] = -state.p[i];
         }
 
-        // DEBUG: Print first iteration details
-        if (tid == 0 && iter == 0) {
-            printf("GPU DEBUG iter 0: Search direction p (first 6): ");
-            for (int i = 0; i < 6 && i < ctx.n_change; i++) {
-                printf("%f ", state.p[i]);
-            }
-            printf("\n");
-        }
-
         // Line search
         float f_new;
         float alpha = accurate_line_search_single_thread(
@@ -1649,14 +1632,8 @@ __global__ void bfgs_minimize_kernel(
             state.node_forces, state.node_torques, state.g_new, f_new
         );
 
-        // DEBUG: Print line search result
-        if (tid == 0 && iter == 0) {
-            printf("GPU DEBUG iter 0: alpha=%f, f0=%f, f_new=%f\n", alpha, state.energy, f_new);
-        }
-
         // Check for line search failure
         if (alpha == 0) {
-            if (tid == 0) printf("GPU DEBUG: Line search failed at iter %d\n", iter);
             break;
         }
 
@@ -1723,7 +1700,8 @@ void run_parallel_bfgs_minimize(
     int max_iterations,
     float& out_energy,
     float& out_intramolecular,
-    std::vector<float>& out_conf
+    std::vector<float>& out_conf,
+    std::vector<float>* out_gradient
 ) {
     // Create scoring context
     ScoringContext ctx;
@@ -1779,6 +1757,13 @@ void run_parallel_bfgs_minimize(
     // (TODO: compute proper intramolecular on final pose)
     out_energy = best_energy;
     out_intramolecular = 0;  // Will be computed by caller using model
+
+    // Copy gradient if requested
+    if (out_gradient) {
+        out_gradient->resize(max_change);
+        CUDA_CHECK_GNINA(cudaMemcpy(out_gradient->data(), mem.all_g,
+                                    max_change * sizeof(float), cudaMemcpyDeviceToHost));
+    }
 
     // Cleanup
     free_batch_memory(mem);

@@ -123,9 +123,7 @@ fl non_cache::check_bounds_deriv(const grid_dims& dims, const vec& a_coords,
 }
 
 fl non_cache::eval_deriv(model& m, fl v, const grid& user_grid) const { // clean up
-  static bool first_call = true;
-  bool do_debug = first_call;
-  first_call = false;
+  bool do_debug = false;
 
   fl e = 0;
   const fl cutoff_sqr = p->cutoff_sqr();

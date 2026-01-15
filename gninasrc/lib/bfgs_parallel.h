@@ -198,6 +198,7 @@ void run_parallel_bfgs_docking(
 // High-level interface for local minimization from input pose
 // Returns: final energy (inter-adjusted), intramolecular energy
 // out_conf: optimized conformation in flat format
+// out_gradient: optional output for final gradient (pass nullptr to skip)
 void run_parallel_bfgs_minimize(
     const struct gpu_data& gdata,
     const struct GPUCacheInfo& cacheInfo,
@@ -205,7 +206,8 @@ void run_parallel_bfgs_minimize(
     int max_iterations,
     float& out_energy,
     float& out_intramolecular,
-    std::vector<float>& out_conf
+    std::vector<float>& out_conf,
+    std::vector<float>* out_gradient = nullptr  // Optional: final gradient
 );
 
 // High-level interface for score-only mode (no optimization)
@@ -219,21 +221,25 @@ void run_gpu_score_only(
     float& out_intramolecular_energy
 );
 
-// Helper: convert conf struct to flat array format
+// Helper: convert conf struct to flat array format for GPU
 // flat_conf must be pre-allocated with size >= 7 * nlig_roots + n_torsions
+// Uses gpu_data for DFS-to-BFS torsion index conversion
 void conf_to_flat(
     const struct conf& c,
     unsigned nlig_roots,
     unsigned n_torsions,
-    float* flat_conf
+    float* flat_conf,
+    const struct gpu_data& gdata
 );
 
 // Helper: convert flat array format back to conf struct
+// Uses gpu_data for BFS-to-DFS torsion index conversion
 void flat_to_conf(
     const float* flat_conf,
     unsigned nlig_roots,
     unsigned n_torsions,
-    struct conf& c
+    struct conf& c,
+    const struct gpu_data& gdata
 );
 
 // Launch parallel BFGS kernel

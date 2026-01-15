@@ -84,7 +84,9 @@ struct user_settings {
     bool no_gpu;
     bool no_lig;
     bool gpu; //use GPU for docking (parallel BFGS instead of MC)
+    bool cpu_grid; //use grid-based scoring for CPU local_only (to match GPU behavior)
     int bfgs_iterations; //max BFGS iterations when using --gpu
+    bool verbose_grad; //output gradient values for debugging
 
 
     cnn_options cnnopts;
@@ -97,7 +99,7 @@ struct user_settings {
             sort_order(CNNscore), score_only(false),
             randomize_only(false), local_only(false), dominimize(false),
             include_atom_info(false), no_gpu(false), no_lig(false),
-            gpu(false), bfgs_iterations(100) {
+            gpu(false), cpu_grid(false), bfgs_iterations(100), verbose_grad(false) {
 
     }
 };

@@ -83,6 +83,21 @@ struct GPUCacheInfo {
     GPUSplineInfo *splineInfo;
 };
 
+// Info for non-cache (pairwise) GPU calculation
+struct GPUNonCacheInfo {
+    unsigned num_movable_atoms, nrec_atoms;
+    float cutoff_sq;
+    fl slope;
+    gfloat3 gridends;
+    gfloat3 gridbegins;
+    force_energy_tup *lig_penalties; // out of bounds lig
+    unsigned *types;  // lig atom types
+    atom_params *rec_atoms;
+    unsigned *rectypes;
+    unsigned ntypes;
+    GPUSplineInfo *splineInfo; // triangular matrix indexed by type
+};
+
 void evaluate_splines_host(const GPUSplineInfo& spInfo, float r,
     float *device_vals, float *device_derivs);
 

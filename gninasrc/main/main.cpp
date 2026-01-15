@@ -135,43 +135,43 @@ fl do_randomization(model &m, const vec &corner1, const vec &corner2, int seed, 
   return best_clash_penalty;
 }
 
-void refine_structure(model &m, const precalculate &prec, non_cache &nc, output_type &out, const vec &cap,
-                      const minimization_params &minparm, grid &user_grid, int verbosity, tee &log, non_cache &nc_new) {
+void refine_structure(model &m, const precalculate &prec, igrid &ig, output_type &out, const vec &cap,
+                      const minimization_params &minparm, grid &user_grid, int verbosity, tee &log, igrid &ig_new) {
   // std::cout << m.get_name() << " | pose " << m.get_pose_num() << " | refining structure\n";
-  change g(m.get_size(), nc.move_receptor());
+  change g(m.get_size(), ig.move_receptor());
 
-  nc.adjust_center(m); // for cnn, set cnn box
-  if (!nc.within(m)) {
+  ig.adjust_center(m); // for cnn, set cnn box
+  if (!ig.within(m)) {
     std::cout << m.get_name() << " | pose " << m.get_pose_num() << " | initial pose not within box\n";
   }
   quasi_newton quasi_newton_par(minparm);
-  const fl slope_orig = nc.getSlope();
+  const fl slope_orig = ig.getSlope();
   // try 5 times to get ligand into box
   // dkoes - you don't need a very strong constraint to keep ligands in the box,
   // but this factor can really bias the energy landscape
   fl slope = 10;
   VINA_FOR(p, 5) {
-    nc.setSlope(slope);
-    quasi_newton_par(m, prec, nc, out, g, cap, user_grid); // quasi_newton operator
+    ig.setSlope(slope);
+    quasi_newton_par(m, prec, ig, out, g, cap, user_grid); // quasi_newton operator
     m.set(out.c);                                          // just to be sure
-    if (nc.within(m)) {
+    if (ig.within(m)) {
       break;
     }
     std::cout << m.get_name() << " | pose " << m.get_pose_num() << " | ligand outside box\n";
     slope *= 10;
   }
   out.coords = m.get_heavy_atom_movable_coords();
-  if (!nc.within(m))
+  if (!ig.within(m))
     out.e = max_fl;
-  nc.setSlope(slope_orig);
+  ig.setSlope(slope_orig);
   if (verbosity > 1) {
     // log total and empirical energy, useful for testing CNN + empirical merge
     log.endl();
-    fl final_e = nc.eval_deriv(m, cap[1], user_grid);
+    fl final_e = ig.eval_deriv(m, cap[1], user_grid);
     log << "Total energy after refinement: " << std::fixed << std::setprecision(5) << final_e;
     log.endl();
     // non_cache::eval for empirical energy
-    fl final_emp_e = nc_new.eval(m, cap[1]);
+    fl final_emp_e = ig_new.eval(m, cap[1]);
     log << "Empirical energy after refinement: " << std::fixed << std::setprecision(5) << final_emp_e;
     log.endl();
   }
@@ -377,7 +377,7 @@ void do_search(model &m, const boost::optional<model> &ref, const boost::optiona
       int conf_size = 7 * nlig_roots + n_torsions;
 
       std::vector<float> input_conf(conf_size);
-      conf_to_flat(c, nlig_roots, n_torsions, input_conf.data());
+      conf_to_flat(c, nlig_roots, n_torsions, input_conf.data(), m.gdata);
 
       // Run GPU score-only
       float gpu_inter_energy, gpu_intra_energy;
@@ -481,24 +481,53 @@ void do_search(model &m, const boost::optional<model> &ref, const boost::optiona
       int conf_size = 7 * nlig_roots + n_torsions;
 
       std::vector<float> input_conf(conf_size);
-      conf_to_flat(c, nlig_roots, n_torsions, input_conf.data());
+      conf_to_flat(c, nlig_roots, n_torsions, input_conf.data(), m.gdata);
 
       // Run parallel BFGS minimize
       float out_energy, out_intramolecular;
       std::vector<float> out_conf;
+      std::vector<float> out_gradient;
 
       run_parallel_bfgs_minimize(
           m.gdata, cacheInfo,
           input_conf,
           settings.bfgs_iterations,
           out_energy, out_intramolecular,
-          out_conf
+          out_conf,
+          settings.verbose_grad ? &out_gradient : nullptr
       );
 
       done(settings.verbosity, log);
 
+      // Output gradient if verbose_grad is set
+      // Convert GPU gradient from BFS to DFS order for comparison with CPU
+      if (settings.verbose_grad && !out_gradient.empty()) {
+        log << "\nGPU Gradient (" << out_gradient.size() << " DOF) - converted to DFS order:\n";
+        log << std::fixed << std::setprecision(8);
+
+        // First output rigid body gradients (position + orientation)
+        sz idx = 0;
+        for (unsigned i = 0; i < nlig_roots; i++) {
+          for (unsigned j = 0; j < 3; j++) {
+            log << "  g[" << idx++ << "] = " << out_gradient[i * 6 + j] << "  (pos" << j << ")\n";
+          }
+          for (unsigned j = 0; j < 3; j++) {
+            log << "  g[" << idx++ << "] = " << out_gradient[i * 6 + 3 + j] << "  (ori" << j << ")\n";
+          }
+        }
+
+        // Convert torsion gradients from BFS to DFS order
+        for (unsigned dfs_torsion_idx = 0; dfs_torsion_idx < n_torsions; dfs_torsion_idx++) {
+          unsigned dfs_node_idx = dfs_torsion_idx + nlig_roots;
+          unsigned bfs_node_idx = m.gdata.dfs_order_bfs_indices[dfs_node_idx];
+          unsigned bfs_torsion_idx = bfs_node_idx - nlig_roots;
+          log << "  g[" << idx++ << "] = " << out_gradient[6 * nlig_roots + bfs_torsion_idx] << "  (tor" << dfs_torsion_idx << ")\n";
+        }
+        log.endl();
+      }
+
       // Convert result back to conf
-      flat_to_conf(out_conf.data(), nlig_roots, n_torsions, c);
+      flat_to_conf(out_conf.data(), nlig_roots, n_torsions, c, m.gdata);
       m.set(c);
 
       // Compute proper energies using model for accurate reporting
@@ -537,11 +566,71 @@ void do_search(model &m, const boost::optional<model> &ref, const boost::optiona
       standard_local_only:
       vecv origcoords = m.get_heavy_atom_movable_coords();
       output_type out(c, e);
+
+      // Output INITIAL gradient if verbose_grad is set (before optimization)
+      if (settings.verbose_grad) {
+        change g(m.get_size(), false);
+        fl grad_e;
+        if (settings.cpu_grid) {
+          grad_e = m.eval_deriv(prec, ig, authentic_v, c, g, user_grid);
+        } else {
+          grad_e = m.eval_deriv(prec, nc, authentic_v, c, g, user_grid);
+        }
+        log << "\nCPU Initial Gradient (energy=" << std::fixed << std::setprecision(5) << grad_e << "):\n";
+        log << std::fixed << std::setprecision(8);
+        sz idx = 0;
+        for (sz i = 0; i < g.ligands.size(); i++) {
+          const ligand_change& lig = g.ligands[i];
+          for (sz j = 0; j < 3; j++) {
+            log << "  g[" << idx++ << "] = " << lig.rigid.position[j] << "  (pos" << j << ")\n";
+          }
+          for (sz j = 0; j < 3; j++) {
+            log << "  g[" << idx++ << "] = " << lig.rigid.orientation[j] << "  (ori" << j << ")\n";
+          }
+          for (sz j = 0; j < lig.torsions.size(); j++) {
+            log << "  g[" << idx++ << "] = " << lig.torsions[j] << "  (tor" << j << ")\n";
+          }
+        }
+        log.endl();
+      }
+
       doing(settings.verbosity, "Performing local search", log);
-      refine_structure(m, prec, nc, out, authentic_v, par.mc.ssd_par.minparm, user_grid, settings.verbosity, log,
-                       nc_new);
+      // Use grid cache (ig) when cpu_grid is set, otherwise use pairwise (nc)
+      if (settings.cpu_grid) {
+        refine_structure(m, prec, ig, out, authentic_v, par.mc.ssd_par.minparm, user_grid, settings.verbosity, log, ig);
+      } else {
+        refine_structure(m, prec, nc, out, authentic_v, par.mc.ssd_par.minparm, user_grid, settings.verbosity, log, nc_new);
+      }
       done(settings.verbosity, log);
       m.set(out.c);
+
+      // Output FINAL gradient if verbose_grad is set (after optimization)
+      if (settings.verbose_grad) {
+        change g(m.get_size(), false);
+        fl grad_e;
+        if (settings.cpu_grid) {
+          grad_e = m.eval_deriv(prec, ig, authentic_v, out.c, g, user_grid);
+        } else {
+          grad_e = m.eval_deriv(prec, nc, authentic_v, out.c, g, user_grid);
+        }
+        log << "\nCPU Final Gradient (energy=" << std::fixed << std::setprecision(5) << grad_e << "):\n";
+        log << std::fixed << std::setprecision(8);
+        // Output gradient values - ligand has position (3) + orientation (3) + torsions
+        sz idx = 0;
+        for (sz i = 0; i < g.ligands.size(); i++) {
+          const ligand_change& lig = g.ligands[i];
+          for (sz j = 0; j < 3; j++) {
+            log << "  g[" << idx++ << "] = " << lig.rigid.position[j] << "  (pos" << j << ")\n";
+          }
+          for (sz j = 0; j < 3; j++) {
+            log << "  g[" << idx++ << "] = " << lig.rigid.orientation[j] << "  (ori" << j << ")\n";
+          }
+          for (sz j = 0; j < lig.torsions.size(); j++) {
+            log << "  g[" << idx++ << "] = " << lig.torsions[j] << "  (tor" << j << ")\n";
+          }
+        }
+        log.endl();
+      }
 
       // be as exact as possible for final score
       naive_non_cache nnc(&exact_prec); // for out of grid issues
@@ -952,8 +1041,12 @@ void main_procedure(model &m, precalculate &prec,
   }
 
   par.mc.ssd_par.evals = unsigned((25 + m.num_movable_atoms()) / 3);
-  if (minparm.maxiters == 0)
+  // For --local_only (but not --minimize), use bfgs_iterations to match GPU behavior
+  if (settings.local_only && !settings.dominimize) {
+    minparm.maxiters = settings.bfgs_iterations;
+  } else if (minparm.maxiters == 0) {
     minparm.maxiters = par.mc.ssd_par.evals;
+  }
   par.mc.ssd_par.minparm = minparm;
   par.mc.min_rmsd = 1.0;
   par.mc.num_saved_mins = settings.num_modes > settings.num_mc_saved ? settings.num_modes : settings.num_mc_saved;
@@ -982,9 +1075,12 @@ void main_procedure(model &m, precalculate &prec,
       do_search(m, ref, ref_data, wt, prec, *nc, *nc, corner1, corner2, par, settings, compute_atominfo, log,
                 wt.unweighted_terms(), user_grid, cnn, results, gridcache, gd, slope);
     } else {
-      // Cache is needed for --gpu mode even with local_only
-      bool cache_needed = !(settings.score_only || settings.randomize_only ||
-                           (settings.local_only && !settings.gpu));
+      // Cache is needed for --gpu mode even with local_only or score_only
+      // CPU score_only uses naive_non_cache, but GPU score_only needs grids
+      // With --cpu_grid, CPU local_only also uses grid cache
+      bool cache_needed = !(settings.randomize_only ||
+                           (settings.score_only && !settings.gpu) ||
+                           (settings.local_only && !settings.gpu && !settings.cpu_grid));
 
       // For --gpu mode, use a static cache to avoid recreating for each molecule
       // This significantly speeds up multi-ligand docking with the same receptor
@@ -1519,8 +1615,12 @@ Thank you!\n";
                                       "local search only using autobox (you probably want to use --minimize)")(
         "gpu", bool_switch(&settings.gpu)->default_value(false),
         "use GPU for docking (parallel BFGS instead of Monte Carlo)")(
+        "cpu_grid", bool_switch(&settings.cpu_grid)->default_value(false),
+        "use grid-based scoring for CPU local_only (to match GPU behavior)")(
         "bfgs_iterations", value<int>(&settings.bfgs_iterations)->default_value(100),
-        "max BFGS iterations when using --gpu")(
+        "max BFGS iterations for --gpu and --local_only modes")(
+        "verbose_grad", bool_switch(&settings.verbose_grad)->default_value(false),
+        "output gradient values for debugging")(
         "minimize", bool_switch(&settings.dominimize)->default_value(false), "energy minimization")(
         "randomize_only", bool_switch(&settings.randomize_only), "generate random poses, attempting to avoid clashes")(
         "num_mc_steps", value<int>(&settings.num_mc_steps), "fixed number of monte carlo steps to take in each chain")(
@@ -1709,9 +1809,14 @@ Thank you!\n";
         approx_factor = 10;
     }
 
-    // Also set soft forcecap for --gpu --local_only (parallel BFGS minimize)
-    if (settings.gpu && settings.local_only && !vm.count("force_cap")) {
+    // Set soft forcecap for --local_only (CPU and GPU) to match --minimize behavior
+    if (settings.local_only && !settings.dominimize && !vm.count("force_cap")) {
       settings.forcecap = 10;
+    }
+
+    // Use accurate line search for --local_only to match GPU behavior
+    if (settings.local_only && !settings.dominimize) {
+      minparms.type = minimization_params::BFGSAccurateLineSearch;
     }
 
      // output banner

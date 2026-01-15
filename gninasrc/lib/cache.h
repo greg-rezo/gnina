@@ -59,6 +59,14 @@ struct cache : public igrid {
     virtual void set_slope(float s) {
       slope = s;
     }
+
+    // igrid interface for slope
+    virtual fl getSlope() const override {
+      return slope;
+    }
+    virtual void setSlope(fl sl) override {
+      slope = sl;
+    }
   private:
     std::string scoring_function_version;
     atomv atoms; // for verification

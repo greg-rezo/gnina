@@ -30,6 +30,7 @@ struct model;
 // forward declaration
 
 struct igrid { // grids interface (that cache, etc. conform to)
+    virtual ~igrid() {}
     virtual fl eval(model& m, fl v) const = 0; // needs m.coords // clean up
     virtual fl eval_deriv(model& m, fl v, const grid& user_grid) const = 0; // needs m.coords, sets m.minus_forces // clean up
     virtual bool skip_interacting_pairs() const {
@@ -43,6 +44,15 @@ struct igrid { // grids interface (that cache, etc. conform to)
     virtual bool move_receptor() {
       return false;
     } //for cnn, if we are moving receptor
+    virtual bool within(const model& m, fl margin = 0.0001) const {
+      return true;  // default: assume within bounds
+    }
+    virtual fl getSlope() const {
+      return 1e3;  // default slope
+    }
+    virtual void setSlope(fl sl) {
+      // default: no-op
+    }
 };
 
 #endif
