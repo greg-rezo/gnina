@@ -32,29 +32,12 @@ if ! docker volume inspect "$VOLUME_NAME" &> /dev/null; then
     docker volume create "$VOLUME_NAME"
 fi
 
-# Base volume mounts (source files)
+# Base volume mounts - mount entire source directories
 MOUNTS=(
     -v "$VOLUME_NAME:/gnina/build"
-    -v "$SCRIPT_DIR/gninasrc/lib/bfgs_parallel.h:/gnina/src/gninasrc/lib/bfgs_parallel.h:ro"
-    -v "$SCRIPT_DIR/gninasrc/lib/bfgs_parallel.cu:/gnina/src/gninasrc/lib/bfgs_parallel.cu:ro"
-    -v "$SCRIPT_DIR/gninasrc/lib/user_opts.h:/gnina/src/gninasrc/lib/user_opts.h:ro"
-    -v "$SCRIPT_DIR/gninasrc/lib/result_info.h:/gnina/src/gninasrc/lib/result_info.h:ro"
-    -v "$SCRIPT_DIR/gninasrc/lib/result_info.cpp:/gnina/src/gninasrc/lib/result_info.cpp:ro"
-    -v "$SCRIPT_DIR/gninasrc/lib/PDBQTUtilities.cpp:/gnina/src/gninasrc/lib/PDBQTUtilities.cpp:ro"
-    -v "$SCRIPT_DIR/gninasrc/main/main.cpp:/gnina/src/gninasrc/main/main.cpp:ro"
-    -v "$SCRIPT_DIR/gninasrc/pygnina/bindings.cpp:/gnina/src/gninasrc/pygnina/bindings.cpp:ro"
-    -v "$SCRIPT_DIR/gninasrc/CMakeLists.txt:/gnina/src/gninasrc/CMakeLists.txt:ro"
+    -v "$SCRIPT_DIR/gninasrc:/gnina/src/gninasrc:ro"
+    -v "$SCRIPT_DIR/test:/gnina/src/test:ro"
 )
-
-# Add test file mounts if building tests
-if $BUILD_TESTS; then
-    MOUNTS+=(
-        -v "$SCRIPT_DIR/test/gnina/test_bfgs_parallel.cu:/gnina/src/test/gnina/test_bfgs_parallel.cu:ro"
-        -v "$SCRIPT_DIR/test/gnina/test_bfgs_parallel.h:/gnina/src/test/gnina/test_bfgs_parallel.h:ro"
-        -v "$SCRIPT_DIR/test/gnina/test_runner.cpp:/gnina/src/test/gnina/test_runner.cpp:ro"
-        -v "$SCRIPT_DIR/test/gnina/CMakeLists.txt:/gnina/src/test/gnina/CMakeLists.txt:ro"
-    )
-fi
 
 # Set build target and cmake flags based on mode
 if $BUILD_TESTS; then

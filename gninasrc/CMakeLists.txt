@@ -47,6 +47,7 @@ lib/cnn_torch_scorer.cpp
 lib/coords.cpp
 lib/covinfo.cpp
 lib/custom_terms.cpp
+lib/device_buffer.cpp
 lib/dl_scorer.cpp
 lib/everything.cpp
 lib/flexinfo.cpp
