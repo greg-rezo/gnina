@@ -12,10 +12,8 @@
 #include "curl.h"
 #include <boost/unordered_map.hpp>
 #include <boost/algorithm/string/predicate.hpp>
-#include "non_cache_gpu.h"
 #include "loop_timer.h"
 #include "gpu_debug.h"
-#include "device_buffer.h"
 
 #define MAX_THREADS 1024
 
@@ -180,23 +178,6 @@ __device__ fl gpu_data::eval_deriv_gpu(const infoT& info, const vec& v,
 
   /* flex.derivative(coords, minus_forces, g.flex); // inflex forces are ignored */
   return e;
-}
-
-//NB: the next two are only used for score_only, but they also compute the forces
-//unnecessarily. this is fine as long as you don't care about using score_only
-//for performance metrics, just correctness, which is what you should do. 
-fl gpu_data::eval(const GPUNonCacheInfo& info, const float v) {
-  fl e;
-  cudaMemsetAsync(minus_forces, 0,
-      sizeof(force_energy_tup) * info.num_movable_atoms, cudaStreamPerThread);
-  e = single_point_calc(info, coords, minus_forces, v);
-  return e;
-}
-
-fl gpu_data::eval_intramolecular(const GPUNonCacheInfo& info, const float v) {
-  fl ie;
-  ie = eval_interacting_pairs_deriv_gpu(info, v, interacting_pairs, pairs_size);
-  return ie;
 }
 
 fl model::eval_deriv(const precalculate& p, const igrid& ig, const vec& v,
@@ -537,18 +518,10 @@ size_t gpu_data::node_idx_cpu2gpu(size_t cpu_idx) const {
 }
 
 template
-__host__  __device__ fl gpu_data::eval_interacting_pairs_deriv_gpu<
-    GPUNonCacheInfo>(const GPUNonCacheInfo& info, fl v, interacting_pair* pairs,
-    unsigned pairs_sz) const;
-
-template
 __host__  __device__ fl gpu_data::eval_interacting_pairs_deriv_gpu<GPUCacheInfo>(
     const GPUCacheInfo& info, fl v, interacting_pair* pairs,
     unsigned pairs_sz) const;
 
-template __device__ fl gpu_data::eval_deriv_gpu<GPUNonCacheInfo>(
-    const GPUNonCacheInfo& info, const vec& v, const conf_gpu& c,
-    change_gpu& g);
 template __device__ fl gpu_data::eval_deriv_gpu<GPUCacheInfo>(
     const GPUCacheInfo& info, const vec& v, const conf_gpu& c, change_gpu& g);
 

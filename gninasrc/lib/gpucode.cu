@@ -212,60 +212,6 @@ void eval_intra_st(const GPUSplineInfo * spinfo, const atom_params * atoms,
   *st_e = total;
 }
 
-//calculates the energies of all ligand-prot interactions and combines the results
-//into energies and minus forces
-//needs enough shared memory for derivatives and energies of single ligand atom
-//roffset specifies how far into the receptor atoms we are
-template<bool remainder> __global__
-void interaction_energy(const GPUNonCacheInfo dinfo, unsigned remainder_offset,
-    const atom_params *ligs, force_energy_tup *out) {
-  unsigned l = blockIdx.x;
-  unsigned r = blockDim.x - threadIdx.x - 1;
-  unsigned roffset =
-      remainder ? remainder_offset : blockIdx.y * THREADS_PER_BLOCK;
-  unsigned ridx = roffset + r;
-  //get ligand atom info
-  unsigned t = dinfo.types[l];
-  float rec_energy = 0;
-  gfloat3 rec_deriv(0, 0, 0);
-
-  atom_params lin = ligs[l];
-  gfloat3 xyz = lin.coords;
-
-  //TODO: remove hydrogen atoms completely
-  if (t > 1) { //ignore hydrogens
-    //now consider interaction with every possible receptor atom
-    if (ridx < dinfo.nrec_atoms) {
-      //compute squared difference
-      atom_params rin = dinfo.rec_atoms[ridx];
-      gfloat3 diff = xyz - rin.coords;
-
-      float rSq = 0;
-      for (unsigned j = 0; j < 3; j++) {
-        float d = diff[j];
-        rSq += d * d;
-      }
-
-      if (rSq < dinfo.cutoff_sq) {
-        //dkoes - the "derivative" value returned by eval_deriv
-        //is normalized by r (dor = derivative over r?)
-        float dor;
-        rec_energy = eval_deriv_gpu(dinfo.splineInfo, t, lin.charge,
-            dinfo.rectypes[ridx], rin.charge, rSq, dor);
-        rec_deriv = diff * dor;
-      }
-    }
-  }
-  float this_e = block_sum<float>(rec_energy);
-  gfloat3 deriv = block_sum<gfloat3>(rec_deriv);
-  if (threadIdx.x == 0) {
-    if (dinfo.nrec_atoms > 1024)
-      pseudoAtomicAdd(&out[l], force_energy_tup(deriv, this_e));
-    else
-      out[l] += force_energy_tup(deriv, this_e);
-  }
-}
-
 __device__ void reduce_energy(force_energy_tup *result, float energy) {
   unsigned idx = threadIdx.x;
   float e = block_sum<float>(energy);
@@ -334,45 +280,6 @@ __global__ void reduce_energy(force_energy_tup *result, int n, float v,
 /*                      float3 *e_penalties, float3 *deriv_penalties){ */
 
 /* } */
-
-__host__ __device__
-float single_point_calc(const GPUNonCacheInfo &info, atom_params *ligs,
-    force_energy_tup *out, float v) {
-  /* Assumed by warp_sum */
-  assert(THREADS_PER_BLOCK <= 1024);
-  unsigned num_movable_atoms = info.num_movable_atoms;
-  unsigned nrec_atoms = info.nrec_atoms;
-
-  //this will calculate the per-atom energies and forces.
-  //TODO: there could be one execution stream for the blocks with
-  //a full complement of threads and a separate stream
-  //for the blocks that have the remaining threads
-  unsigned nfull_blocks = nrec_atoms / THREADS_PER_BLOCK;
-  unsigned nthreads_remain = nrec_atoms % THREADS_PER_BLOCK;
-
-  if (nfull_blocks)
-    interaction_energy<0> <<<dim3(num_movable_atoms, nfull_blocks),
-    THREADS_PER_BLOCK>>>(info, 0, ligs, out);
-  if (nthreads_remain)
-    interaction_energy<1> <<<num_movable_atoms, ROUND_TO_WARP(nthreads_remain)>>>(
-        info, nrec_atoms - nthreads_remain, ligs, out);
-
-  //TODO: reduce energy only launches one block, thus enforcing the
-  //hardware restriction on the number of threads per block for the number of
-  //movable atoms. generalize this to remove this unnecessary constraint
-  assert(num_movable_atoms <= 1024);
-  reduce_energy<<<1, ROUND_TO_WARP(num_movable_atoms)>>>(out, num_movable_atoms,
-      v, info.gridbegins, info.gridends, info.slope, ligs);
-  abort_on_gpu_err();
-#ifdef __CUDA_ARCH__
-  return out->energy;
-#else
-  cudaDeviceSynchronize();
-  float cpu_out;
-  definitelyPinnedMemcpy(&cpu_out, &out->energy, sizeof(float), cudaMemcpyDeviceToHost);
-  return cpu_out;
-#endif
-}
 
 __global__
 void cache_gpu_kernel(const GPUCacheInfo info, atom_params *ligs,

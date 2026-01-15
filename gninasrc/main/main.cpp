@@ -56,7 +56,6 @@
 #include "naive_non_cache.h"
 #include "non_cache.h"
 #include "non_cache_cnn.h"
-#include "non_cache_gpu.h"
 #include "obmolopener.h"
 #include "parallel_mc.h"
 #include "parse_error.h"
@@ -302,20 +301,29 @@ static fl compute_reference_rmsd(const model &m, const boost::optional<reference
     if (current_coords.size() != ref->coords.size()) return -1;
     if (current_coords.size() != ref->rdkit_mol->getNumAtoms()) return -1;
 
-    // Create a copy of the reference molecule for the probe (current pose)
+    // Create two molecules: one with reference coords, one with current coords
+    RDKit::RWMol ref_mol(*ref->rdkit_mol);
     RDKit::RWMol probe_mol(*ref->rdkit_mol);
 
-    // Update probe molecule coordinates with current pose
-    RDKit::Conformer &conf = probe_mol.getConformer();
+    // Set reference molecule coordinates from stored ref->coords
+    RDKit::Conformer &ref_conf = ref_mol.getConformer();
+    for (size_t i = 0; i < ref->coords.size(); i++) {
+      ref_conf.setAtomPos(i, RDGeom::Point3D(ref->coords[i][0],
+                                              ref->coords[i][1],
+                                              ref->coords[i][2]));
+    }
+
+    // Set probe molecule coordinates with current pose
+    RDKit::Conformer &probe_conf = probe_mol.getConformer();
     for (size_t i = 0; i < current_coords.size(); i++) {
-      conf.setAtomPos(i, RDGeom::Point3D(current_coords[i][0],
-                                          current_coords[i][1],
-                                          current_coords[i][2]));
+      probe_conf.setAtomPos(i, RDGeom::Point3D(current_coords[i][0],
+                                                current_coords[i][1],
+                                                current_coords[i][2]));
     }
 
     // Use getBestRMS which accounts for molecular symmetry
     // It finds the optimal atom mapping that minimizes RMSD
-    double rmsd = RDKit::MolAlign::getBestRMS(probe_mol, *ref->rdkit_mol);
+    double rmsd = RDKit::MolAlign::getBestRMS(probe_mol, ref_mol);
     return static_cast<fl>(rmsd);
   } catch (...) {
     return -1;
@@ -340,7 +348,7 @@ void do_search(model &m, const boost::optional<model> &ref, const boost::optiona
     fl intramolecular_energy = max_fl;
     fl cnnscore = 0, cnnaffinity = 0, cnnvariance = 0;
     fl rmsd = 0;
-    if (settings.gpu_docking)
+    if (settings.gpu)
       m.initialize_gpu();
     const vec authentic_v(settings.forcecap, settings.forcecap,
                           settings.forcecap); // small cap restricts initial movement from clash
@@ -384,24 +392,18 @@ void do_search(model &m, const boost::optional<model> &ref, const boost::optiona
 
       if (compute_atominfo)
         results.back().setAtomValues(m, &sf);
-    } else if (settings.bfgs_only && settings.local_only) {
+    } else if (settings.gpu && settings.local_only) {
       // Parallel BFGS minimize from input pose
-      if (!settings.gpu_docking) {
-        log << "ERROR: --bfgs_only --local_only requires GPU docking.\n";
-        log.endl();
-        throw std::runtime_error("--bfgs_only requires GPU docking");
-      }
-
       cache_gpu* cgpu = dynamic_cast<cache_gpu*>(&ig);
       if (!cgpu) {
-        log << "ERROR: --bfgs_only --local_only requires grid caching.\n";
+        log << "ERROR: --gpu --local_only requires grid caching.\n";
         log.endl();
-        throw std::runtime_error("--bfgs_only requires grid caching");
+        throw std::runtime_error("--gpu --local_only requires grid caching");
       }
 
       vecv origcoords = m.get_heavy_atom_movable_coords();
 
-      log << "Running parallel BFGS minimize (iterations=" << settings.bfgs_iterations << ")\n";
+      log << "Running parallel BFGS minimize (iterations=" << settings.gpu_bfgs_iterations << ")\n";
       log.endl();
 
       doing(settings.verbosity, "Performing parallel BFGS local search", log);
@@ -426,7 +428,7 @@ void do_search(model &m, const boost::optional<model> &ref, const boost::optiona
       run_parallel_bfgs_minimize(
           m.gdata, cacheInfo,
           input_conf,
-          settings.bfgs_iterations,
+          settings.gpu_bfgs_iterations,
           out_energy, out_intramolecular,
           out_conf
       );
@@ -512,24 +514,18 @@ void do_search(model &m, const boost::optional<model> &ref, const boost::optiona
 
       if (compute_atominfo)
         results.back().setAtomValues(m, &sf);
-    } else if (settings.bfgs_only) {
-      // Parallel BFGS without Monte Carlo - requires GPU
-      if (!settings.gpu_docking) {
-        log << "ERROR: --bfgs_only requires GPU docking (--gpu_docking flag or cnn scoring).\n";
-        log.endl();
-        throw std::runtime_error("--bfgs_only requires GPU docking");
-      }
-
+    } else if (settings.gpu) {
+      // Parallel BFGS without Monte Carlo
       // Try to get cache_gpu info
       cache_gpu* cgpu = dynamic_cast<cache_gpu*>(&ig);
       if (!cgpu) {
-        log << "ERROR: --bfgs_only requires grid caching. Cannot use with no_cache mode.\n";
+        log << "ERROR: --gpu requires grid caching. Cannot use with no_cache mode.\n";
         log.endl();
-        throw std::runtime_error("--bfgs_only requires grid caching");
+        throw std::runtime_error("--gpu requires grid caching");
       }
 
       log << "Running parallel BFGS (exhaustiveness=" << settings.exhaustiveness
-          << ", bfgs_iterations=" << settings.bfgs_iterations << ")\n";
+          << ", bfgs_iterations=" << settings.gpu_bfgs_iterations << ")\n";
       log << "Using random seed: " << settings.seed;
       log.endl();
 
@@ -549,7 +545,7 @@ void do_search(model &m, const boost::optional<model> &ref, const boost::optiona
       run_parallel_bfgs_docking(
           m.gdata, cacheInfo,
           settings.exhaustiveness,
-          settings.bfgs_iterations,
+          settings.gpu_bfgs_iterations,
           box_min, box_max,
           settings.seed,
           energies, conformations
@@ -608,8 +604,19 @@ void do_search(model &m, const boost::optional<model> &ref, const boost::optiona
           output_type out_result(c_result, energies[i]);
           m.set(out_result.c);
           out_result.coords = m.get_heavy_atom_movable_coords();
-          add_to_output_container(out_cont, out_result, settings.out_min_rmsd, settings.num_modes * 10);
+          // Don't cluster by RMSD yet - just collect all valid poses
+          // Clustering should happen after refinement/scoring when we know final scores
+          out_cont.push_back(new output_type(out_result));
         }
+      }
+
+      // Sort by energy first to limit refinement to best initial poses
+      out_cont.sort();  // Default sort is by energy
+
+      // Limit to reasonable number for refinement
+      sz max_to_refine = settings.num_modes * 20;  // Refine more than we need, then cluster
+      while (out_cont.size() > max_to_refine) {
+        out_cont.pop_back();
       }
 
       // Refine and score results
@@ -642,7 +649,10 @@ void do_search(model &m, const boost::optional<model> &ref, const boost::optiona
         }
       };
 
+      // Sort by user-specified metric BEFORE clustering
       out_cont.sort(sorter);
+
+      // Now cluster by RMSD - this keeps the best-scoring pose from each cluster
       // Use symmetry-aware RMSD for clustering if RDKit mol is available
       if (ref_data && ref_data->rdkit_mol) {
         out_cont = remove_redundant(out_cont, settings.out_min_rmsd, ref_data->rdkit_mol);
@@ -902,12 +912,6 @@ void main_procedure(model &m, precalculate &prec,
     non_cache *nc = NULL;
     if (settings.cnnopts.cnn_scoring >= CNNrefinement) {
       nc = new non_cache_cnn(gridcache, gd, &prec, slope, cnn);
-    } else if (settings.gpu_docking) {
-      log << "WARNING: --gpu with empirical scoring is experimental and not recommended\n";
-      precalculate_gpu *gprec = dynamic_cast<precalculate_gpu *>(&prec);
-      if (!gprec)
-        abort();
-      nc = new non_cache_gpu(gridcache, gd, gprec, slope);
     } else {
       nc = new non_cache(gridcache, gd, &prec, slope);
     }
@@ -916,11 +920,11 @@ void main_procedure(model &m, precalculate &prec,
       do_search(m, ref, ref_data, wt, prec, *nc, *nc, corner1, corner2, par, settings, compute_atominfo, log,
                 wt.unweighted_terms(), user_grid, cnn, results, gridcache, gd, slope);
     } else {
-      // Cache is needed for bfgs_only mode even with local_only
+      // Cache is needed for --gpu mode even with local_only
       bool cache_needed = !(settings.score_only || settings.randomize_only ||
-                           (settings.local_only && !settings.bfgs_only));
+                           (settings.local_only && !settings.gpu));
 
-      // For bfgs_only mode, use a static cache to avoid recreating for each molecule
+      // For --gpu mode, use a static cache to avoid recreating for each molecule
       // This significantly speeds up multi-ligand docking with the same receptor
       static std::unique_ptr<cache> bfgs_cache;
       static grid_dims bfgs_cache_gd;
@@ -929,7 +933,7 @@ void main_procedure(model &m, precalculate &prec,
       std::unique_ptr<cache> local_cache;
       cache* c = nullptr;
 
-      if (settings.bfgs_only && settings.gpu_docking) {
+      if (settings.gpu && settings.gpu) {
         // Check if we can reuse the static cache (same grid dimensions)
         bool can_reuse = bfgs_cache_initialized &&
                          bfgs_cache_gd[0].begin == gd[0].begin && bfgs_cache_gd[0].end == gd[0].end &&
@@ -937,7 +941,7 @@ void main_procedure(model &m, precalculate &prec,
                          bfgs_cache_gd[2].begin == gd[2].begin && bfgs_cache_gd[2].end == gd[2].end;
 
         if (!can_reuse) {
-          // Create new cache for bfgs_only mode
+          // Create new cache for --gpu mode
           if (cache_needed)
             doing(settings.verbosity, "Analyzing the binding site (creating GPU cache)", log);
           bfgs_cache.reset(new cache_gpu("scoring_function_version001", gd, slope,
@@ -959,7 +963,7 @@ void main_procedure(model &m, precalculate &prec,
         // Standard path: create a new cache for each molecule
         if (cache_needed)
           doing(settings.verbosity, "Analyzing the binding site", log);
-        local_cache.reset((settings.gpu_docking) ? new cache_gpu("scoring_function_version001", gd, slope,
+        local_cache.reset((settings.gpu) ? new cache_gpu("scoring_function_version001", gd, slope,
                                                                  dynamic_cast<precalculate_gpu *>(&prec))
                                                  : new cache("scoring_function_version001", gd, slope));
         c = local_cache.get();
@@ -1228,7 +1232,7 @@ void threads_at_work(job_queue<worker_job> *wrkq, job_queue<writer_job> *writerq
   if (!gs->settings->no_gpu)
     initializeCUDA(gs->settings->device);
 
-  if (gs->settings->gpu_docking)
+  if (gs->settings->gpu)
     thread_buffer.init(available_mem(gs->settings->cpu));
 
   worker_job j;
@@ -1448,10 +1452,10 @@ Thank you!\n";
         "score_only", bool_switch(&settings.score_only)->default_value(false),
         "score provided ligand pose")("local_only", bool_switch(&settings.local_only)->default_value(false),
                                       "local search only using autobox (you probably want to use --minimize)")(
-        "bfgs_only", bool_switch(&settings.bfgs_only)->default_value(false),
-        "skip Monte Carlo, run parallel BFGS from random initial poses (experimental)")(
-        "bfgs_iterations", value<int>(&settings.bfgs_iterations)->default_value(100),
-        "max BFGS iterations when using --bfgs_only")(
+        "gpu", bool_switch(&settings.gpu)->default_value(false),
+        "use GPU for docking (parallel BFGS instead of Monte Carlo)")(
+        "gpu_bfgs_iterations", value<int>(&settings.gpu_bfgs_iterations)->default_value(100),
+        "max BFGS iterations when using --gpu")(
         "minimize", bool_switch(&settings.dominimize)->default_value(false), "energy minimization")(
         "randomize_only", bool_switch(&settings.randomize_only), "generate random poses, attempting to avoid clashes")(
         "num_mc_steps", value<int>(&settings.num_mc_steps), "fixed number of monte carlo steps to take in each chain")(
@@ -1485,8 +1489,7 @@ Thank you!\n";
         "Vina.")("outputmin", value<int>(&minparms.outputframes),
                  "output minout.sdf of minimization with provided amount of interpolation")(
         "cnn_gradient_check", bool_switch(&cnnopts.gradient_check)->default_value(false),
-        "Perform internal checks on gradient.")("gpu_docking", bool_switch(&settings.gpu_docking),
-                                                "Turn on GPU acceleration for non-CNN scoring operations.");
+        "Perform internal checks on gradient.");
 
     options_description cnn("Convolutional neural net (CNN) scoring");
     cnn.add_options() //
@@ -1850,7 +1853,7 @@ Thank you!\n";
 
     boost::shared_ptr<precalculate> prec;
 
-    if (settings.gpu_docking || approx == GPU) { // don't get a choice
+    if (settings.gpu || approx == GPU) { // don't get a choice
       prec = boost::shared_ptr<precalculate>(new precalculate_gpu(wt, approx_factor));
     } else if (approx == SplineApprox)
       prec = boost::shared_ptr<precalculate>(new precalculate_splines(wt, approx_factor));
@@ -1927,7 +1930,6 @@ Thank you!\n";
             break;
           }
           m->set_pose_num(i);
-          m->gdata.device_on = settings.gpu_docking;
           m->gdata.device_id = settings.device;
 
           grid_dims gdbox(gd);

@@ -109,36 +109,46 @@ void monte_carlo::operator()(model& m, output_container& out,
 
   if (minparms.maxiters == 0) minparms.maxiters = ssd_par.evals;
   quasi_newton quasi_newton_par(minparms);
-  VINA_U_FOR(step, num_steps) {
-    if (increment_me) ++(*increment_me);
-    output_type candidate = tmp;
-    mutate_conf(candidate.c, m, mutation_amplitude, generator);
 
-    if (minparms.single_min) //use full v to begin with
-      quasi_newton_par(m, p, ig, candidate, g, authentic_v, user_grid);
-    else
-      quasi_newton_par(m, p, ig, candidate, g, hunt_cap, user_grid);
-    
-    update_energy(m, candidate, authentic_v, &ig_metropolis);
-    
-    if (step == 0
-        || metropolis_accept(tmp.e, candidate.e, temperature, generator)) {
-      tmp = candidate;
+  if (num_steps == 0) {
+    // No MC steps - just minimize the random initial pose once
+    quasi_newton_par(m, p, ig, tmp, g, authentic_v, user_grid);
+    update_energy(m, tmp, authentic_v, &ig_metropolis);
+    m.set(tmp.c);
+    tmp.coords = m.get_heavy_atom_movable_coords();
+    add_to_output_container(out, tmp, min_rmsd, num_saved_mins);
+  } else {
+    VINA_U_FOR(step, num_steps) {
+      if (increment_me) ++(*increment_me);
+      output_type candidate = tmp;
+      mutate_conf(candidate.c, m, mutation_amplitude, generator);
 
-      m.set(tmp.c); // FIXME? useless?
+      if (minparms.single_min) //use full v to begin with
+        quasi_newton_par(m, p, ig, candidate, g, authentic_v, user_grid);
+      else
+        quasi_newton_par(m, p, ig, candidate, g, hunt_cap, user_grid);
 
-      // FIXME only for very promising ones
-      if (tmp.e < best_e || out.size() < num_saved_mins) {
+      update_energy(m, candidate, authentic_v, &ig_metropolis);
 
-        if (!minparms.single_min) { //refine with full v
-          quasi_newton_par(m, p, ig, tmp, g, authentic_v, user_grid);
-          update_energy(m, tmp, authentic_v, &ig_metropolis);
-          m.set(tmp.c); // FIXME? useless?
-        }
-        tmp.coords = m.get_heavy_atom_movable_coords();
-        add_to_output_container(out, tmp, min_rmsd, num_saved_mins); // 20 - max size
-        if (tmp.e < best_e) {
-          best_e = tmp.e;
+      if (step == 0
+          || metropolis_accept(tmp.e, candidate.e, temperature, generator)) {
+        tmp = candidate;
+
+        m.set(tmp.c); // FIXME? useless?
+
+        // FIXME only for very promising ones
+        if (tmp.e < best_e || out.size() < num_saved_mins) {
+
+          if (!minparms.single_min) { //refine with full v
+            quasi_newton_par(m, p, ig, tmp, g, authentic_v, user_grid);
+            update_energy(m, tmp, authentic_v, &ig_metropolis);
+            m.set(tmp.c); // FIXME? useless?
+          }
+          tmp.coords = m.get_heavy_atom_movable_coords();
+          add_to_output_container(out, tmp, min_rmsd, num_saved_mins); // 20 - max size
+          if (tmp.e < best_e) {
+            best_e = tmp.e;
+          }
         }
       }
     }

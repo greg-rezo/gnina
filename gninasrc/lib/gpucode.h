@@ -67,28 +67,6 @@ inline __host__  __device__ force_energy_tup& operator+=(force_energy_tup& a,
   return a;
 }
 
-struct GPUNonCacheInfo {
-    unsigned num_movable_atoms, nrec_atoms;
-    float cutoff_sq;
-    float slope;
-
-    //device pointers for grid data
-    gfloat3 gridends; //max range of grid
-    gfloat3 gridbegins; //min range of grid
-
-    //device pointers for ligand data
-    force_energy_tup *lig_penalties;
-    unsigned *types; //n
-
-    //device pointers for receptor data
-    atom_params *rec_atoms;
-    unsigned *rectypes;
-
-    //triangular matrix of spline data, indexed by type, device pointer
-    unsigned ntypes; //number of atom types; also, dimension of triangular splineInfo
-    GPUSplineInfo *splineInfo;
-};
-
 struct GPUCacheInfo {
     gfloat3 gridends;
     gfloat3 gridbegins;
@@ -106,10 +84,6 @@ struct GPUCacheInfo {
 
 void evaluate_splines_host(const GPUSplineInfo& spInfo, float r,
     float *device_vals, float *device_derivs);
-
-__host__ __device__
-float single_point_calc(const GPUNonCacheInfo &dinfo, atom_params *lig,
-    force_energy_tup *out, float v);
 
 __host__ __device__
 float single_point_calc(const GPUCacheInfo &dinfo, atom_params *lig,

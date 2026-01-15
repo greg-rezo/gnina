@@ -68,7 +68,6 @@ struct gpu_data {
     unsigned forces_size;
     unsigned pairs_size;
     unsigned other_pairs_size;
-    bool device_on; //use gpu for docking, not just CNN
     int device_id;
 
     //TODO delete
@@ -79,7 +78,7 @@ struct gpu_data {
             interacting_pairs(NULL), other_pairs(NULL),
             dfs_order_bfs_indices(NULL), bfs_order_dfs_indices(NULL),
             scratch(NULL), coords_size(0), atom_coords_size(0), forces_size(0),
-            pairs_size(0), other_pairs_size(0), device_on(false), device_id(0) {
+            pairs_size(0), other_pairs_size(0), device_id(0) {
     }
 
     template<typename infoT>
@@ -90,8 +89,6 @@ struct gpu_data {
         const vec& v, const conf_gpu& c, change_gpu& g);
 
     size_t node_idx_dfs2bfs(const size_t node_idx);
-    fl eval(const GPUNonCacheInfo& info, const float v);
-    fl eval_intramolecular(const GPUNonCacheInfo& info, const float v);
     //copy relevant data to gpu buffers
     void copy_to_gpu(model& m);
     //copy back relevant data from gpu buffers
@@ -560,7 +557,6 @@ struct model {
   private:
     //my, aren't we friendly!
     friend struct non_cache;
-    friend struct non_cache_gpu;
     friend struct naive_non_cache;
     friend struct cache;
     friend struct szv_grid;

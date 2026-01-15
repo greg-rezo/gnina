@@ -38,7 +38,6 @@ include_directories(${TORCH_INCLUDE_DIRS})
 set(LIB_SRCS
 ${CMAKE_CURRENT_BINARY_DIR}/version.cpp
 lib/atom_constants.cpp
-lib/bfgs.cu
 lib/bfgs_parallel.cu
 lib/box.cpp
 lib/builtinscoring.cpp
@@ -49,7 +48,6 @@ lib/coords.cpp
 lib/covinfo.cpp
 lib/custom_terms.cpp
 lib/dl_scorer.cpp
-lib/device_buffer.cpp
 lib/everything.cpp
 lib/flexinfo.cpp
 lib/GninaConverter.cpp
@@ -81,7 +79,6 @@ lib/conf.cpp
 lib/conf_gpu.cu
 lib/gpucode.cu
 lib/model.cu
-lib/non_cache_gpu.cu
 lib/precalculate_gpu.cu
 lib/torch_model.cpp
 lib/tree_gpu.cu

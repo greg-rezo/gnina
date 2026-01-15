@@ -1,12 +1,11 @@
 #include <boost/program_options.hpp>
 #include <iostream>
 #include "parsed_args.h"
-#include "device_buffer.h"
-#include "test_gpucode.h"
 #include "test_tree.h"
 #include "test_cache.h"
 #include "test_utils.h"
 #include "test_bfgs_parallel.h"
+#include "gpu_util.h"
 #define N_ITERS 5
 #define BOOST_TEST_DYN_LINK
 #define BOOST_TEST_NO_MAIN
@@ -23,18 +22,6 @@ void boost_loop_test(void (*func)());
 
 //TODO: when we are running with a boost version > 1.58, start using UTF
 //datasets with BOOST_PARAM_TEST_CASE
-
-BOOST_AUTO_TEST_SUITE(gpucode)
-
-BOOST_AUTO_TEST_CASE(interaction_energy) {
-  boost_loop_test(&test_interaction_energy);
-}
-
-BOOST_AUTO_TEST_CASE(eval_intra) {
-  boost_loop_test(&test_eval_intra);
-}
-
-BOOST_AUTO_TEST_SUITE_END()
 
 BOOST_AUTO_TEST_SUITE(test_tree_gpu)
 
@@ -92,9 +79,7 @@ BOOST_AUTO_TEST_SUITE_END()
 
 
 bool init_unit_test() {
-  // initializeCUDA(0);
-  // TODO: multithread running tests
-  thread_buffer.init(available_mem(1));
+  initializeCUDA(0);
   std::string logname;
   unsigned seed;
   po::positional_options_description positional;

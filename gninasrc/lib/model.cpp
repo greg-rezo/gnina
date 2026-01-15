@@ -3,7 +3,6 @@
 #include "curl.h"
 #include "file.h"
 #include "loop_timer.h"
-#include "non_cache_gpu.h"
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/unordered_map.hpp>
 #include <openbabel/obconversion.h>

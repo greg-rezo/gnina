@@ -5,8 +5,6 @@
 set( TEST_SRCS
  test_cache.cu
  test_cache.h
- test_gpucode.cpp
- test_gpucode.h
  test_runner.cpp
  test_tree.h
  test_tree.cu
