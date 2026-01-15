@@ -73,6 +73,7 @@ struct GPUCacheInfo {
     fl slope;
     float cutoff_sq;
     unsigned num_movable_atoms;
+    float forcecap;  // Curl parameter for energy capping (authentic_v)
 
     //lig atom types
     unsigned *types;

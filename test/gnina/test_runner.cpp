@@ -6,6 +6,8 @@
 #include "test_utils.h"
 #include "test_bfgs_parallel.h"
 #include "gpu_util.h"
+#include "dl_scorer.h"
+#include "device_buffer.h"
 #define N_ITERS 5
 #define BOOST_TEST_DYN_LINK
 #define BOOST_TEST_NO_MAIN
@@ -80,6 +82,7 @@ BOOST_AUTO_TEST_SUITE_END()
 
 bool init_unit_test() {
   initializeCUDA(0);
+  thread_buffer.init(available_mem(1));  // Initialize GPU buffer for tests
   std::string logname;
   unsigned seed;
   po::positional_options_description positional;

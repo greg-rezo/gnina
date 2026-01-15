@@ -108,7 +108,8 @@ __device__ void set_conf_single_thread(
     const float* conf,
     float* coords,
     float* node_origins,      // [num_nodes × 3] scratch
-    float* node_orientations  // [num_nodes × 9] scratch (rotation matrices)
+    float* node_orientations, // [num_nodes × 9] scratch (rotation matrices)
+    float* node_axes          // [num_nodes × 3] output: transformed axes in lab frame
 ) {
     // Early exit if no atoms or missing data
     if (ctx.num_atoms == 0 || ctx.atom_local_data == nullptr) {
@@ -158,6 +159,11 @@ __device__ void set_conf_single_thread(
             float rel_axis[3] = {node.relative_axis.x, node.relative_axis.y, node.relative_axis.z};
             float axis[3];
             mat_vec_mult(parent_mat, rel_axis, axis);
+
+            // Store transformed axis for gradient computation
+            node_axes[nid * 3 + 0] = axis[0];
+            node_axes[nid * 3 + 1] = axis[1];
+            node_axes[nid * 3 + 2] = axis[2];
 
             // Transform relative origin to lab frame
             float rel_origin[3] = {node.relative_origin.x, node.relative_origin.y, node.relative_origin.z};
@@ -373,7 +379,8 @@ __device__ inline void trilinear_interp_charge(
 __device__ float eval_energy_grid_single_thread(
     const ScoringContext& ctx,
     const float* coords,
-    float* forces
+    float* forces,
+    bool debug_print
 ) {
     float total_energy = 0;
 
@@ -401,7 +408,11 @@ __device__ float eval_energy_grid_single_thread(
         const grid_gpu& grid = ctx.grids[atom_type];
 
         float e, fx, fy, fz;
-        trilinear_interp_device(grid, x, y, z, ctx.slope, 1000.0f, &e, &fx, &fy, &fz);
+        trilinear_interp_device(grid, x, y, z, ctx.slope, ctx.forcecap, &e, &fx, &fy, &fz);
+
+        if (debug_print && i < 10) {
+            printf("GPU atom %u: type=%u pos=(%.3f,%.3f,%.3f) e=%.6f\n", i, atom_type, x, y, z, e);
+        }
 
         total_energy += e;
         forces[i * 3 + 0] = fx;
@@ -413,7 +424,10 @@ __device__ float eval_energy_grid_single_thread(
             float charge = ctx.atom_params_data[i].charge;
             if (charge != 0) {
                 float ce, cfx, cfy, cfz;
-                trilinear_interp_charge(grid, x, y, z, ctx.slope, 1000.0f, &ce, &cfx, &cfy, &cfz);
+                trilinear_interp_charge(grid, x, y, z, ctx.slope, ctx.forcecap, &ce, &cfx, &cfy, &cfz);
+                if (debug_print && i < 10) {
+                    printf("GPU atom %u: charge=%.3f charge_e=%.6f\n", i, charge, charge * ce);
+                }
                 total_energy += charge * ce;
                 forces[i * 3 + 0] += charge * cfx;
                 forces[i * 3 + 1] += charge * cfy;
@@ -544,8 +558,8 @@ __device__ float eval_intramolecular_single_thread(
         return total_energy;
     }
 
-    // Curl parameter (matches standard gnina)
-    const float v = 1000.0f;
+    // Curl parameter from forcecap (matches standard gnina)
+    const float v = ctx.forcecap;
 
     for (unsigned i = 0; i < ctx.num_pairs; i++) {
         const interacting_pair& ip = ctx.pairs[i];
@@ -610,6 +624,7 @@ __device__ void compute_gradient_single_thread(
     const float* coords,        // Cartesian atom coordinates [num_atoms × 3]
     const float* forces,        // Cartesian atom forces [num_atoms × 3]
     const float* node_origins,  // Node origins from set_conf [num_nodes × 3]
+    const float* node_axes,     // Transformed axes from set_conf [num_nodes × 3]
     float* node_forces,         // Scratch: [num_nodes × 3]
     float* node_torques,        // Scratch: [num_nodes × 3]
     float* gradient             // Output: [n_change]
@@ -698,11 +713,10 @@ __device__ void compute_gradient_single_thread(
     }
 
     // Torsion nodes: dot(torque, axis)
-    // Note: uses node.axis which is in lab frame (set by set_conf)
+    // Uses transformed axis from node_axes (computed by set_conf_single_thread)
     for (unsigned nid = ctx.nlig_roots; nid < ctx.num_nodes; nid++) {
-        const segment_node& node = ctx.tree_nodes[nid];
-        float axis[3] = {node.axis.x, node.axis.y, node.axis.z};
-        float* torque = &node_torques[nid * 3];
+        const float* axis = &node_axes[nid * 3];
+        const float* torque = &node_torques[nid * 3];
 
         gradient[nid + 5 * ctx.nlig_roots] = dot3(torque, axis);
     }
@@ -766,9 +780,10 @@ __device__ float eval_conf_single_thread(
     float* coords,
     float* forces,
     float* node_origins,
-    float* node_orientations
+    float* node_orientations,
+    float* node_axes
 ) {
-    set_conf_single_thread(ctx, conf, coords, node_origins, node_orientations);
+    set_conf_single_thread(ctx, conf, coords, node_origins, node_orientations, node_axes);
     float e = eval_energy_grid_single_thread(ctx, coords, forces);
     e += eval_intramolecular_single_thread(ctx, coords, forces);
     return e;
@@ -796,6 +811,7 @@ __device__ float accurate_line_search_single_thread(
     // Scratch for node state
     float node_origins[PARALLEL_MAX_TORSIONS * 3];
     float node_orientations[PARALLEL_MAX_TORSIONS * 9];
+    float node_axes[PARALLEL_MAX_TORSIONS * 3];
 
     // Compute slope = g · p
     float slope = 0;
@@ -850,13 +866,13 @@ __device__ float accurate_line_search_single_thread(
 
         // Evaluate at new point
         f_new = eval_conf_single_thread(ctx, x_new, coords, forces,
-                                        node_origins, node_orientations);
+                                        node_origins, node_orientations, node_axes);
 
         // Check Armijo sufficient decrease condition
         if (f_new <= f0 + ALF * alpha * slope) {
             // Success - compute gradient and return
             compute_gradient_single_thread(ctx, coords, forces, node_origins,
-                                          node_forces, node_torques, g_new);
+                                          node_axes, node_forces, node_torques, g_new);
             return alpha;
         }
 
@@ -1003,13 +1019,14 @@ __global__ void bfgs_parallel_kernel(
     // Scratch for node state during set_conf
     float node_origins[PARALLEL_MAX_TORSIONS * 3];
     float node_orientations[PARALLEL_MAX_TORSIONS * 9];
+    float node_axes[PARALLEL_MAX_TORSIONS * 3];
 
     // Initial energy and gradient
-    set_conf_single_thread(ctx, state.x, state.coords, node_origins, node_orientations);
+    set_conf_single_thread(ctx, state.x, state.coords, node_origins, node_orientations, node_axes);
     state.energy = eval_energy_grid_single_thread(ctx, state.coords, state.forces);
     state.energy += eval_intramolecular_single_thread(ctx, state.coords, state.forces);
     compute_gradient_single_thread(ctx, state.coords, state.forces, node_origins,
-                                   state.node_forces, state.node_torques, state.g);
+                                   node_axes, state.node_forces, state.node_torques, state.g);
     state.best_energy = state.energy;
 
     // Save best conf
@@ -1313,6 +1330,7 @@ void create_scoring_context(
     ctx.splineInfo = cacheInfo.splineInfo;
     ctx.num_atoms = cacheInfo.num_movable_atoms;
     ctx.atom_types = cacheInfo.types;
+    ctx.forcecap = cacheInfo.forcecap;
 
     // From tree_gpu - need to copy from device to host first
     if (gdata.treegpu) {
@@ -1551,14 +1569,44 @@ __global__ void bfgs_minimize_kernel(
     // Scratch for node state during set_conf
     float node_origins[PARALLEL_MAX_TORSIONS * 3];
     float node_orientations[PARALLEL_MAX_TORSIONS * 9];
+    float node_axes[PARALLEL_MAX_TORSIONS * 3];
 
     // Initial energy and gradient
-    set_conf_single_thread(ctx, state.x, state.coords, node_origins, node_orientations);
-    state.energy = eval_energy_grid_single_thread(ctx, state.coords, state.forces);
-    state.energy += eval_intramolecular_single_thread(ctx, state.coords, state.forces);
+    set_conf_single_thread(ctx, state.x, state.coords, node_origins, node_orientations, node_axes);
+    float inter_energy = eval_energy_grid_single_thread(ctx, state.coords, state.forces, tid == 0);  // Debug on first thread
+    float intra_energy = eval_intramolecular_single_thread(ctx, state.coords, state.forces);
+    state.energy = inter_energy + intra_energy;
     compute_gradient_single_thread(ctx, state.coords, state.forces, node_origins,
-                                   state.node_forces, state.node_torques, state.g);
+                                   node_axes, state.node_forces, state.node_torques, state.g);
     state.best_energy = state.energy;
+
+    // DEBUG: Print initial state
+    if (tid == 0) {
+        printf("GPU DEBUG: forcecap=%f, slope=%f\n", ctx.forcecap, ctx.slope);
+        printf("GPU DEBUG: Initial energy=%f (inter=%f, intra=%f)\n", state.energy, inter_energy, intra_energy);
+        printf("GPU DEBUG: Initial gradient (first 6 rigid): ");
+        for (int i = 0; i < 6 && i < ctx.n_change; i++) {
+            printf("%f ", state.g[i]);
+        }
+        printf("\n");
+        if (ctx.n_change > 6) {
+            printf("GPU DEBUG: Initial gradient (torsions): ");
+            for (int i = 6; i < ctx.n_change; i++) {
+                printf("%f ", state.g[i]);
+            }
+            printf("\n");
+        }
+        printf("GPU DEBUG: n_change=%d, n_conf=%d, num_atoms=%d, num_nodes=%d, ngrids=%d\n",
+               ctx.n_change, ctx.n_conf, ctx.num_atoms, ctx.num_nodes, ctx.ngrids);
+
+        // Print first 5 atom positions, types and per-atom energies
+        printf("GPU DEBUG: First atoms (pos, type):\n");
+        for (unsigned i = 0; i < 5 && i < ctx.num_atoms; i++) {
+            unsigned atom_type = ctx.atom_types[i];
+            printf("  Atom %d: pos=(%f,%f,%f), type=%d\n",
+                   i, state.coords[i*3], state.coords[i*3+1], state.coords[i*3+2], atom_type);
+        }
+    }
 
     // Save best conf
     for (int i = 0; i < ctx.n_conf; i++) {
@@ -1587,6 +1635,15 @@ __global__ void bfgs_minimize_kernel(
             state.p[i] = -state.p[i];
         }
 
+        // DEBUG: Print first iteration details
+        if (tid == 0 && iter == 0) {
+            printf("GPU DEBUG iter 0: Search direction p (first 6): ");
+            for (int i = 0; i < 6 && i < ctx.n_change; i++) {
+                printf("%f ", state.p[i]);
+            }
+            printf("\n");
+        }
+
         // Line search
         float f_new;
         float alpha = accurate_line_search_single_thread(
@@ -1595,8 +1652,14 @@ __global__ void bfgs_minimize_kernel(
             state.node_forces, state.node_torques, state.g_new, f_new
         );
 
+        // DEBUG: Print line search result
+        if (tid == 0 && iter == 0) {
+            printf("GPU DEBUG iter 0: alpha=%f, f0=%f, f_new=%f\n", alpha, state.energy, f_new);
+        }
+
         // Check for line search failure
         if (alpha == 0) {
+            if (tid == 0) printf("GPU DEBUG: Line search failed at iter %d\n", iter);
             break;
         }
 
@@ -1724,4 +1787,103 @@ void run_parallel_bfgs_minimize(
     free_batch_memory(mem);
     cudaFree(d_contexts);
     cudaFree(d_input_conf);
+}
+
+// ============================================================================
+// Score-Only Kernel and Interface
+// ============================================================================
+
+// Kernel for evaluating energy without optimization (score_only mode)
+__global__ void score_only_kernel(
+    const float* input_conf,
+    const ScoringContext* contexts,
+    float* out_inter_energy,
+    float* out_intra_energy,
+    float* scratch_coords,      // [num_atoms * 3]
+    float* scratch_forces       // [num_atoms * 3]
+) {
+    // Single thread kernel
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+
+    const ScoringContext& ctx = contexts[0];
+
+    // Scratch for node state during set_conf
+    float node_origins[PARALLEL_MAX_TORSIONS * 3];
+    float node_orientations[PARALLEL_MAX_TORSIONS * 9];
+    float node_axes[PARALLEL_MAX_TORSIONS * 3];  // Not used for score_only, but required by set_conf
+
+    // Transform internal coordinates to Cartesian
+    set_conf_single_thread(ctx, input_conf, scratch_coords, node_origins, node_orientations, node_axes);
+
+    // Evaluate inter-molecular energy (grid-based)
+    float inter_e = eval_energy_grid_single_thread(ctx, scratch_coords, scratch_forces);
+
+    // Evaluate intramolecular energy
+    float intra_e = eval_intramolecular_single_thread(ctx, scratch_coords, scratch_forces);
+
+    *out_inter_energy = inter_e;
+    *out_intra_energy = intra_e;
+}
+
+void run_gpu_score_only(
+    const gpu_data& gdata,
+    const GPUCacheInfo& cacheInfo,
+    const std::vector<float>& input_conf,
+    float& out_inter_energy,
+    float& out_intramolecular_energy
+) {
+    // Create scoring context
+    ScoringContext ctx;
+    create_scoring_context(ctx, gdata, cacheInfo);
+
+    // Allocate context on device
+    ScoringContext* d_contexts;
+    CUDA_CHECK_GNINA(cudaMalloc(&d_contexts, sizeof(ScoringContext)));
+    CUDA_CHECK_GNINA(cudaMemcpy(d_contexts, &ctx, sizeof(ScoringContext), cudaMemcpyHostToDevice));
+
+    // Copy input conf to device
+    float* d_input_conf;
+    CUDA_CHECK_GNINA(cudaMalloc(&d_input_conf, input_conf.size() * sizeof(float)));
+    CUDA_CHECK_GNINA(cudaMemcpy(d_input_conf, input_conf.data(),
+                                input_conf.size() * sizeof(float), cudaMemcpyHostToDevice));
+
+    // Allocate output
+    float* d_inter_energy;
+    float* d_intra_energy;
+    CUDA_CHECK_GNINA(cudaMalloc(&d_inter_energy, sizeof(float)));
+    CUDA_CHECK_GNINA(cudaMalloc(&d_intra_energy, sizeof(float)));
+
+    // Allocate scratch space for coords and forces
+    int max_atoms = ctx.num_atoms > 0 ? ctx.num_atoms : PARALLEL_MAX_ATOMS;
+    float* d_coords;
+    float* d_forces;
+    CUDA_CHECK_GNINA(cudaMalloc(&d_coords, max_atoms * 3 * sizeof(float)));
+    CUDA_CHECK_GNINA(cudaMalloc(&d_forces, max_atoms * 3 * sizeof(float)));
+
+    // Launch score-only kernel (single thread)
+    score_only_kernel<<<1, 1>>>(
+        d_input_conf,
+        d_contexts,
+        d_inter_energy,
+        d_intra_energy,
+        d_coords,
+        d_forces
+    );
+
+    // Synchronize
+    CUDA_CHECK_GNINA(cudaDeviceSynchronize());
+
+    // Copy results back
+    CUDA_CHECK_GNINA(cudaMemcpy(&out_inter_energy, d_inter_energy,
+                                sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK_GNINA(cudaMemcpy(&out_intramolecular_energy, d_intra_energy,
+                                sizeof(float), cudaMemcpyDeviceToHost));
+
+    // Cleanup
+    cudaFree(d_contexts);
+    cudaFree(d_input_conf);
+    cudaFree(d_inter_energy);
+    cudaFree(d_intra_energy);
+    cudaFree(d_coords);
+    cudaFree(d_forces);
 }

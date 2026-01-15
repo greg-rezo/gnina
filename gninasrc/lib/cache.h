@@ -42,14 +42,18 @@ struct cache : public igrid {
     cache(const std::string& scoring_function_version_, const grid_dims& gd_,
         fl slope_);
     fl eval(model& m, fl v) const; // needs m.coords // clean up
-    fl eval_deriv(model& m, fl v, const grid& user_grid) const; // needs m.coords, sets m.minus_forces // clean up
+    fl eval_deriv(model& m, fl v, const grid& user_grid) const override; // needs m.coords, sets m.minus_forces // clean up
 
     virtual void populate(const model& m, const precalculate& p,
         const std::vector<smt>& atom_types_needed, grid& user_grid,
         bool display_progress = true);
     virtual ~cache() {
     }
-    ;
+
+    // Set forcecap (authentic_v) for curl parameter - only relevant for GPU cache
+    virtual void set_forcecap(float /*fc*/) {
+      // No-op for CPU cache; overridden in cache_gpu
+    }
   private:
     std::string scoring_function_version;
     atomv atoms; // for verification

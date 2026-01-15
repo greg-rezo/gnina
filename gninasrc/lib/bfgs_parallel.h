@@ -73,6 +73,9 @@ struct ScoringContext {
     // Spline data for pair interactions
     const GPUSplineInfo* splineInfo;
 
+    // Curl parameter for energy capping (from forcecap)
+    float forcecap;
+
     // Dimensions
     int n_conf;    // 7 * nlig_roots + n_torsions
     int n_change;  // 6 * nlig_roots + n_torsions
@@ -205,6 +208,17 @@ void run_parallel_bfgs_minimize(
     std::vector<float>& out_conf
 );
 
+// High-level interface for score-only mode (no optimization)
+// Evaluates energy at the given conformation using GPU
+// Returns: inter-molecular energy (grid-based), intramolecular energy
+void run_gpu_score_only(
+    const struct gpu_data& gdata,
+    const struct GPUCacheInfo& cacheInfo,
+    const std::vector<float>& input_conf,  // Conformation in flat format
+    float& out_inter_energy,
+    float& out_intramolecular_energy
+);
+
 // Helper: convert conf struct to flat array format
 // flat_conf must be pre-allocated with size >= 7 * nlig_roots + n_torsions
 void conf_to_flat(
@@ -248,14 +262,16 @@ __device__ void set_conf_single_thread(
     const float* conf,
     float* coords,
     float* node_origins,
-    float* node_orientations
+    float* node_orientations,
+    float* node_axes          // [num_nodes × 3] output: transformed axes in lab frame
 );
 
 // Single-thread grid-based energy evaluation
 __device__ float eval_energy_grid_single_thread(
     const ScoringContext& ctx,
     const float* coords,
-    float* forces
+    float* forces,
+    bool debug_print = false
 );
 
 // Single-thread intramolecular energy
@@ -270,6 +286,8 @@ __device__ void compute_gradient_single_thread(
     const ScoringContext& ctx,
     const float* coords,
     const float* forces,
+    const float* node_origins,  // Node origins from set_conf [num_nodes × 3]
+    const float* node_axes,     // Transformed axes from set_conf [num_nodes × 3]
     float* node_forces,
     float* node_torques,
     float* gradient

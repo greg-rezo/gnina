@@ -58,9 +58,11 @@ docker run --rm --platform linux/amd64 \
         cd /gnina/build
 
         # Always run cmake for tests (needs BUILD_TESTING=ON), otherwise only if no cache
-        if $BUILD_TESTS || [ ! -f CMakeCache.txt ]; then
-            echo 'Running cmake...'
+        if $BUILD_TESTS || [ ! -f build.ninja ]; then
+            echo 'Running cmake with Ninja...'
+            rm -rf CMakeCache.txt CMakeFiles
             cmake /gnina/src \
+                -G Ninja \
                 -DCMAKE_BUILD_TYPE=Release \
                 $CMAKE_EXTRA \
                 -DLIBMOLGRID_LIBRARY=/usr/local/lib/libmolgrid.so \
@@ -70,7 +72,7 @@ docker run --rm --platform linux/amd64 \
         fi
 
         echo 'Building $BUILD_TARGET...'
-        make -j\$(nproc) $BUILD_TARGET
+        ninja $BUILD_TARGET
 
         echo 'Build complete!'
         if $BUILD_TESTS; then

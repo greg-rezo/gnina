@@ -63,8 +63,16 @@ fl cache::eval(model& m, fl v) const { // needs m.coords
 }
 
 fl cache::eval_deriv(model& m, fl v, const grid& user_grid) const { // needs m.coords, sets m.minus_forces
+  static bool first_call = true;
+  bool do_debug = first_call;
+  first_call = false;
+
   fl e = 0;
   sz nat = num_atom_types();
+
+  if (do_debug) {
+    std::cerr << "CPU DEBUG: eval_deriv with forcecap v=" << v << ", slope=" << slope << std::endl;
+  }
 
   VINA_FOR(i, m.num_movable_atoms()) {
     const atom& a = m.atoms[i];
@@ -76,7 +84,13 @@ fl cache::eval_deriv(model& m, fl v, const grid& user_grid) const { // needs m.c
     const grid& g = grids[t];
     assert(g.initialized());
     vec deriv;
-    e += g.evaluate(a, m.coords[i], slope, v, &deriv);
+    fl atom_e = g.evaluate(a, m.coords[i], slope, v, &deriv);
+    if (do_debug && i < 10) {
+      std::cerr << "CPU atom " << i << ": type=" << t
+                << " pos=(" << m.coords[i][0] << "," << m.coords[i][1] << "," << m.coords[i][2] << ")"
+                << " e=" << atom_e << std::endl;
+    }
+    e += atom_e;
     m.minus_forces[i] = deriv;
   }
   return e;

@@ -84,7 +84,7 @@ struct user_settings {
     bool no_gpu;
     bool no_lig;
     bool gpu; //use GPU for docking (parallel BFGS instead of MC)
-    int gpu_bfgs_iterations; //max BFGS iterations when using --gpu
+    int bfgs_iterations; //max BFGS iterations when using --gpu
 
 
     cnn_options cnnopts;
@@ -97,7 +97,7 @@ struct user_settings {
             sort_order(CNNscore), score_only(false),
             randomize_only(false), local_only(false), dominimize(false),
             include_atom_info(false), no_gpu(false), no_lig(false),
-            gpu(false), gpu_bfgs_iterations(100) {
+            gpu(false), bfgs_iterations(100) {
 
     }
 };

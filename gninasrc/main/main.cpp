@@ -355,7 +355,65 @@ void do_search(model &m, const boost::optional<model> &ref, const boost::optiona
 
     cnn.set_center_from_model(m);
     non_cache nc_new = non_cache(grid_cache, gd, &prec, slope);
-    if (settings.score_only) {
+    if (settings.gpu && settings.score_only) {
+      // GPU score-only mode
+      cache_gpu* cgpu = dynamic_cast<cache_gpu*>(&ig);
+      if (!cgpu) {
+        log << "ERROR: --gpu --score_only requires grid caching.\n";
+        log.endl();
+        throw std::runtime_error("--gpu --score_only requires grid caching");
+      }
+
+      doing(settings.verbosity, "Performing GPU scoring", log);
+
+      const GPUCacheInfo& cacheInfo = cgpu->get_info();
+
+      // Convert conf to flat array format
+      unsigned nlig_roots = 1;
+      unsigned n_torsions = 0;
+      if (!c.ligands.empty()) {
+        n_torsions = c.ligands[0].torsions.size();
+      }
+      int conf_size = 7 * nlig_roots + n_torsions;
+
+      std::vector<float> input_conf(conf_size);
+      conf_to_flat(c, nlig_roots, n_torsions, input_conf.data());
+
+      // Run GPU score-only
+      float gpu_inter_energy, gpu_intra_energy;
+      run_gpu_score_only(
+          m.gdata, cacheInfo,
+          input_conf,
+          gpu_inter_energy, gpu_intra_energy
+      );
+
+      done(settings.verbosity, log);
+
+      // Compute adjusted energy like CPU version
+      intramolecular_energy = gpu_intra_energy;
+      e = gpu_inter_energy + gpu_intra_energy;
+
+      // Apply scoring function adjustment
+      e = sf.conf_independent(m, e);
+
+      get_cnn_info(m, cnn, log, cnnscore, cnnaffinity, cnnvariance);
+
+      log << "Affinity: " << std::fixed << std::setprecision(5) << e << " (kcal/mol)\n";
+
+      log << "CNNscore: " << std::fixed << std::setprecision(5) << cnnscore << " "
+          << "\nCNNaffinity: " << cnnaffinity;
+      if (cnnvariance > 0) {
+        log << "\nCNNvariance: " << std::fixed << std::setprecision(5) << cnnvariance;
+      }
+      log.endl();
+
+      log << "Intramolecular energy: " << std::fixed << std::setprecision(5) << intramolecular_energy << "\n";
+
+      results.push_back(result_info(e, cnnscore, cnnaffinity, cnnvariance, -1, compute_reference_rmsd(m, ref_data), m));
+
+      if (compute_atominfo)
+        results.back().setAtomValues(m, &sf);
+    } else if (settings.score_only) {
       intramolecular_energy = m.eval_intramolecular(exact_prec, authentic_v, c);
       naive_non_cache nnc(&exact_prec); // for out of grid issues
       e = m.eval_adjusted(sf, exact_prec, nnc, authentic_v, c, intramolecular_energy, user_grid);
@@ -403,7 +461,7 @@ void do_search(model &m, const boost::optional<model> &ref, const boost::optiona
 
       vecv origcoords = m.get_heavy_atom_movable_coords();
 
-      log << "Running parallel BFGS minimize (iterations=" << settings.gpu_bfgs_iterations << ")\n";
+      log << "Running parallel BFGS minimize (iterations=" << settings.bfgs_iterations << ")\n";
       log.endl();
 
       doing(settings.verbosity, "Performing parallel BFGS local search", log);
@@ -428,7 +486,7 @@ void do_search(model &m, const boost::optional<model> &ref, const boost::optiona
       run_parallel_bfgs_minimize(
           m.gdata, cacheInfo,
           input_conf,
-          settings.gpu_bfgs_iterations,
+          settings.bfgs_iterations,
           out_energy, out_intramolecular,
           out_conf
       );
@@ -525,7 +583,7 @@ void do_search(model &m, const boost::optional<model> &ref, const boost::optiona
       }
 
       log << "Running parallel BFGS (exhaustiveness=" << settings.exhaustiveness
-          << ", bfgs_iterations=" << settings.gpu_bfgs_iterations << ")\n";
+          << ", bfgs_iterations=" << settings.bfgs_iterations << ")\n";
       log << "Using random seed: " << settings.seed;
       log.endl();
 
@@ -545,7 +603,7 @@ void do_search(model &m, const boost::optional<model> &ref, const boost::optiona
       run_parallel_bfgs_docking(
           m.gdata, cacheInfo,
           settings.exhaustiveness,
-          settings.gpu_bfgs_iterations,
+          settings.bfgs_iterations,
           box_min, box_max,
           settings.seed,
           energies, conformations
@@ -974,6 +1032,9 @@ void main_procedure(model &m, precalculate &prec,
           done(settings.verbosity, log);
         }
       }
+
+      // Set forcecap for GPU cache (for curl parameter in BFGS energy evaluation)
+      c->set_forcecap(settings.forcecap);
 
       do_search(m, ref, ref_data, wt, prec, *c, *nc, corner1, corner2, par, settings, compute_atominfo, log,
                 wt.unweighted_terms(), user_grid, cnn, results, gridcache, gd, slope);
@@ -1454,7 +1515,7 @@ Thank you!\n";
                                       "local search only using autobox (you probably want to use --minimize)")(
         "gpu", bool_switch(&settings.gpu)->default_value(false),
         "use GPU for docking (parallel BFGS instead of Monte Carlo)")(
-        "gpu_bfgs_iterations", value<int>(&settings.gpu_bfgs_iterations)->default_value(100),
+        "bfgs_iterations", value<int>(&settings.bfgs_iterations)->default_value(100),
         "max BFGS iterations when using --gpu")(
         "minimize", bool_switch(&settings.dominimize)->default_value(false), "energy minimization")(
         "randomize_only", bool_switch(&settings.randomize_only), "generate random poses, attempting to avoid clashes")(
@@ -1642,6 +1703,11 @@ Thank you!\n";
         approx = SplineApprox; // use high accuracy approximation for --minimize
       if (!vm.count("factor"))
         approx_factor = 10;
+    }
+
+    // Also set soft forcecap for --gpu --local_only (parallel BFGS minimize)
+    if (settings.gpu && settings.local_only && !vm.count("force_cap")) {
+      settings.forcecap = 10;
     }
 
      // output banner
