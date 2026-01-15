@@ -380,7 +380,7 @@ __device__ float eval_energy_grid_single_thread(
     const ScoringContext& ctx,
     const float* coords,
     float* forces,
-    bool debug_print
+    bool debug_print = false
 ) {
     float total_energy = 0;
 
@@ -410,7 +410,7 @@ __device__ float eval_energy_grid_single_thread(
         float e, fx, fy, fz;
         trilinear_interp_device(grid, x, y, z, ctx.slope, ctx.forcecap, &e, &fx, &fy, &fz);
 
-        if (debug_print && i < 10) {
+        if (debug_print) {
             printf("GPU atom %u: type=%u pos=(%.3f,%.3f,%.3f) e=%.6f\n", i, atom_type, x, y, z, e);
         }
 
@@ -425,9 +425,6 @@ __device__ float eval_energy_grid_single_thread(
             if (charge != 0) {
                 float ce, cfx, cfy, cfz;
                 trilinear_interp_charge(grid, x, y, z, ctx.slope, ctx.forcecap, &ce, &cfx, &cfy, &cfz);
-                if (debug_print && i < 10) {
-                    printf("GPU atom %u: charge=%.3f charge_e=%.6f\n", i, charge, charge * ce);
-                }
                 total_energy += charge * ce;
                 forces[i * 3 + 0] += charge * cfx;
                 forces[i * 3 + 1] += charge * cfy;

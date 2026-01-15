@@ -29,6 +29,12 @@ struct cache_gpu : public cache {
       info.forcecap = fc;
     }
 
+    // Set slope for out-of-bounds penalty (also updates GPU info)
+    void set_slope(float s) override {
+      cache::set_slope(s);  // Update base class
+      info.slope = s;       // Update GPU info
+    }
+
   private:
     GPUCacheInfo info; //host struct of device pointers
 };

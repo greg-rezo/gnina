@@ -266,14 +266,6 @@ __device__ void set_conf_single_thread(
     float* node_axes          // [num_nodes × 3] output: transformed axes in lab frame
 );
 
-// Single-thread grid-based energy evaluation
-__device__ float eval_energy_grid_single_thread(
-    const ScoringContext& ctx,
-    const float* coords,
-    float* forces,
-    bool debug_print = false
-);
-
 // Single-thread intramolecular energy
 __device__ float eval_intramolecular_single_thread(
     const ScoringContext& ctx,

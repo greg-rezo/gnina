@@ -54,6 +54,11 @@ struct cache : public igrid {
     virtual void set_forcecap(float /*fc*/) {
       // No-op for CPU cache; overridden in cache_gpu
     }
+
+    // Set slope for out-of-bounds penalty - relevant for GPU cache to match CPU minimize behavior
+    virtual void set_slope(float s) {
+      slope = s;
+    }
   private:
     std::string scoring_function_version;
     atomv atoms; // for verification

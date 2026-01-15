@@ -123,10 +123,18 @@ fl non_cache::check_bounds_deriv(const grid_dims& dims, const vec& a_coords,
 }
 
 fl non_cache::eval_deriv(model& m, fl v, const grid& user_grid) const { // clean up
+  static bool first_call = true;
+  bool do_debug = first_call;
+  first_call = false;
+
   fl e = 0;
   const fl cutoff_sqr = p->cutoff_sqr();
 
   sz n = num_atom_types();
+
+  if (do_debug) {
+    std::cerr << "CPU non_cache DEBUG: eval_deriv with forcecap v=" << v << ", slope=" << slope << std::endl;
+  }
 
   VINA_FOR(i, m.num_movable_atoms()) {
     const atom& a = m.atoms[i];
@@ -172,6 +180,11 @@ fl non_cache::eval_deriv(model& m, fl v, const grid& user_grid) const { // clean
       deriv += ug_deriv;
     }
     curl(this_e, deriv, v);
+    if (do_debug) {
+      std::cerr << "CPU atom " << i << ": type=" << t1
+                << " pos=(" << a_coords[0] << "," << a_coords[1] << "," << a_coords[2] << ")"
+                << " e=" << (this_e + out_of_bounds_penalty) << std::endl;
+    }
     m.minus_forces[i] = deriv + out_of_bounds_deriv;
     e += this_e + out_of_bounds_penalty;
   }

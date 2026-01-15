@@ -461,6 +461,10 @@ void do_search(model &m, const boost::optional<model> &ref, const boost::optiona
 
       vecv origcoords = m.get_heavy_atom_movable_coords();
 
+      // Set slope=10 to match CPU refine_structure behavior
+      // (CPU uses slope=10 initially, increasing if ligand outside box)
+      cgpu->set_slope(10);
+
       log << "Running parallel BFGS minimize (iterations=" << settings.bfgs_iterations << ")\n";
       log.endl();
 
