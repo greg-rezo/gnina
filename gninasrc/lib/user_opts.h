@@ -87,6 +87,7 @@ struct user_settings {
     bool cpu_grid; //use grid-based scoring for CPU local_only (to match GPU behavior)
     int bfgs_iterations; //max BFGS iterations when using --gpu
     bool verbose_grad; //output gradient values for debugging
+    bool direct_pairwise; //use direct pairwise scoring with LUT instead of grid interpolation (GPU only)
 
 
     cnn_options cnnopts;
@@ -99,7 +100,8 @@ struct user_settings {
             sort_order(CNNscore), score_only(false),
             randomize_only(false), local_only(false), dominimize(false),
             include_atom_info(false), no_gpu(false), no_lig(false),
-            gpu(false), cpu_grid(false), bfgs_iterations(50), verbose_grad(false) {
+            gpu(false), cpu_grid(false), bfgs_iterations(50), verbose_grad(false),
+            direct_pairwise(false) {
 
     }
 };

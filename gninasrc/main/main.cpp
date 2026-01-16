@@ -699,7 +699,9 @@ void do_search(model &m, const boost::optional<model> &ref, const boost::optiona
           settings.bfgs_iterations,
           box_min, box_max,
           settings.seed,
-          energies, conformations
+          energies, conformations,
+          settings.verbosity,
+          settings.direct_pairwise
       );
 
       done(settings.verbosity, log);
@@ -1615,6 +1617,8 @@ Thank you!\n";
                                       "local search only using autobox (you probably want to use --minimize)")(
         "gpu", bool_switch(&settings.gpu)->default_value(false),
         "use GPU for docking (parallel BFGS instead of Monte Carlo)")(
+        "direct_pairwise", bool_switch(&settings.direct_pairwise)->default_value(false),
+        "use direct pairwise scoring with LUT instead of grid interpolation (GPU only, reduces L2 cache pressure)")(
         "cpu_grid", bool_switch(&settings.cpu_grid)->default_value(false),
         "use grid-based scoring for CPU local_only (to match GPU behavior)")(
         "bfgs_iterations", value<int>(&settings.bfgs_iterations)->default_value(50),

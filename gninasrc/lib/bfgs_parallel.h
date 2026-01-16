@@ -25,6 +25,8 @@
 
 // Forward declarations
 struct gpu_data;
+struct ScoringLUTMinimal;  // From scoring_lut.h
+struct SpatialHashGPU;     // From spatial_hash.h
 
 // Maximum supported values (can be overridden at runtime based on batch)
 #define PARALLEL_MAX_ATOMS 100
@@ -81,6 +83,13 @@ struct ScoringContext {
     int n_conf;    // 7 * nlig_roots + n_torsions
     int n_change;  // 6 * nlig_roots + n_torsions
     int n_torsions;
+
+    // Direct pairwise scoring (alternative to grid-based)
+    // When enabled, uses LUT + spatial hash instead of grid interpolation
+    bool use_direct_pairwise;         // Flag to enable direct pairwise scoring
+    const struct ScoringLUTMinimal* lut;   // Scoring lookup table (in global memory)
+    const struct SpatialHashGPU* spatial_hash;  // Spatial hash for receptor neighbor finding
+    const uint8_t* ligand_smina_types;     // SMINA atom types for ligand atoms [num_atoms]
 };
 
 // Per-optimizer state
@@ -185,6 +194,7 @@ void create_scoring_context(
 
 // High-level interface for running parallel BFGS docking
 // verbosity: 0=silent, 1=warnings/info, 2=detailed
+// direct_pairwise: use direct pairwise scoring with LUT instead of grid interpolation
 void run_parallel_bfgs_docking(
     const struct gpu_data& gdata,
     const struct GPUCacheInfo& cacheInfo,
@@ -195,7 +205,8 @@ void run_parallel_bfgs_docking(
     unsigned int seed,
     std::vector<float>& out_energies,
     std::vector<std::vector<float>>& out_conformations,
-    int verbosity = 0
+    int verbosity = 0,
+    bool direct_pairwise = false
 );
 
 // High-level interface for local minimization from input pose

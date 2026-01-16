@@ -5,6 +5,8 @@
 #include "test_cache.h"
 #include "test_utils.h"
 #include "test_bfgs_parallel.h"
+#include "test_scoring_lut.h"
+#include "test_spatial_hash.h"
 #include "gpu_util.h"
 #include "dl_scorer.h"
 #include "device_buffer.h"
@@ -78,6 +80,61 @@ BOOST_AUTO_TEST_CASE(trajectory_cpu_vs_gpu) {
 
 BOOST_AUTO_TEST_SUITE_END()
 
+BOOST_AUTO_TEST_SUITE(scoring_lut)
+
+BOOST_AUTO_TEST_CASE(vdw_group_mapping) {
+  test_vdw_group_mapping();
+}
+
+BOOST_AUTO_TEST_CASE(vdw_sum_symmetry) {
+  test_vdw_sum_symmetry();
+}
+
+BOOST_AUTO_TEST_CASE(vdw_sum_roundtrip) {
+  test_vdw_sum_roundtrip();
+}
+
+BOOST_AUTO_TEST_CASE(lut_vs_analytical) {
+  test_lut_vs_analytical();
+}
+
+BOOST_AUTO_TEST_CASE(lut_edge_cases) {
+  test_lut_edge_cases();
+}
+
+BOOST_AUTO_TEST_CASE(atom_type_flags) {
+  test_atom_type_flags();
+}
+
+BOOST_AUTO_TEST_CASE(gradient_numerical) {
+  test_gradient_numerical();
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+BOOST_AUTO_TEST_SUITE(spatial_hash)
+
+BOOST_AUTO_TEST_CASE(cell_indexing) {
+  test_spatial_hash_cell_indexing();
+}
+
+BOOST_AUTO_TEST_CASE(neighbor_accuracy) {
+  test_spatial_hash_neighbor_accuracy();
+}
+
+BOOST_AUTO_TEST_CASE(edge_cases) {
+  test_spatial_hash_edge_cases();
+}
+
+BOOST_AUTO_TEST_CASE(validation) {
+  test_spatial_hash_validation();
+}
+
+BOOST_AUTO_TEST_CASE(atom_types) {
+  test_spatial_hash_atom_types();
+}
+
+BOOST_AUTO_TEST_SUITE_END()
 
 
 bool init_unit_test() {

@@ -11,6 +11,8 @@
 #include "quaternion.h"
 #include "curl.h"
 #include "gpu_util.h"
+#include "scoring_lut.h"
+#include "spatial_hash.h"
 #include <curand_kernel.h>
 #include <cstring>
 #include <vector>
@@ -441,6 +443,171 @@ __device__ float eval_energy_grid_single_thread(
 }
 
 // ============================================================================
+// Direct Pairwise Energy Evaluation (LUT-based)
+// ============================================================================
+
+// Evaluate intermolecular energy using direct pairwise computation with LUT
+// This replaces grid-based scoring to avoid L2 cache thrashing at high exhaustiveness
+__device__ float eval_energy_direct_pairwise(
+    const float* ligand_coords,      // [num_ligand_atoms * 3] Ligand atom coordinates
+    const uint8_t* ligand_types,     // [num_ligand_atoms] SMINA atom types
+    int num_ligand_atoms,
+    float* forces,                   // [num_ligand_atoms * 3] Output forces
+    const ScoringLUTMinimal* lut,    // Scoring lookup table (in shared memory)
+    const SpatialHashGPU* spatial_hash,  // Spatial hash for receptor atoms
+    float cutoff_sq = 64.0f          // Cutoff distance squared (8^2)
+) {
+    float total_energy = 0;
+    const float bin_scale = (float)N_DIST_BINS_COMPACT / cutoff_sq;
+
+    // Zero forces
+    for (int i = 0; i < num_ligand_atoms * 3; i++) {
+        forces[i] = 0;
+    }
+
+    // For each ligand atom
+    for (int la = 0; la < num_ligand_atoms; la++) {
+        float lx = ligand_coords[la * 3 + 0];
+        float ly = ligand_coords[la * 3 + 1];
+        float lz = ligand_coords[la * 3 + 2];
+
+        uint8_t l_type = ligand_types[la];
+
+        // Skip hydrogens
+        if (l_type <= 1) continue;
+
+        uint8_t l_radius_group = SMINA_TYPE_TO_RADIUS_GROUP[l_type];
+        uint8_t l_flags = SMINA_TYPE_FLAGS[l_type];
+        bool l_hydro = (l_flags & FLAG_HYDROPHOBIC) != 0;
+        bool l_donor = (l_flags & FLAG_DONOR) != 0;
+        bool l_acceptor = (l_flags & FLAG_ACCEPTOR) != 0;
+
+        float fx = 0, fy = 0, fz = 0;
+
+        // Get cell containing ligand atom
+        int3 cell = get_cell_coords_gpu(lx, ly, lz, *spatial_hash);
+
+        // Check 27 neighboring cells (3x3x3)
+        for (int dz = -1; dz <= 1; dz++) {
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dx = -1; dx <= 1; dx++) {
+                    int3 neighbor_cell = make_int3(cell.x + dx, cell.y + dy, cell.z + dz);
+
+                    // Skip invalid cells
+                    if (!is_valid_cell(neighbor_cell, *spatial_hash)) continue;
+
+                    int cell_idx = cell_coords_to_index(neighbor_cell, *spatial_hash);
+                    int start = spatial_hash->cell_start[cell_idx];
+                    int count = spatial_hash->cell_count[cell_idx];
+
+                    // For each receptor atom in this cell
+                    for (int ri = start; ri < start + count; ri++) {
+                        const ReceptorAtomGPU& ra = spatial_hash->atoms[ri];
+
+                        // Compute distance squared
+                        float ddx = lx - ra.x;
+                        float ddy = ly - ra.y;
+                        float ddz = lz - ra.z;
+                        float d_sq = ddx*ddx + ddy*ddy + ddz*ddz;
+
+                        // Skip if beyond cutoff or too close
+                        if (d_sq >= cutoff_sq || d_sq < 0.01f) continue;
+
+                        // Get vdw_sum index
+                        uint8_t r_radius_group = ra.radius_group;
+                        int vdw_idx = get_vdw_sum_idx(l_radius_group, r_radius_group);
+
+                        // LUT lookup with interpolation
+                        float base_e, base_dor;
+                        lut_lookup(
+                            (const half*)lut->base_energy,
+                            (const half*)lut->base_deriv,
+                            vdw_idx, d_sq, bin_scale, N_DIST_BINS_COMPACT,
+                            base_e, base_dor
+                        );
+
+                        float e = base_e;
+                        float dor = base_dor;
+
+                        // Hydrophobic term (if both atoms are hydrophobic)
+                        bool r_hydro = (ra.flags & FLAG_HYDROPHOBIC) != 0;
+                        if (l_hydro && r_hydro) {
+                            float hydro_e, hydro_dor;
+                            lut_lookup(
+                                (const half*)lut->hydro_energy,
+                                (const half*)lut->hydro_deriv,
+                                vdw_idx, d_sq, bin_scale, N_DIST_BINS_COMPACT,
+                                hydro_e, hydro_dor
+                            );
+                            e += hydro_e;
+                            dor += hydro_dor;
+                        }
+
+                        // H-bond term (if donor-acceptor pair)
+                        bool r_donor = (ra.flags & FLAG_DONOR) != 0;
+                        bool r_acceptor = (ra.flags & FLAG_ACCEPTOR) != 0;
+                        if ((l_donor && r_acceptor) || (l_acceptor && r_donor)) {
+                            float hbond_e, hbond_dor;
+                            lut_lookup(
+                                (const half*)lut->hbond_energy,
+                                (const half*)lut->hbond_deriv,
+                                vdw_idx, d_sq, bin_scale, N_DIST_BINS_COMPACT,
+                                hbond_e, hbond_dor
+                            );
+                            e += hbond_e;
+                            dor += hbond_dor;
+                        }
+
+                        total_energy += e;
+
+                        // Force: F = -dE/dr * (r_vec / r)
+                        // Since dor = dE/dr / r, force = -dor * r_vec
+                        fx -= dor * ddx;
+                        fy -= dor * ddy;
+                        fz -= dor * ddz;
+                    }
+                }
+            }
+        }
+
+        forces[la * 3 + 0] = fx;
+        forces[la * 3 + 1] = fy;
+        forces[la * 3 + 2] = fz;
+    }
+
+    return total_energy;
+}
+
+// ============================================================================
+// Unified Intermolecular Energy Evaluation
+// ============================================================================
+
+// Wrapper that selects between grid-based and direct pairwise scoring
+// based on the use_direct_pairwise flag in the context
+__device__ float eval_intermolecular_energy(
+    const ScoringContext& ctx,
+    const float* coords,
+    float* forces,
+    bool debug_print = false
+) {
+    if (ctx.use_direct_pairwise && ctx.lut != nullptr && ctx.spatial_hash != nullptr) {
+        // Use direct pairwise with LUT (avoids L2 cache thrashing)
+        return eval_energy_direct_pairwise(
+            coords,
+            ctx.ligand_smina_types,
+            ctx.num_atoms,
+            forces,
+            ctx.lut,
+            ctx.spatial_hash,
+            ctx.cutoff_sq
+        );
+    } else {
+        // Use grid-based scoring (default)
+        return eval_energy_grid_single_thread(ctx, coords, forces, debug_print);
+    }
+}
+
+// ============================================================================
 // Single-Thread Intramolecular Energy
 // ============================================================================
 
@@ -785,7 +952,7 @@ __device__ float eval_conf_single_thread(
     float* node_axes
 ) {
     set_conf_single_thread(ctx, conf, coords, node_origins, node_orientations, node_axes);
-    float e = eval_energy_grid_single_thread(ctx, coords, forces);
+    float e = eval_intermolecular_energy(ctx, coords, forces);
     e += eval_intramolecular_single_thread(ctx, coords, forces);
     return e;
 }
@@ -1051,7 +1218,7 @@ __global__ void bfgs_parallel_kernel(
 
     // Initial energy and gradient
     set_conf_single_thread(ctx, state.x, state.coords, node_origins, node_orientations, node_axes);
-    state.energy = eval_energy_grid_single_thread(ctx, state.coords, state.forces);
+    state.energy = eval_intermolecular_energy(ctx, state.coords, state.forces);
     state.energy += eval_intramolecular_single_thread(ctx, state.coords, state.forces);
     compute_gradient_single_thread(ctx, state.coords, state.forces, node_origins,
                                    node_axes, state.node_forces, state.node_torques, state.g);
@@ -1438,6 +1605,12 @@ void create_scoring_context(
     ctx.n_torsions = ctx.num_nodes > ctx.nlig_roots ? ctx.num_nodes - ctx.nlig_roots : 0;
     ctx.n_conf = 7 * ctx.nlig_roots + ctx.n_torsions;
     ctx.n_change = 6 * ctx.nlig_roots + ctx.n_torsions;
+
+    // Direct pairwise scoring (disabled by default - use grid-based)
+    ctx.use_direct_pairwise = false;
+    ctx.lut = nullptr;
+    ctx.spatial_hash = nullptr;
+    ctx.ligand_smina_types = nullptr;
 }
 
 // ============================================================================
@@ -1454,7 +1627,8 @@ void run_parallel_bfgs_docking(
     unsigned int seed,
     std::vector<float>& out_energies,
     std::vector<std::vector<float>>& out_conformations,
-    int verbosity
+    int verbosity,
+    bool direct_pairwise
 ) {
     // Timing events
     cudaEvent_t start_total, end_setup, end_bfgs, end_collect;
@@ -1468,6 +1642,18 @@ void run_parallel_bfgs_docking(
     // Create scoring context
     ScoringContext ctx;
     create_scoring_context(ctx, gdata, cacheInfo);
+
+    // Enable direct pairwise scoring if requested
+    // TODO: Initialize LUT and spatial hash when direct_pairwise is true
+    // For now, we just set the flag - the actual scoring will fall back to grid-based
+    // because lut and spatial_hash are nullptr
+    if (direct_pairwise) {
+        ctx.use_direct_pairwise = true;
+        if (verbosity >= 1) {
+            printf("WARNING: --direct_pairwise specified but LUT/spatial hash not yet initialized. "
+                   "Falling back to grid-based scoring.\n");
+        }
+    }
 
     // Allocate context on device
     ScoringContext* d_contexts;
@@ -1675,7 +1861,7 @@ __global__ void bfgs_minimize_kernel(
 
     // Initial energy and gradient
     set_conf_single_thread(ctx, state.x, state.coords, node_origins, node_orientations, node_axes);
-    float inter_energy = eval_energy_grid_single_thread(ctx, state.coords, state.forces);
+    float inter_energy = eval_intermolecular_energy(ctx, state.coords, state.forces);
     float intra_energy = eval_intramolecular_single_thread(ctx, state.coords, state.forces);
     state.energy = inter_energy + intra_energy;
     compute_gradient_single_thread(ctx, state.coords, state.forces, node_origins,
@@ -1899,8 +2085,8 @@ __global__ void score_only_kernel(
     // Transform internal coordinates to Cartesian
     set_conf_single_thread(ctx, input_conf, scratch_coords, node_origins, node_orientations, node_axes);
 
-    // Evaluate inter-molecular energy (grid-based)
-    float inter_e = eval_energy_grid_single_thread(ctx, scratch_coords, scratch_forces);
+    // Evaluate inter-molecular energy (grid-based or direct pairwise)
+    float inter_e = eval_intermolecular_energy(ctx, scratch_coords, scratch_forces);
 
     // Evaluate intramolecular energy
     float intra_e = eval_intramolecular_single_thread(ctx, scratch_coords, scratch_forces);
