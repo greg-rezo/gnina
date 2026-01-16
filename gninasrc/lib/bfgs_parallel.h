@@ -21,6 +21,7 @@
 #include "grid_gpu.h"
 #include "interacting_pairs.h"
 #include "gpucode.h"
+#include "bfgs_diagnostics.h"
 
 // Forward declarations
 struct gpu_data;
@@ -183,6 +184,7 @@ void create_scoring_context(
 );
 
 // High-level interface for running parallel BFGS docking
+// verbosity: 0=silent, 1=warnings/info, 2=detailed
 void run_parallel_bfgs_docking(
     const struct gpu_data& gdata,
     const struct GPUCacheInfo& cacheInfo,
@@ -192,13 +194,15 @@ void run_parallel_bfgs_docking(
     const gfloat3& box_max,
     unsigned int seed,
     std::vector<float>& out_energies,
-    std::vector<std::vector<float>>& out_conformations
+    std::vector<std::vector<float>>& out_conformations,
+    int verbosity = 0
 );
 
 // High-level interface for local minimization from input pose
 // Returns: final energy (inter-adjusted), intramolecular energy
 // out_conf: optimized conformation in flat format
 // out_gradient: optional output for final gradient (pass nullptr to skip)
+// verbosity: 0=silent, 1=warnings/info, 2=detailed
 void run_parallel_bfgs_minimize(
     const struct gpu_data& gdata,
     const struct GPUCacheInfo& cacheInfo,
@@ -207,7 +211,8 @@ void run_parallel_bfgs_minimize(
     float& out_energy,
     float& out_intramolecular,
     std::vector<float>& out_conf,
-    std::vector<float>* out_gradient = nullptr  // Optional: final gradient
+    std::vector<float>* out_gradient = nullptr,  // Optional: final gradient
+    int verbosity = 0
 );
 
 // High-level interface for score-only mode (no optimization)
@@ -243,13 +248,15 @@ void flat_to_conf(
 );
 
 // Launch parallel BFGS kernel
+// verbosity: 0=silent, 1=warnings/info, 2=detailed
 void launch_parallel_bfgs(
     const LigandBatch& batch,
     BFGSBatchMemory& mem,
     int max_iterations,
     const gfloat3& box_min,
     const gfloat3& box_max,
-    unsigned int random_seed
+    unsigned int random_seed,
+    int verbosity = 0
 );
 
 // Collect results from GPU

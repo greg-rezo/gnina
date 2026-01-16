@@ -977,6 +977,9 @@ __device__ void bfgs_hessian_update_single_thread(
 // Main Parallel BFGS Kernel
 // ============================================================================
 
+// Launch bounds: 128 threads/block, min 8 blocks/SM = 1024 threads/SM
+// L4 GPU: 65,536 registers/SM -> 64 registers/thread target
+__launch_bounds__(128, 8)
 __global__ void bfgs_parallel_kernel(
     BFGSState* states,
     const float* initial_confs,
@@ -1246,8 +1249,32 @@ void launch_parallel_bfgs(
     int max_iterations,
     const gfloat3& box_min,
     const gfloat3& box_max,
-    unsigned int random_seed
+    unsigned int random_seed,
+    int verbosity
 ) {
+    // Run diagnostics - warnings always appear, INFO only with verbosity >= 1
+    if (batch.num_ligands > 0) {
+        // Get first ligand context for diagnostics
+        ScoringContext ctx;
+        CUDA_CHECK_GNINA(cudaMemcpy(&ctx, &batch.ligand_contexts[0],
+            sizeof(ScoringContext), cudaMemcpyDeviceToHost));
+
+        check_bfgs_resources(
+            ctx.n_conf,
+            ctx.n_change,
+            ctx.num_atoms,
+            ctx.num_nodes,
+            0,  // Grid memory estimation done separately
+            verbosity
+        );
+
+        // Check kernel register usage
+        int kernel_regs = get_kernel_registers(bfgs_parallel_kernel);
+        if (kernel_regs > 0) {
+            check_kernel_registers("bfgs_parallel_kernel", kernel_regs, verbosity);
+        }
+    }
+
     int threads_per_block = 128;
     int num_blocks = (batch.total_optimizers + threads_per_block - 1) / threads_per_block;
 
@@ -1378,7 +1405,8 @@ void run_parallel_bfgs_docking(
     const gfloat3& box_max,
     unsigned int seed,
     std::vector<float>& out_energies,
-    std::vector<std::vector<float>>& out_conformations
+    std::vector<std::vector<float>>& out_conformations,
+    int verbosity
 ) {
     // Timing events
     cudaEvent_t start_total, end_setup, end_bfgs, end_collect;
@@ -1421,7 +1449,7 @@ void run_parallel_bfgs_docking(
     CUDA_CHECK_GNINA(cudaEventRecord(end_setup));
 
     // Launch parallel BFGS
-    launch_parallel_bfgs(batch, mem, max_iterations, box_min, box_max, seed);
+    launch_parallel_bfgs(batch, mem, max_iterations, box_min, box_max, seed, verbosity);
 
     // Synchronize
     CUDA_CHECK_GNINA(cudaDeviceSynchronize());
@@ -1440,12 +1468,19 @@ void run_parallel_bfgs_docking(
     CUDA_CHECK_GNINA(cudaEventElapsedTime(&collect_ms, end_bfgs, end_collect));
 
     float total_ms = setup_ms + bfgs_ms + collect_ms;
+    float time_per_pose_ms = total_ms / n_poses;
+    float time_per_pose_us = time_per_pose_ms * 1000.0f;
+
     fprintf(stderr, "Parallel BFGS timing:\n");
     fprintf(stderr, "  Setup (context + alloc): %.2f ms (%.1f%%)\n", setup_ms, 100.0f * setup_ms / total_ms);
     fprintf(stderr, "  BFGS kernel:             %.2f ms (%.1f%%)\n", bfgs_ms, 100.0f * bfgs_ms / total_ms);
     fprintf(stderr, "  Result collection:       %.2f ms (%.1f%%)\n", collect_ms, 100.0f * collect_ms / total_ms);
     fprintf(stderr, "  Total:                   %.2f ms\n", total_ms);
     fprintf(stderr, "  Throughput:              %.1f poses/sec\n", 1000.0f * n_poses / total_ms);
+    fprintf(stderr, "  Time per pose:           %.2f us (%.3f ms)\n", time_per_pose_us, time_per_pose_ms);
+    fprintf(stderr, "  Poses optimized:         %d\n", n_poses);
+    fprintf(stderr, "  Molecules (ligands):     1\n");
+    fprintf(stderr, "  Time per molecule:       %.2f ms\n", total_ms);
 
     // Cleanup timing events
     cudaEventDestroy(start_total);
@@ -1550,6 +1585,8 @@ void flat_to_conf(
 // ============================================================================
 
 // Kernel for minimizing a single pose (or N copies of the same pose)
+// Launch bounds: 128 threads/block, min 8 blocks/SM = 1024 threads/SM
+__launch_bounds__(128, 8)
 __global__ void bfgs_minimize_kernel(
     const float* initial_conf,
     const ScoringContext* contexts,
@@ -1701,11 +1738,28 @@ void run_parallel_bfgs_minimize(
     float& out_energy,
     float& out_intramolecular,
     std::vector<float>& out_conf,
-    std::vector<float>* out_gradient
+    std::vector<float>* out_gradient,
+    int verbosity
 ) {
     // Create scoring context
     ScoringContext ctx;
     create_scoring_context(ctx, gdata, cacheInfo);
+
+    // Run diagnostics - warnings always appear, INFO only with verbosity >= 1
+    check_bfgs_resources(
+        ctx.n_conf,
+        ctx.n_change,
+        ctx.num_atoms,
+        ctx.num_nodes,
+        0,  // Grid memory estimation done separately
+        verbosity
+    );
+
+    // Check kernel register usage
+    int kernel_regs = get_kernel_registers(bfgs_minimize_kernel);
+    if (kernel_regs > 0) {
+        check_kernel_registers("bfgs_minimize_kernel", kernel_regs, verbosity);
+    }
 
     // Allocate context on device
     ScoringContext* d_contexts;
