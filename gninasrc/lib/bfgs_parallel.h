@@ -195,6 +195,7 @@ void create_scoring_context(
 // High-level interface for running parallel BFGS docking
 // verbosity: 0=silent, 1=warnings/info, 2=detailed
 // direct_pairwise: use direct pairwise scoring with LUT instead of grid interpolation
+// receptor_coords/types: receptor atom data for direct pairwise mode (ignored if direct_pairwise=false)
 void run_parallel_bfgs_docking(
     const struct gpu_data& gdata,
     const struct GPUCacheInfo& cacheInfo,
@@ -206,7 +207,9 @@ void run_parallel_bfgs_docking(
     std::vector<float>& out_energies,
     std::vector<std::vector<float>>& out_conformations,
     int verbosity = 0,
-    bool direct_pairwise = false
+    bool direct_pairwise = false,
+    const std::vector<float>* receptor_coords = nullptr,
+    const std::vector<uint8_t>* receptor_types = nullptr
 );
 
 // High-level interface for local minimization from input pose

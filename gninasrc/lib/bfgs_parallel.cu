@@ -1628,7 +1628,9 @@ void run_parallel_bfgs_docking(
     std::vector<float>& out_energies,
     std::vector<std::vector<float>>& out_conformations,
     int verbosity,
-    bool direct_pairwise
+    bool direct_pairwise,
+    const std::vector<float>* receptor_coords,
+    const std::vector<uint8_t>* receptor_types
 ) {
     // Timing events
     cudaEvent_t start_total, end_setup, end_bfgs, end_collect;
@@ -1643,15 +1645,71 @@ void run_parallel_bfgs_docking(
     ScoringContext ctx;
     create_scoring_context(ctx, gdata, cacheInfo);
 
+    // Device pointers for direct pairwise data (need to track for cleanup)
+    ScoringLUTMinimal* d_lut = nullptr;
+    SpatialHashGPU* d_spatial_hash = nullptr;
+    SpatialHashGPU h_spatial_hash;  // Host copy to store device pointers
+    uint8_t* d_ligand_smina_types = nullptr;
+
     // Enable direct pairwise scoring if requested
-    // TODO: Initialize LUT and spatial hash when direct_pairwise is true
-    // For now, we just set the flag - the actual scoring will fall back to grid-based
-    // because lut and spatial_hash are nullptr
     if (direct_pairwise) {
-        ctx.use_direct_pairwise = true;
-        if (verbosity >= 1) {
-            printf("WARNING: --direct_pairwise specified but LUT/spatial hash not yet initialized. "
-                   "Falling back to grid-based scoring.\n");
+        if (receptor_coords == nullptr || receptor_types == nullptr ||
+            receptor_coords->empty() || receptor_types->empty()) {
+            if (verbosity >= 1) {
+                printf("WARNING: --direct_pairwise specified but receptor data not provided. "
+                       "Falling back to grid-based scoring.\n");
+            }
+        } else {
+            ctx.use_direct_pairwise = true;
+
+            // Generate scoring LUT on host
+            ScoringLUTGenerator lut_gen;
+            ScoringLUTMinimal h_lut;
+            lut_gen.generate(h_lut);
+
+            // Allocate and upload LUT to GPU
+            CUDA_CHECK_GNINA(cudaMalloc(&d_lut, sizeof(ScoringLUTMinimal)));
+            CUDA_CHECK_GNINA(cudaMemcpy(d_lut, &h_lut, sizeof(ScoringLUTMinimal), cudaMemcpyHostToDevice));
+            ctx.lut = d_lut;
+
+            // Build spatial hash on host
+            float3 box_min_f3 = make_float3(box_min.x, box_min.y, box_min.z);
+            float3 box_max_f3 = make_float3(box_max.x, box_max.y, box_max.z);
+            float cutoff = sqrtf(cacheInfo.cutoff_sq);
+
+            SpatialHashBuilder hash_builder;
+            hash_builder.build(*receptor_coords, *receptor_types, box_min_f3, box_max_f3, cutoff);
+
+            // Upload spatial hash to GPU
+            hash_builder.upload_to_gpu(h_spatial_hash);
+            CUDA_CHECK_GNINA(cudaMalloc(&d_spatial_hash, sizeof(SpatialHashGPU)));
+            CUDA_CHECK_GNINA(cudaMemcpy(d_spatial_hash, &h_spatial_hash, sizeof(SpatialHashGPU), cudaMemcpyHostToDevice));
+            ctx.spatial_hash = d_spatial_hash;
+
+            // Upload ligand SMINA types to GPU
+            // Need to copy from device (cacheInfo.types) to host, then create uint8_t array
+            std::vector<unsigned> h_types(ctx.num_atoms);
+            CUDA_CHECK_GNINA(cudaMemcpy(h_types.data(), cacheInfo.types,
+                                        ctx.num_atoms * sizeof(unsigned), cudaMemcpyDeviceToHost));
+
+            std::vector<uint8_t> ligand_types_u8(ctx.num_atoms);
+            for (unsigned i = 0; i < ctx.num_atoms; i++) {
+                ligand_types_u8[i] = static_cast<uint8_t>(h_types[i]);
+            }
+
+            CUDA_CHECK_GNINA(cudaMalloc(&d_ligand_smina_types, ctx.num_atoms * sizeof(uint8_t)));
+            CUDA_CHECK_GNINA(cudaMemcpy(d_ligand_smina_types, ligand_types_u8.data(),
+                                        ctx.num_atoms * sizeof(uint8_t), cudaMemcpyHostToDevice));
+            ctx.ligand_smina_types = d_ligand_smina_types;
+
+            if (verbosity >= 1) {
+                printf("Direct pairwise scoring enabled:\n");
+                printf("  Receptor atoms: %zu\n", receptor_coords->size() / 3);
+                printf("  Spatial hash cells: %d (%d x %d x %d)\n",
+                       hash_builder.num_cells,
+                       hash_builder.grid_dim.x, hash_builder.grid_dim.y, hash_builder.grid_dim.z);
+                printf("  Cutoff: %.1f A\n", cutoff);
+            }
         }
     }
 
@@ -1726,6 +1784,14 @@ void run_parallel_bfgs_docking(
     free_batch_memory(mem);
     cudaFree(d_contexts);
     cudaFree(d_optimizer_to_ligand);
+
+    // Cleanup direct pairwise resources
+    if (d_lut) cudaFree(d_lut);
+    if (d_spatial_hash) {
+        SpatialHashBuilder::free_gpu(h_spatial_hash);
+        cudaFree(d_spatial_hash);
+    }
+    if (d_ligand_smina_types) cudaFree(d_ligand_smina_types);
 }
 
 // ============================================================================

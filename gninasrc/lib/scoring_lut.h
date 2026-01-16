@@ -105,7 +105,8 @@ constexpr float HBOND_BAD = 0.0f;
 
 // The 10 unique xs_radius values (in Angstroms)
 // Index 0-9 corresponds to radius_group_id
-constexpr float RADIUS_VALUES[N_RADIUS_GROUPS] = {
+// Host version for CPU code
+constexpr float RADIUS_VALUES_HOST[N_RADIUS_GROUPS] = {
     0.37f,  // Group 0: H, PolarH
     1.20f,  // Group 1: Metals (Mg, Mn, Zn, Ca, Fe, GenericMetal)
     1.50f,  // Group 2: F
@@ -117,6 +118,16 @@ constexpr float RADIUS_VALUES[N_RADIUS_GROUPS] = {
     2.10f,  // Group 8: P
     2.20f,  // Group 9: I
 };
+
+#ifdef __CUDACC__
+// Device constant version for GPU code (visible when compiling with nvcc)
+__device__ __constant__ float RADIUS_VALUES_DEVICE[N_RADIUS_GROUPS] = {
+    0.37f, 1.20f, 1.50f, 1.70f, 1.80f, 1.90f, 1.92f, 2.00f, 2.10f, 2.20f
+};
+#endif
+
+// Use RADIUS_VALUES_HOST for host code
+#define RADIUS_VALUES RADIUS_VALUES_HOST
 
 // Map from SMINA atom type (0-27) to radius group (0-9)
 // Based on xs_radius values from atom_constants.h
@@ -236,7 +247,11 @@ LUT_HOSTDEVICE inline float get_vdw_sum_value(int vdw_idx) {
         max_g++;
     }
     int min_g = vdw_idx - (max_g * (max_g + 1)) / 2;
-    return RADIUS_VALUES[min_g] + RADIUS_VALUES[max_g];
+#ifdef __CUDA_ARCH__
+    return RADIUS_VALUES_DEVICE[min_g] + RADIUS_VALUES_DEVICE[max_g];
+#else
+    return RADIUS_VALUES_HOST[min_g] + RADIUS_VALUES_HOST[max_g];
+#endif
 }
 
 // Precomputed vdw_sum values for all 55 indices

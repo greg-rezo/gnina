@@ -689,6 +689,21 @@ void do_search(model &m, const boost::optional<model> &ref, const boost::optiona
       gfloat3 box_min(corner1[0], corner1[1], corner1[2]);
       gfloat3 box_max(corner2[0], corner2[1], corner2[2]);
 
+      // Extract receptor atoms for direct pairwise mode
+      std::vector<float> receptor_coords;
+      std::vector<uint8_t> receptor_types;
+      if (settings.direct_pairwise) {
+          const atomv& rec_atoms = m.get_fixed_atoms();
+          receptor_coords.reserve(rec_atoms.size() * 3);
+          receptor_types.reserve(rec_atoms.size());
+          for (const auto& atom : rec_atoms) {
+              receptor_coords.push_back(atom.coords[0]);
+              receptor_coords.push_back(atom.coords[1]);
+              receptor_coords.push_back(atom.coords[2]);
+              receptor_types.push_back(static_cast<uint8_t>(atom.sm));
+          }
+      }
+
       // Run parallel BFGS
       std::vector<float> energies;
       std::vector<std::vector<float>> conformations;
@@ -701,7 +716,9 @@ void do_search(model &m, const boost::optional<model> &ref, const boost::optiona
           settings.seed,
           energies, conformations,
           settings.verbosity,
-          settings.direct_pairwise
+          settings.direct_pairwise,
+          settings.direct_pairwise ? &receptor_coords : nullptr,
+          settings.direct_pairwise ? &receptor_types : nullptr
       );
 
       done(settings.verbosity, log);
