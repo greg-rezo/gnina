@@ -1617,7 +1617,7 @@ Thank you!\n";
         "use GPU for docking (parallel BFGS instead of Monte Carlo)")(
         "cpu_grid", bool_switch(&settings.cpu_grid)->default_value(false),
         "use grid-based scoring for CPU local_only (to match GPU behavior)")(
-        "bfgs_iterations", value<int>(&settings.bfgs_iterations)->default_value(100),
+        "bfgs_iterations", value<int>(&settings.bfgs_iterations)->default_value(50),
         "max BFGS iterations for --gpu and --local_only modes")(
         "verbose_grad", bool_switch(&settings.verbose_grad)->default_value(false),
         "output gradient values for debugging")(

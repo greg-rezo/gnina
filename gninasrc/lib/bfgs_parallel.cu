@@ -94,8 +94,12 @@ __device__ inline float norm3(const float* v) {
 // Normalize angle to [-pi, pi]
 __device__ inline float normalize_angle_device(float a) {
     const float pi = 3.14159265358979323846f;
-    while (a > pi) a -= 2*pi;
-    while (a < -pi) a += 2*pi;
+    // Handle NaN/infinity to prevent infinite loops
+    if (!isfinite(a)) return 0.0f;
+    // Use fmod for efficient normalization instead of while loops
+    a = fmodf(a, 2*pi);
+    if (a > pi) a -= 2*pi;
+    if (a < -pi) a += 2*pi;
     return a;
 }
 
@@ -844,7 +848,8 @@ __device__ float accurate_line_search_single_thread(
     float alpha2 = 0, f2 = 0;
     bool first_backtrack = true;
 
-    for (;;) {
+    const int MAX_LINE_SEARCH_ITERS = 50;  // Prevent infinite loop
+    for (int ls_iter = 0; ls_iter < MAX_LINE_SEARCH_ITERS; ls_iter++) {
         // Check for too small step
         if (alpha < alamin || !isfinite(alpha)) {
             // Step too small - copy x to x_new and zero gradient
@@ -864,6 +869,19 @@ __device__ float accurate_line_search_single_thread(
         // Evaluate at new point
         f_new = eval_conf_single_thread(ctx, x_new, coords, forces,
                                         node_origins, node_orientations, node_axes);
+
+        // Check for NaN energy (can happen with out-of-bounds poses)
+        if (!isfinite(f_new)) {
+            // Treat as failure - return to starting point
+            for (int i = 0; i < ctx.n_conf; i++) {
+                x_new[i] = x[i];
+            }
+            for (int i = 0; i < ctx.n_change; i++) {
+                g_new[i] = 0;
+            }
+            f_new = f0;
+            return 0;
+        }
 
         // Check Armijo sufficient decrease condition
         if (f_new <= f0 + ALF * alpha * slope) {
@@ -926,6 +944,16 @@ __device__ float accurate_line_search_single_thread(
         // Update alpha, but never smaller than a tenth of previous
         alpha = fmaxf(tmplam, 0.1f * alpha);
     }
+
+    // Hit max iterations - treat as failure
+    for (int i = 0; i < ctx.n_conf; i++) {
+        x_new[i] = x[i];
+    }
+    for (int i = 0; i < ctx.n_change; i++) {
+        g_new[i] = 0;
+    }
+    f_new = f0;
+    return 0;
 }
 
 // BFGS Hessian update
@@ -1252,6 +1280,26 @@ void launch_parallel_bfgs(
     unsigned int random_seed,
     int verbosity
 ) {
+    // Check and configure CUDA stack size
+    // Each thread needs ~8KB for local arrays (node_origins, node_orientations, node_axes)
+    // in both the main kernel and line_search function
+    size_t currentStackSize;
+    cudaDeviceGetLimit(&currentStackSize, cudaLimitStackSize);
+
+    const size_t requiredStackSize = 16384;  // 16KB per thread
+    if (currentStackSize < requiredStackSize) {
+        if (verbosity >= 1) {
+            fprintf(stderr, "INFO: Increasing CUDA stack size from %zu to %zu bytes/thread\n",
+                    currentStackSize, requiredStackSize);
+        }
+        cudaError_t err = cudaDeviceSetLimit(cudaLimitStackSize, requiredStackSize);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "WARNING: Failed to set CUDA stack size: %s\n", cudaGetErrorString(err));
+        }
+    } else if (verbosity >= 1) {
+        fprintf(stderr, "INFO: CUDA stack size: %zu bytes/thread (sufficient)\n", currentStackSize);
+    }
+
     // Run diagnostics - warnings always appear, INFO only with verbosity >= 1
     if (batch.num_ligands > 0) {
         // Get first ligand context for diagnostics

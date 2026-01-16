@@ -99,7 +99,7 @@ struct user_settings {
             sort_order(CNNscore), score_only(false),
             randomize_only(false), local_only(false), dominimize(false),
             include_atom_info(false), no_gpu(false), no_lig(false),
-            gpu(false), cpu_grid(false), bfgs_iterations(100), verbose_grad(false) {
+            gpu(false), cpu_grid(false), bfgs_iterations(50), verbose_grad(false) {
 
     }
 };

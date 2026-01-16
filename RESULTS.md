@@ -99,11 +99,45 @@
 
 ---
 
+## BFGS Iterations Benchmark (L4 GPU)
+
+**Test**: DMQ ligand, exhaustiveness=1024, single molecule
+
+| BFGS Iterations | Total Time | Throughput | Time/Pose |
+|-----------------|------------|------------|-----------|
+| 100 (default)   | 407 ms     | 2,515 poses/sec | 398 µs |
+| **50**          | **257 ms** | **3,990 poses/sec** | **251 µs** |
+
+**Speedup with 50 iterations**: 37% faster, 59% higher throughput
+
+Recommended default: `--bfgs_iterations 50` for good balance of speed and convergence.
+
+---
+
+## High Exhaustiveness Scaling (L4 GPU)
+
+**Test**: DMQ ligand, bfgs_iterations=50, seed=12345
+
+| Exhaustiveness | Total Time | Throughput | Time/Pose |
+|----------------|------------|------------|-----------|
+| 1,024          | 233 ms     | 4,398 poses/sec | 227 µs |
+| 7,000          | 700 ms     | 10,005 poses/sec | 100 µs |
+| 16,384         | 882 ms     | 18,582 poses/sec | 54 µs |
+| **65,536**     | **3,525 ms** | **18,593 poses/sec** | **54 µs** |
+
+**Key findings**:
+- Throughput improves with higher exhaustiveness (better GPU utilization)
+- Peak throughput: ~18,500 poses/sec at 16K+ exhaustiveness
+- L4 GPU can easily handle 65K+ poses without memory issues
+- Bug fix in `normalize_angle_device()` resolved infinite loops at high exhaustiveness
+
+---
+
 ## Conclusion
 
 GPU parallel BFGS finds excellent results competitive with or better than CPU Monte Carlo:
 - At exhaustiveness 1024: GPU finds better affinity (-13.92 vs -13.20) and better RMSD (0.23 Å vs 0.67 Å)
 - At exhaustiveness 4096: Both find near-native poses (~0.25 Å), with GPU slightly better affinity (-14.13 vs -14.07)
-- GPU throughput: ~4000-15000 poses/sec
+- GPU throughput: **4,000-18,500 poses/sec** depending on exhaustiveness (higher = better utilization)
 
 The parallel BFGS approach benefits from massively parallel local optimization from many random starting poses, which with sufficient exhaustiveness can find excellent near-native poses.
