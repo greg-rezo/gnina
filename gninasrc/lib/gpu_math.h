@@ -221,8 +221,13 @@ class array3d_gpu {
     __device__ T& operator()(sz i, sz j, sz k) {
       return data[i + this->i * (j + this->j * k)];
     }
-    __device__   const T& operator()(sz i, sz j, sz k) const {
+    __device__ const T& operator()(sz i, sz j, sz k) const {
       return data[i + this->i * (j + this->j * k)];
+    }
+    // Read-only access using texture cache path (__ldg)
+    // Better for read-only data with spatial locality (like scoring grids)
+    __device__ T ldg(sz i, sz j, sz k) const {
+      return __ldg(&data[i + this->i * (j + this->j * k)]);
     }
 };
 

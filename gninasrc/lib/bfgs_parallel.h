@@ -337,4 +337,110 @@ __device__ void bfgs_hessian_update_single_thread(
     int n
 );
 
+// ============================================================================
+// Inline Device Functions (shared between bfgs_parallel.cu and warp_coop_bfgs.cu)
+// ============================================================================
+
+// Helper: evaluate a single spline at distance r
+// Returns energy value and sets deriv to derivative
+__device__ inline float evaluate_spline_device(
+    float* spline,
+    float r,
+    float fraction,
+    float cutoff,
+    float& deriv
+) {
+    if (r >= cutoff || r < 0) {
+        deriv = 0;
+        return 0;
+    }
+
+    unsigned index = (unsigned)(r / fraction);
+    unsigned base = 5 * index;
+
+    float x = spline[base];
+    float a = spline[base + 1];
+    float b = spline[base + 2];
+    float c = spline[base + 3];
+    float d = spline[base + 4];
+
+    float lx = r - x;
+    float val = ((a * lx + b) * lx + c) * lx + d;
+    deriv = (3 * a * lx + 2 * b) * lx + c;
+
+    return val;
+}
+
+// Evaluate intramolecular pair interaction with charge-dependent components
+// Matches gpucode.cu eval_deriv_gpu()
+__device__ inline float eval_pair_deriv_gpu(
+    const GPUSplineInfo* splineInfo,
+    unsigned t,       // atom A type
+    float charge,     // atom A charge
+    unsigned rt,      // atom B type
+    float rcharge,    // atom B charge
+    float r2,         // distance squared
+    float& dor        // output: derivative/r for force computation
+) {
+    float r = sqrtf(r2);
+
+    // Sort types so t1 <= t2, and sort charges accordingly
+    unsigned t1, t2;
+    float charge1, charge2;
+    if (t < rt) {
+        t1 = t;
+        t2 = rt;
+        charge1 = fabsf(charge);
+        charge2 = fabsf(rcharge);
+    } else {
+        t1 = rt;
+        t2 = t;
+        charge1 = fabsf(rcharge);
+        charge2 = fabsf(charge);
+    }
+
+    // Symmetric indexing for spline lookup
+    unsigned tindex = t1 + t2 * (t2 + 1) / 2;
+    const GPUSplineInfo& spInfo = splineInfo[tindex];
+    unsigned n = spInfo.n;  // number of charge-dependent components
+
+    float ret = 0, d = 0;
+
+    // Evaluate up to 4 charge-dependent spline components
+    if (n > 0) {
+        float fraction = spInfo.fraction;
+        float cutoff = spInfo.cutoff;
+        float val, deriv;
+
+        // Component 0: TypeDependentOnly (no charge adjustment)
+        val = evaluate_spline_device(spInfo.splines[0], r, fraction, cutoff, deriv);
+        ret += val;
+        d += deriv;
+
+        // Component 1: AbsAChargeDependent (multiply by abs(chargeA))
+        if (n > 1) {
+            val = evaluate_spline_device(spInfo.splines[1], r, fraction, cutoff, deriv);
+            ret += val * charge1;
+            d += deriv * charge1;
+
+            // Component 2: AbsBChargeDependent (multiply by abs(chargeB))
+            if (n > 2) {
+                val = evaluate_spline_device(spInfo.splines[2], r, fraction, cutoff, deriv);
+                ret += val * charge2;
+                d += deriv * charge2;
+
+                // Component 3: ABChargeDependent (multiply by chargeA * chargeB)
+                if (n > 3) {
+                    val = evaluate_spline_device(spInfo.splines[3], r, fraction, cutoff, deriv);
+                    ret += val * charge2 * charge1;
+                    d += deriv * charge2 * charge1;
+                }
+            }
+        }
+    }
+
+    dor = d / r;  // Divide by distance to normalize for force computation
+    return ret;
+}
+
 #endif // BFGS_PARALLEL_H

@@ -21,7 +21,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 # Default values
-POD_NAME="${GNINA_BUILD_POD:-gpu-gnina-build-abc123}"
+POD_NAME="${GNINA_BUILD_POD:-gpu-gnina-build-x7k2m9}"
 NAMESPACE="development"
 JOBS=16
 CLEAN=""

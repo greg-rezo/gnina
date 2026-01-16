@@ -51,6 +51,7 @@
 #include "flexinfo.h"
 #include "gpucode.h"
 #include "bfgs_parallel.h"
+#include "warp_coop_bfgs.h"
 #include "grid.h"
 #include "molgetter.h"
 #include "naive_non_cache.h"
@@ -708,18 +709,31 @@ void do_search(model &m, const boost::optional<model> &ref, const boost::optiona
       std::vector<float> energies;
       std::vector<std::vector<float>> conformations;
 
-      run_parallel_bfgs_docking(
-          m.gdata, cacheInfo,
-          settings.exhaustiveness,
-          settings.bfgs_iterations,
-          box_min, box_max,
-          settings.seed,
-          energies, conformations,
-          settings.verbosity,
-          settings.direct_pairwise,
-          settings.direct_pairwise ? &receptor_coords : nullptr,
-          settings.direct_pairwise ? &receptor_types : nullptr
-      );
+      if (settings.warp_coop) {
+          // Use warp-cooperative BFGS kernel (experimental)
+          run_warp_coop_bfgs_docking_default(
+              m.gdata, cacheInfo,
+              settings.exhaustiveness,
+              settings.bfgs_iterations,
+              box_min, box_max,
+              settings.seed,
+              energies, conformations,
+              settings.verbosity
+          );
+      } else {
+          run_parallel_bfgs_docking(
+              m.gdata, cacheInfo,
+              settings.exhaustiveness,
+              settings.bfgs_iterations,
+              box_min, box_max,
+              settings.seed,
+              energies, conformations,
+              settings.verbosity,
+              settings.direct_pairwise,
+              settings.direct_pairwise ? &receptor_coords : nullptr,
+              settings.direct_pairwise ? &receptor_types : nullptr
+          );
+      }
 
       done(settings.verbosity, log);
 
@@ -1636,6 +1650,8 @@ Thank you!\n";
         "use GPU for docking (parallel BFGS instead of Monte Carlo)")(
         "direct_pairwise", bool_switch(&settings.direct_pairwise)->default_value(false),
         "use direct pairwise scoring with LUT instead of grid interpolation (GPU only, reduces L2 cache pressure)")(
+        "warp_coop", bool_switch(&settings.warp_coop)->default_value(false),
+        "use warp-cooperative BFGS kernel (GPU only, experimental - uses shuffle for faster memory access)")(
         "cpu_grid", bool_switch(&settings.cpu_grid)->default_value(false),
         "use grid-based scoring for CPU local_only (to match GPU behavior)")(
         "bfgs_iterations", value<int>(&settings.bfgs_iterations)->default_value(50),
@@ -1838,6 +1854,11 @@ Thank you!\n";
     // Use accurate line search for --local_only to match GPU behavior
     if (settings.local_only && !settings.dominimize) {
       minparms.type = minimization_params::BFGSAccurateLineSearch;
+    }
+
+    // --warp_coop implies --gpu (both use GPU-based BFGS)
+    if (settings.warp_coop) {
+      settings.gpu = true;
     }
 
      // output banner

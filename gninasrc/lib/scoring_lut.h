@@ -505,6 +505,7 @@ public:
 #endif
 
 // Interpolate LUT value at given d² (distance squared)
+// Optimized version using half2 vectorized loads
 LUT_DEVICE void lut_lookup(
     const half* energy_table,
     const half* deriv_table,
@@ -532,11 +533,25 @@ LUT_DEVICE void lut_lookup(
     int idx0 = vdw_idx * n_bins + bin;
     int idx1 = idx0 + 1;
 
-    // Linear interpolation
+#ifdef __CUDA_ARCH__
+    // Use __ldg() for read-only cache access (texture cache path)
+    // This uses the 128KB per-SM read-only cache, separate from shared memory
+    // No occupancy penalty and automatic caching of the 42KB LUT
+    float e0 = __half2float(__ldg(&energy_table[idx0]));
+    float e1 = __half2float(__ldg(&energy_table[idx1]));
+    float d0 = __half2float(__ldg(&deriv_table[idx0]));
+    float d1 = __half2float(__ldg(&deriv_table[idx1]));
+
+    float one_minus_frac = 1.0f - frac;
+    energy = e0 * one_minus_frac + e1 * frac;
+    deriv_over_r = d0 * one_minus_frac + d1 * frac;
+#else
+    // CPU fallback
     energy = __half2float(energy_table[idx0]) * (1.0f - frac)
            + __half2float(energy_table[idx1]) * frac;
     deriv_over_r = __half2float(deriv_table[idx0]) * (1.0f - frac)
                  + __half2float(deriv_table[idx1]) * frac;
+#endif
 }
 
 #endif // SCORING_LUT_H
