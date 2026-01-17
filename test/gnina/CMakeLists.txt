@@ -12,6 +12,8 @@ set( TEST_SRCS
  test_utils.h
  test_bfgs_parallel.cu
  test_bfgs_parallel.h
+ test_ligand_batch.cpp
+ test_ligand_batch.h
 )
 
 find_package(OpenMP)

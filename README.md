@@ -130,7 +130,74 @@ If you are building for systems with different GPUs (e.g. in a cluster environme
 Note that the cmake build will automatically fetch and install [libmolgrid](https://github.com/gnina/libmolgrid) and [torch](https://github.com/pytorch/pytorch) if they are not already installed.
 
 
-The scripts provided in `gnina/scripts` have additional python dependencies that must be installed. 
+The scripts provided in `gnina/scripts` have additional python dependencies that must be installed.
+
+GPU Architecture
+================
+
+When using `--gpu` mode (default for multi-ligand docking), gnina utilizes GPU-accelerated parallel BFGS optimization:
+
+### Multi-Ligand Batch Processing
+
+For docking multiple ligands, gnina automatically batches them for efficient GPU processing:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Phase 1: Load All Ligands into CPU Memory                  │
+│  ┌─────────┐ ┌─────────┐ ┌─────────┐     ┌─────────┐       │
+│  │ Ligand0 │ │ Ligand1 │ │ Ligand2 │ ... │ LigandN │       │
+│  └─────────┘ └─────────┘ └─────────┘     └─────────┘       │
+└─────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────┐
+│  Phase 2: Sort by Size & Group into Batches                 │
+│  ┌──────────────────┐  ┌──────────────────┐                 │
+│  │ Batch 0 (small)  │  │ Batch 1 (medium) │  ...            │
+│  │ 50 ligs × 1024   │  │ 48 ligs × 1024   │                 │
+│  └──────────────────┘  └──────────────────┘                 │
+└─────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────┐
+│  Phase 3: GPU Kernel Launch per Batch                       │
+│  ┌──────────────────────────────────────────────────┐       │
+│  │ bfgs_parallel_kernel: optimizes ~50k poses       │       │
+│  │ simultaneously using per-thread BFGS minimizers  │       │
+│  └──────────────────────────────────────────────────┘       │
+└─────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────┐
+│  Phase 4: Collect Results & Write in Original Order         │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Key Features:**
+- **Batch Size Control**: Use `--batch_size N` to control target poses per GPU batch (default: 50,000)
+- **Size Grouping**: Similar-sized ligands are grouped together to minimize memory waste
+- **Memory Efficient**: Batches respect GPU memory limits automatically
+- **Order Preserved**: Output maintains original ligand input order
+
+**Example:**
+```bash
+# Dock 1000 ligands with high exhaustiveness (uses batch mode by default)
+gnina --gpu -r receptor.pdb -l ligands_1000.sdf --autobox_ligand ref.sdf \
+      --exhaustiveness 2048 -o docked_output.sdf
+
+# Process with smaller batches (for memory-constrained GPUs)
+gnina --gpu --batch_size 20000 -r receptor.pdb -l ligands.sdf \
+      --autobox_ligand ref.sdf -o output.sdf
+
+# Disable batching (process one ligand at a time)
+gnina --gpu --no_batch -r receptor.pdb -l ligand.sdf \
+      --autobox_ligand ref.sdf -o output.sdf
+```
+
+### GPU Kernel Design
+
+The parallel BFGS kernel (`bfgs_parallel_kernel`) runs one optimizer per GPU thread:
+- Each thread independently minimizes a random initial pose
+- Threads share read-only receptor grid data (cached in L2)
+- Per-optimizer state stored in global memory (coordinates, gradients, Hessian)
+- Launch bounds: 128 threads/block, 8+ blocks/SM for high occupancy
 
 Usage
 =====

@@ -7,6 +7,7 @@
 #include "test_bfgs_parallel.h"
 #include "test_scoring_lut.h"
 #include "test_spatial_hash.h"
+#include "test_ligand_batch.h"
 #include "gpu_util.h"
 #include "dl_scorer.h"
 #include "device_buffer.h"
@@ -132,6 +133,30 @@ BOOST_AUTO_TEST_CASE(validation) {
 
 BOOST_AUTO_TEST_CASE(atom_types) {
   test_spatial_hash_atom_types();
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+BOOST_AUTO_TEST_SUITE(ligand_batch)
+
+BOOST_AUTO_TEST_CASE(memory_estimation) {
+  test_batch_memory_estimation();
+}
+
+BOOST_AUTO_TEST_CASE(compatibility) {
+  test_batch_compatibility();
+}
+
+BOOST_AUTO_TEST_CASE(grouping) {
+  test_batch_grouping();
+}
+
+BOOST_AUTO_TEST_CASE(pose_distribution) {
+  test_batch_pose_distribution();
+}
+
+BOOST_AUTO_TEST_CASE(memory_constraint) {
+  test_batch_memory_constraint();
 }
 
 BOOST_AUTO_TEST_SUITE_END()

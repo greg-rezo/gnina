@@ -40,6 +40,7 @@ ${CMAKE_CURRENT_BINARY_DIR}/version.cpp
 lib/atom_constants.cpp
 lib/bfgs_parallel.cu
 lib/warp_coop_bfgs.cu
+lib/ligand_batch_manager.cpp
 lib/box.cpp
 lib/builtinscoring.cpp
 lib/cache.cpp
