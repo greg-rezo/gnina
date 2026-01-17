@@ -15,6 +15,19 @@
 #include "curand_kernel.h"
 #include <cstdio>
 #include <stdexcept>
+#include <sstream>
+
+// Debug mode - uncomment to enable verbose kernel debug output
+// #define WARP_COOP_DEBUG
+
+// Use inline single-threaded computation for debugging
+// #define USE_INLINE_DEBUG
+
+#ifdef WARP_COOP_DEBUG
+#define WARP_DEBUG_PRINT(fmt, ...) printf(fmt, ##__VA_ARGS__)
+#else
+#define WARP_DEBUG_PRINT(fmt, ...) ((void)0)
+#endif
 
 // Error checking macro
 #define CUDA_CHECK_WARP(call) do { \
@@ -24,6 +37,116 @@
                 cudaGetErrorString(err)); \
     } \
 } while(0)
+
+// Normalize angle to [-pi, pi] (matches reference)
+__device__ inline float normalize_angle_warp(float a) {
+    const float pi = 3.14159265358979323846f;
+    if (!isfinite(a)) return 0.0f;
+    a = fmodf(a, 2*pi);
+    if (a > pi) a -= 2*pi;
+    if (a < -pi) a += 2*pi;
+    return a;
+}
+
+// Convert angle-axis rotation to quaternion (matches reference angle_to_quaternion_device)
+__device__ inline void angle_to_quaternion_warp(float rx, float ry, float rz, float* q) {
+    const float epsilon_fl = 1e-7f;
+    float angle = sqrtf(rx*rx + ry*ry + rz*rz);
+    if (angle > epsilon_fl) {
+        float s = sinf(angle * 0.5f) / angle;
+        q[0] = cosf(angle * 0.5f);  // w
+        q[1] = s * rx;               // x
+        q[2] = s * ry;               // y
+        q[3] = s * rz;               // z
+    } else {
+        // Identity quaternion for small/zero angles (matches reference)
+        q[0] = 1.0f;
+        q[1] = 0.0f;
+        q[2] = 0.0f;
+        q[3] = 0.0f;
+    }
+}
+
+// Quaternion multiplication: result = q1 * q2
+__device__ inline void quat_mult_warp(const float* q1, const float* q2, float* result) {
+    result[0] = q1[0]*q2[0] - q1[1]*q2[1] - q1[2]*q2[2] - q1[3]*q2[3];
+    result[1] = q1[0]*q2[1] + q1[1]*q2[0] + q1[2]*q2[3] - q1[3]*q2[2];
+    result[2] = q1[0]*q2[2] - q1[1]*q2[3] + q1[2]*q2[0] + q1[3]*q2[1];
+    result[3] = q1[0]*q2[3] + q1[1]*q2[2] - q1[2]*q2[1] + q1[3]*q2[0];
+}
+
+// Increment conformation: x_new = x + alpha * p (with proper quaternion handling)
+// This matches reference increment_conf_single_thread
+// x has 7 * nlig_roots + n_torsions components (3 pos + 4 quat per root + torsions)
+// p has 6 * nlig_roots + n_torsions components (3 pos + 3 angle-axis per root + torsions)
+template<typename Config>
+__device__ void increment_conf_warp(
+    const float* all_x,    // Current conformation (n_conf values)
+    const float* all_p,    // Search direction (n_change values)
+    float alpha,
+    int nlig_roots,
+    int n_conf,
+    int n_change,
+    WarpCoopState<Config>& state,
+    const ThreadIndex<Config>& idx
+) {
+    using DA = DistributedArray<Config>;
+
+    // Process rigid body transforms for each ligand root
+    for (int r = 0; r < nlig_roots; r++) {
+        // Position increment (simple addition)
+        for (int j = 0; j < 3; j++) {
+            int x_idx = r * 7 + j;
+            int p_idx = r * 6 + j;
+            if ((x_idx % Config::THREADS_PER_OPT) == idx.local_lane) {
+                float x_new = all_x[x_idx] + alpha * all_p[p_idx];
+                DA::set(state.x_new, x_idx, x_new, idx);
+            }
+        }
+
+        // Orientation increment via quaternion multiplication
+        // p contains angle-axis rotation, x contains quaternion
+        float rot[3] = {alpha * all_p[r * 6 + 3],
+                       alpha * all_p[r * 6 + 4],
+                       alpha * all_p[r * 6 + 5]};
+        float dq[4], q[4], qnew[4];
+        angle_to_quaternion_warp(rot[0], rot[1], rot[2], dq);
+        q[0] = all_x[r * 7 + 3];
+        q[1] = all_x[r * 7 + 4];
+        q[2] = all_x[r * 7 + 5];
+        q[3] = all_x[r * 7 + 6];
+        quat_mult_warp(dq, q, qnew);
+
+        // Normalize quaternion (matching reference epsilon)
+        const float epsilon_fl = 1e-7f;
+        float qn = sqrtf(qnew[0]*qnew[0] + qnew[1]*qnew[1] + qnew[2]*qnew[2] + qnew[3]*qnew[3]);
+        if (qn > epsilon_fl) {
+            qnew[0] /= qn; qnew[1] /= qn; qnew[2] /= qn; qnew[3] /= qn;
+        }
+
+        // Store quaternion (each thread stores its lane's portion)
+        for (int j = 0; j < 4; j++) {
+            int x_idx = r * 7 + 3 + j;
+            if ((x_idx % Config::THREADS_PER_OPT) == idx.local_lane) {
+                DA::set(state.x_new, x_idx, qnew[j], idx);
+            }
+        }
+    }
+
+    // Torsion increments (with angle normalization)
+    int torsion_start_x = 7 * nlig_roots;
+    int torsion_start_p = 6 * nlig_roots;
+    int n_torsions = n_conf - torsion_start_x;
+
+    for (int t = idx.local_lane; t < n_torsions; t += Config::THREADS_PER_OPT) {
+        int x_idx = torsion_start_x + t;
+        int p_idx = torsion_start_p + t;
+        // Match reference: add raw increment and normalize only the final result
+        float x_new = all_x[x_idx] + alpha * all_p[p_idx];
+        x_new = normalize_angle_warp(x_new);
+        DA::set(state.x_new, x_idx, x_new, idx);
+    }
+}
 
 // ============================================================================
 // ThreadIndex Method Implementations
@@ -183,18 +306,18 @@ __device__ __forceinline__ void trilinear_interp_warp(
     float sy = (y - grid.m_init.y) * grid.m_factor.y;
     float sz = (z - grid.m_init.z) * grid.m_factor.z;
 
-    // Handle out-of-bounds
+    // Handle out-of-bounds (use pre-computed m_dim_fl_minus_1 for exact match)
     float miss_x = 0, miss_y = 0, miss_z = 0;
     int region_x = 0, region_y = 0, region_z = 0;
 
     if (sx < 0) { miss_x = -sx; region_x = -1; sx = 0; }
-    else if (sx >= data.dim0() - 1) { miss_x = sx - (data.dim0() - 1); region_x = 1; sx = data.dim0() - 1 - 0.001f; }
+    else if (sx >= grid.m_dim_fl_minus_1.x) { miss_x = sx - grid.m_dim_fl_minus_1.x; region_x = 1; sx = grid.m_dim_fl_minus_1.x - 0.001f; }
 
     if (sy < 0) { miss_y = -sy; region_y = -1; sy = 0; }
-    else if (sy >= data.dim1() - 1) { miss_y = sy - (data.dim1() - 1); region_y = 1; sy = data.dim1() - 1 - 0.001f; }
+    else if (sy >= grid.m_dim_fl_minus_1.y) { miss_y = sy - grid.m_dim_fl_minus_1.y; region_y = 1; sy = grid.m_dim_fl_minus_1.y - 0.001f; }
 
     if (sz < 0) { miss_z = -sz; region_z = -1; sz = 0; }
-    else if (sz >= data.dim2() - 1) { miss_z = sz - (data.dim2() - 1); region_z = 1; sz = data.dim2() - 1 - 0.001f; }
+    else if (sz >= grid.m_dim_fl_minus_1.z) { miss_z = sz - grid.m_dim_fl_minus_1.z; region_z = 1; sz = grid.m_dim_fl_minus_1.z - 0.001f; }
 
     int ix = (int)sx;
     int iy = (int)sy;
@@ -225,7 +348,7 @@ __device__ __forceinline__ void trilinear_interp_warp(
 
     float e = c0 * (1.0f - fx_) + c1 * fx_;
 
-    // Gradients
+    // Gradients (only used if in-bounds for that dimension)
     float gx = (c1 - c0) * grid.m_factor.x;
     float gy = ((c01 - c00) * (1.0f - fx_) + (c11 - c10) * fx_) * grid.m_factor.y;
     float gz = ((c001 - c000) * (1.0f - fy_) * (1.0f - fx_) +
@@ -243,17 +366,18 @@ __device__ __forceinline__ void trilinear_interp_warp(
         gz *= factor;
     }
 
-    // Out-of-bounds penalty
-    float penalty = slope * (miss_x + miss_y + miss_z);
+    // Out-of-bounds penalty (convert from grid units to Angstroms using m_factor_inv)
+    float penalty = slope * (miss_x * grid.m_factor_inv.x +
+                             miss_y * grid.m_factor_inv.y +
+                             miss_z * grid.m_factor_inv.z);
     e += penalty;
-    gx += slope * region_x;
-    gy += slope * region_y;
-    gz += slope * region_z;
 
+    // Out-of-bounds gradient: zero the interpolated gradient, use only penalty gradient
+    // (matches bfgs_parallel.cu behavior - returns gradient, NOT force)
+    *fx = (region_x == 0 ? gx : 0) + slope * region_x;
+    *fy = (region_y == 0 ? gy : 0) + slope * region_y;
+    *fz = (region_z == 0 ? gz : 0) + slope * region_z;
     *energy = e;
-    *fx = -gx;  // Force = -gradient
-    *fy = -gy;
-    *fz = -gz;
 }
 
 // ============================================================================
@@ -268,9 +392,12 @@ __device__ void set_conf_warp_coop(
     const ShuffleOps<Config>& shfl
 ) {
     using DA = DistributedArray<Config>;
+#ifdef WARP_COOP_DEBUG
     bool debug_thread = (threadIdx.x == 0 && blockIdx.x == 0);
+    (void)debug_thread;  // Suppress unused warning
+#endif
 
-    if (debug_thread) printf("set_conf: num_layers=%d, num_nodes=%d\n", ctx.num_layers, ctx.num_nodes);
+    WARP_DEBUG_PRINT("set_conf: num_layers=%d, num_nodes=%d\n", ctx.num_layers, ctx.num_nodes);
 
     // === Step 1: Root node transform ===
     float root_pos[3], root_quat[4], root_mat[9];
@@ -284,13 +411,13 @@ __device__ void set_conf_warp_coop(
     root_quat[2] = DA::get(state.x, 5, shfl);
     root_quat[3] = DA::get(state.x, 6, shfl);
 
-    if (debug_thread) printf("set_conf: root_pos=(%.2f,%.2f,%.2f)\n", root_pos[0], root_pos[1], root_pos[2]);
+    WARP_DEBUG_PRINT("set_conf: root_pos=(%.2f,%.2f,%.2f)\n", root_pos[0], root_pos[1], root_pos[2]);
 
     // Normalize quaternion and convert to matrix
     normalize_quat_warp(root_quat);
     quat_to_matrix_warp(root_quat, root_mat);
 
-    if (debug_thread) printf("set_conf: root transform done\n");
+    WARP_DEBUG_PRINT("set_conf: root transform done\n");
 
     // Store root transform (distributed)
     for (int i = 0; i < 3; i++) {
@@ -300,108 +427,115 @@ __device__ void set_conf_warp_coop(
         DA::set(state.node_orientations, i, root_mat[i], idx);
     }
 
-    if (debug_thread) printf("set_conf: entering torsion loop\n");
+#ifdef USE_INLINE_DEBUG
+    if (threadIdx.x == 0 && blockIdx.x == 0) printf("set_conf: CHECKPOINT 1 - root done\n");
+#endif
 
     // === Step 2: Torsion nodes (sequential by layer) ===
+    // IMPORTANT: All threads must participate in DA::get shuffles, so no early continues!
     for (int layer = 1; layer < (int)ctx.num_layers; layer++) {
-        if (debug_thread) printf("set_conf: layer %d\n", layer);
         for (int nid = 1; nid < (int)ctx.num_nodes; nid++) {
-            if ((int)ctx.tree_nodes[nid].layer != layer) continue;
-            if (debug_thread) printf("set_conf: processing node %d\n", nid);
-
+            // Check if this node is in current layer (all threads evaluate this uniformly)
+            bool process_node = ((int)ctx.tree_nodes[nid].layer == layer);
             int parent = ctx.tree_nodes[nid].parent;
-            if (parent < 0) continue;
+            if (parent < 0) process_node = false;
 
-            // Gather parent transform
+            // ALL threads participate in shuffles (required for correctness)
+            // Use parent=0 as dummy if not processing (safe since node 0 exists)
+            int safe_parent = process_node ? parent : 0;
+
             float parent_origin[3], parent_mat[9];
             for (int i = 0; i < 3; i++) {
-                parent_origin[i] = DA::get(state.node_origins, parent * 3 + i, shfl);
+                parent_origin[i] = DA::get(state.node_origins, safe_parent * 3 + i, shfl);
             }
             for (int i = 0; i < 9; i++) {
-                parent_mat[i] = DA::get(state.node_orientations, parent * 9 + i, shfl);
+                parent_mat[i] = DA::get(state.node_orientations, safe_parent * 9 + i, shfl);
             }
+            // Torsion index: nid + 6 * nlig_roots (general formula, not hardcoded for nlig_roots=1)
+            float torsion = DA::get(state.x, nid + 6 * ctx.nlig_roots, shfl);
 
-            // Get torsion angle (conf index = 7 + torsion_index, nid starts at 1)
-            float torsion = DA::get(state.x, 7 + nid - 1, shfl);
+            // Only process if this node is in current layer
+            if (process_node) {
+                float rel_axis[3] = {
+                    ctx.tree_nodes[nid].relative_axis.x,
+                    ctx.tree_nodes[nid].relative_axis.y,
+                    ctx.tree_nodes[nid].relative_axis.z
+                };
+                float rel_origin[3] = {
+                    ctx.tree_nodes[nid].relative_origin.x,
+                    ctx.tree_nodes[nid].relative_origin.y,
+                    ctx.tree_nodes[nid].relative_origin.z
+                };
 
-            // Get relative axis and origin from tree node
-            float rel_axis[3] = {
-                ctx.tree_nodes[nid].relative_axis.x,
-                ctx.tree_nodes[nid].relative_axis.y,
-                ctx.tree_nodes[nid].relative_axis.z
-            };
-            float rel_origin[3] = {
-                ctx.tree_nodes[nid].relative_origin.x,
-                ctx.tree_nodes[nid].relative_origin.y,
-                ctx.tree_nodes[nid].relative_origin.z
-            };
+                // Transform axis to world frame
+                float axis[3];
+                mat_vec_mult_warp(parent_mat, rel_axis, axis);
 
-            // Transform axis to world frame
-            float axis[3];
-            mat_vec_mult_warp(parent_mat, rel_axis, axis);
+                // Normalize axis
+                float axis_norm = sqrtf(axis[0]*axis[0] + axis[1]*axis[1] + axis[2]*axis[2]);
+                if (axis_norm > 1e-10f) {
+                    axis[0] /= axis_norm;
+                    axis[1] /= axis_norm;
+                    axis[2] /= axis_norm;
+                }
 
-            // Normalize axis
-            float axis_norm = sqrtf(axis[0]*axis[0] + axis[1]*axis[1] + axis[2]*axis[2]);
-            if (axis_norm > 1e-10f) {
-                axis[0] /= axis_norm;
-                axis[1] /= axis_norm;
-                axis[2] /= axis_norm;
-            }
+                // Store axis for gradient computation
+                for (int i = 0; i < 3; i++) {
+                    DA::set(state.node_axes, nid * 3 + i, axis[i], idx);
+                }
 
-            // Store axis for gradient computation
-            for (int i = 0; i < 3; i++) {
-                DA::set(state.node_axes, nid * 3 + i, axis[i], idx);
-            }
+                // Transform relative origin to world frame
+                float local_origin[3];
+                mat_vec_mult_warp(parent_mat, rel_origin, local_origin);
 
-            // Transform relative origin to world frame
-            float local_origin[3];
-            mat_vec_mult_warp(parent_mat, rel_origin, local_origin);
+                // Node origin = parent_origin + transformed relative origin
+                float origin[3];
+                origin[0] = parent_origin[0] + local_origin[0];
+                origin[1] = parent_origin[1] + local_origin[1];
+                origin[2] = parent_origin[2] + local_origin[2];
 
-            // Node origin = parent_origin + transformed relative origin
-            float origin[3];
-            origin[0] = parent_origin[0] + local_origin[0];
-            origin[1] = parent_origin[1] + local_origin[1];
-            origin[2] = parent_origin[2] + local_origin[2];
+                // Compute rotation matrix for this torsion using Rodrigues
+                float c = cosf(torsion);
+                float s = sinf(torsion);
+                float t = 1.0f - c;
 
-            // Compute rotation matrix for this torsion using Rodrigues
-            float c = cosf(torsion);
-            float s = sinf(torsion);
-            float t = 1.0f - c;
+                // Rodrigues rotation matrix
+                float rot[9];
+                rot[0] = c + axis[0]*axis[0]*t;
+                rot[1] = axis[1]*axis[0]*t + axis[2]*s;
+                rot[2] = axis[2]*axis[0]*t - axis[1]*s;
+                rot[3] = axis[0]*axis[1]*t - axis[2]*s;
+                rot[4] = c + axis[1]*axis[1]*t;
+                rot[5] = axis[2]*axis[1]*t + axis[0]*s;
+                rot[6] = axis[0]*axis[2]*t + axis[1]*s;
+                rot[7] = axis[1]*axis[2]*t - axis[0]*s;
+                rot[8] = c + axis[2]*axis[2]*t;
 
-            // Rodrigues rotation matrix
-            float rot[9];
-            rot[0] = c + axis[0]*axis[0]*t;
-            rot[1] = axis[1]*axis[0]*t + axis[2]*s;
-            rot[2] = axis[2]*axis[0]*t - axis[1]*s;
-            rot[3] = axis[0]*axis[1]*t - axis[2]*s;
-            rot[4] = c + axis[1]*axis[1]*t;
-            rot[5] = axis[2]*axis[1]*t + axis[0]*s;
-            rot[6] = axis[0]*axis[2]*t + axis[1]*s;
-            rot[7] = axis[1]*axis[2]*t - axis[0]*s;
-            rot[8] = c + axis[2]*axis[2]*t;
-
-            // Node orientation = rot * parent_mat
-            float mat[9];
-            for (int i = 0; i < 3; i++) {
-                for (int j = 0; j < 3; j++) {
-                    mat[i + j*3] = 0;
-                    for (int k = 0; k < 3; k++) {
-                        mat[i + j*3] += rot[i + k*3] * parent_mat[k + j*3];
+                // Node orientation = rot * parent_mat
+                float mat[9];
+                for (int i = 0; i < 3; i++) {
+                    for (int j = 0; j < 3; j++) {
+                        mat[i + j*3] = 0;
+                        for (int k = 0; k < 3; k++) {
+                            mat[i + j*3] += rot[i + k*3] * parent_mat[k + j*3];
+                        }
                     }
                 }
-            }
 
-            // Store node transform
-            for (int i = 0; i < 3; i++) {
-                DA::set(state.node_origins, nid * 3 + i, origin[i], idx);
-            }
-            for (int i = 0; i < 9; i++) {
-                DA::set(state.node_orientations, nid * 9 + i, mat[i], idx);
+                // Store node transform
+                for (int i = 0; i < 3; i++) {
+                    DA::set(state.node_origins, nid * 3 + i, origin[i], idx);
+                }
+                for (int i = 0; i < 9; i++) {
+                    DA::set(state.node_orientations, nid * 9 + i, mat[i], idx);
+                }
             }
         }
     }
 
-    if (debug_thread) printf("set_conf: torsion loop done, gathering node transforms\n");
+#ifdef USE_INLINE_DEBUG
+    if (threadIdx.x == 0 && blockIdx.x == 0) printf("set_conf: CHECKPOINT 2 - torsion loop done\n");
+#endif
 
     // === Step 3: Gather ALL node transforms locally (lockstep) ===
     // This is needed because the atom loop is divergent (different threads process different atoms)
@@ -418,12 +552,14 @@ __device__ void set_conf_warp_coop(
         }
     }
 
-    if (debug_thread) printf("set_conf: starting atom transform\n");
+#ifdef USE_INLINE_DEBUG
+    if (threadIdx.x == 0 && blockIdx.x == 0) printf("set_conf: CHECKPOINT 3 - gather done\n");
+#endif
 
     // === Step 4: Atom coordinates (PARALLEL over atoms - no shuffles!) ===
     AtomPartition<Config> atoms(idx.local_lane, ctx.num_atoms);
 
-    if (debug_thread) printf("set_conf: atoms.start=%d, atoms.end=%d\n", atoms.start, atoms.end);
+    WARP_DEBUG_PRINT("set_conf: atoms.start=%d, atoms.end=%d\n", atoms.start, atoms.end);
 
     for (int a = atoms.start; a < atoms.end; a++) {
         int local_slot = a - atoms.start;
@@ -454,7 +590,20 @@ __device__ void set_conf_warp_coop(
         state.my_coords[local_slot * 3 + 2] = origin[2] + rotated[2];
     }
 
-    if (debug_thread) printf("set_conf: DONE\n");
+    WARP_DEBUG_PRINT("set_conf: DONE\n");
+
+#ifdef WARP_COOP_DEBUG
+    // Debug: print atom 0 coords (only from thread that owns it)
+    AtomPartition<Config> dbg_atoms(idx.local_lane, ctx.num_atoms);
+    if (dbg_atoms.start == 0 && threadIdx.x < 8) {  // Thread 0 of first optimizer owns atom 0
+        printf("set_conf VERIFY: atom[0] coords=(%.4f,%.4f,%.4f) local=(%.4f,%.4f,%.4f) owner=%d\n",
+               state.my_coords[0], state.my_coords[1], state.my_coords[2],
+               ctx.atom_local_data[0].coords.x, ctx.atom_local_data[0].coords.y, ctx.atom_local_data[0].coords.z,
+               ctx.atom_owners[0]);
+        printf("set_conf VERIFY: root origin=(%.4f,%.4f,%.4f)\n",
+               all_origins[0], all_origins[1], all_origins[2]);
+    }
+#endif
 }
 
 // ============================================================================
@@ -489,12 +638,15 @@ __device__ float eval_energy_warp_coop(
         float z = state.my_coords[local_slot * 3 + 2];
 
         unsigned atype = ctx.atom_types[a];
-        if (atype >= ctx.ngrids) continue;
+        // Skip hydrogens (type <= 1) and out-of-bounds types (matches bfgs_parallel.cu)
+        if (atype <= 1 || atype >= ctx.ngrids) continue;
+
+        const grid_gpu& grid = ctx.grids[atype];
 
         float e, fx, fy, fz;
         trilinear_interp_warp(
-            ctx.grids[atype],
-            ctx.grids[atype].data,
+            grid,
+            grid.data,
             x, y, z,
             ctx.slope,
             ctx.forcecap,
@@ -505,6 +657,26 @@ __device__ float eval_energy_warp_coop(
         state.my_forces[local_slot * 3 + 0] = fx;
         state.my_forces[local_slot * 3 + 1] = fy;
         state.my_forces[local_slot * 3 + 2] = fz;
+
+        // Handle charge-dependent grid if present (matches bfgs_parallel.cu)
+        if (ctx.atom_params_data != nullptr && grid.chargedata.dim0() > 0) {
+            float charge = ctx.atom_params_data[a].charge;
+            if (charge != 0) {
+                float ce, cfx, cfy, cfz;
+                trilinear_interp_warp(
+                    grid,
+                    grid.chargedata,
+                    x, y, z,
+                    ctx.slope,
+                    ctx.forcecap,
+                    &ce, &cfx, &cfy, &cfz
+                );
+                my_energy += charge * ce;
+                state.my_forces[local_slot * 3 + 0] += charge * cfx;
+                state.my_forces[local_slot * 3 + 1] += charge * cfy;
+                state.my_forces[local_slot * 3 + 2] += charge * cfz;
+            }
+        }
     }
 
     // Reduce intermolecular energy across threads
@@ -512,6 +684,11 @@ __device__ float eval_energy_warp_coop(
 
     // Add intramolecular energy (also updates forces)
     float intra_energy = eval_intramolecular_warp_coop<Config>(ctx, state, idx, shfl);
+
+#ifdef WARP_COOP_DEBUG
+    WARP_DEBUG_PRINT("eval_energy: inter=%f, intra=%f, total=%f\n",
+                     inter_energy, intra_energy, inter_energy + intra_energy);
+#endif
 
     return inter_energy + intra_energy;
 }
@@ -713,24 +890,46 @@ __device__ void compute_gradient_warp_coop(
     }
 
     // === Step 3: Tree reduction (child -> parent) ===
+    // Physics: When force F acts at point P, torque about point O is: τ_O = τ_P + (P - O) × F
     for (int layer = ctx.num_layers - 1; layer > 0; layer--) {
         for (int nid = ctx.num_nodes - 1; nid >= 1; nid--) {
             if ((int)ctx.tree_nodes[nid].layer != layer) continue;
             int parent = ctx.tree_nodes[nid].parent;
             if (parent < 0) continue;
 
-            // Gather child force/torque
-            for (int d = 0; d < 3; d++) {
-                float cf = DA::get(state.node_forces, nid * 3 + d, shfl);
-                float ct = DA::get(state.node_torques, nid * 3 + d, shfl);
+            // Gather child force/torque (all 3 components at once for cross product)
+            float child_fx = DA::get(state.node_forces, nid * 3 + 0, shfl);
+            float child_fy = DA::get(state.node_forces, nid * 3 + 1, shfl);
+            float child_fz = DA::get(state.node_forces, nid * 3 + 2, shfl);
 
-                // Get parent values and add
-                float pf = DA::get(state.node_forces, parent * 3 + d, shfl);
-                float pt = DA::get(state.node_torques, parent * 3 + d, shfl);
+            float child_tx = DA::get(state.node_torques, nid * 3 + 0, shfl);
+            float child_ty = DA::get(state.node_torques, nid * 3 + 1, shfl);
+            float child_tz = DA::get(state.node_torques, nid * 3 + 2, shfl);
 
-                DA::set(state.node_forces, parent * 3 + d, pf + cf, idx);
-                DA::set(state.node_torques, parent * 3 + d, pt + ct, idx);
-            }
+            // r = child_origin - parent_origin (using pre-gathered origins)
+            float rx = all_origins[nid * 3 + 0] - all_origins[parent * 3 + 0];
+            float ry = all_origins[nid * 3 + 1] - all_origins[parent * 3 + 1];
+            float rz = all_origins[nid * 3 + 2] - all_origins[parent * 3 + 2];
+
+            // Get parent values
+            float parent_fx = DA::get(state.node_forces, parent * 3 + 0, shfl);
+            float parent_fy = DA::get(state.node_forces, parent * 3 + 1, shfl);
+            float parent_fz = DA::get(state.node_forces, parent * 3 + 2, shfl);
+
+            float parent_tx = DA::get(state.node_torques, parent * 3 + 0, shfl);
+            float parent_ty = DA::get(state.node_torques, parent * 3 + 1, shfl);
+            float parent_tz = DA::get(state.node_torques, parent * 3 + 2, shfl);
+
+            // parent_force += child_force
+            DA::set(state.node_forces, parent * 3 + 0, parent_fx + child_fx, idx);
+            DA::set(state.node_forces, parent * 3 + 1, parent_fy + child_fy, idx);
+            DA::set(state.node_forces, parent * 3 + 2, parent_fz + child_fz, idx);
+
+            // parent_torque += cross(r, child_force) + child_torque
+            // cross(r, f) = (ry*fz - rz*fy, rz*fx - rx*fz, rx*fy - ry*fx)
+            DA::set(state.node_torques, parent * 3 + 0, parent_tx + (ry * child_fz - rz * child_fy) + child_tx, idx);
+            DA::set(state.node_torques, parent * 3 + 1, parent_ty + (rz * child_fx - rx * child_fz) + child_ty, idx);
+            DA::set(state.node_torques, parent * 3 + 2, parent_tz + (rx * child_fy - ry * child_fx) + child_tz, idx);
         }
     }
 
@@ -747,18 +946,28 @@ __device__ void compute_gradient_warp_coop(
     }
 
     // === Step 5: Compute gradient (parallel over DOFs, no shuffles needed) ===
+    // Layout: [pos1(3), rot1(3), pos2(3), rot2(3), ..., torsions...]
+    // For nlig_roots roots: 6*nlig_roots rigid body DOFs, then n_change - 6*nlig_roots torsion DOFs
+    int rigid_dofs = 6 * ctx.nlig_roots;
+
     for (int i = idx.local_lane; i < ctx.n_change; i += Config::THREADS_PER_OPT) {
         float g_val;
-        if (i < 3) {
-            // Translation: gradient = root force
-            g_val = all_node_forces[i];
-        } else if (i < 6) {
-            // Rotation: gradient = root torque
-            g_val = all_node_torques[i - 3];
+        if (i < rigid_dofs) {
+            // Rigid body DOF: determine which root and whether pos or rot
+            int root = i / 6;
+            int local_dof = i % 6;
+            if (local_dof < 3) {
+                // Translation: gradient = root force
+                g_val = all_node_forces[root * 3 + local_dof];
+            } else {
+                // Rotation: gradient = root torque
+                g_val = all_node_torques[root * 3 + (local_dof - 3)];
+            }
         } else {
             // Torsion: gradient = dot(torque, axis)
-            int nid = i - 5;  // Node for this torsion (1-indexed)
-            if (nid < (int)ctx.num_nodes) {
+            // Matches reference: gradient[nid + 5*nlig_roots], so nid = i - 5*nlig_roots
+            int nid = i - 5 * ctx.nlig_roots;
+            if (nid >= 0 && nid < (int)ctx.num_nodes) {
                 float t0 = all_node_torques[nid * 3 + 0];
                 float t1 = all_node_torques[nid * 3 + 1];
                 float t2 = all_node_torques[nid * 3 + 2];
@@ -910,6 +1119,7 @@ __device__ void bfgs_hessian_update(
 // Line Search
 // ============================================================================
 
+// Accurate line search with quadratic/cubic interpolation (matches reference)
 template<typename Config>
 __device__ float line_search_warp_coop(
     const ScoringContext& ctx,
@@ -919,11 +1129,10 @@ __device__ float line_search_warp_coop(
     const ShuffleOps<Config>& shfl
 ) {
     using DA = DistributedArray<Config>;
-    bool debug_thread = (threadIdx.x == 0 && blockIdx.x == 0);
+    const float ALF = 1.0e-4f;
+    const float epsilon_fl = 1e-7f;
 
-    if (debug_thread) printf("line_search: starting, f0=%f\n", f0);
-
-    // Pre-gather g and p (lockstep)
+    // Pre-gather g, p, and x (all threads in lockstep)
     float all_g[Config::N_CHANGE];
     float all_p[Config::N_CHANGE];
     float all_x[Config::N_CONF];
@@ -931,34 +1140,47 @@ __device__ float line_search_warp_coop(
         all_g[i] = DA::get(state.g, i, shfl);
         all_p[i] = DA::get(state.p, i, shfl);
     }
-    if (debug_thread) printf("line_search: gathering x (n_conf=%d)\n", ctx.n_conf);
     for (int i = 0; i < ctx.n_conf; i++) {
         all_x[i] = DA::get(state.x, i, shfl);
     }
-    if (debug_thread) printf("line_search: gathered all arrays\n");
 
-    // Compute slope = g . p (local computation, then reduce)
+    // Compute slope = g . p
     float my_slope = 0.0f;
     for (int i = idx.local_lane; i < ctx.n_change; i += Config::THREADS_PER_OPT) {
         my_slope += all_g[i] * all_p[i];
     }
     float slope = shfl.reduce_sum(my_slope);
-    if (debug_thread) printf("line_search: slope=%f\n", slope);
 
-    if (slope >= 0.0f) return 0.0f;  // Not descent direction
+    // Not a descent direction
+    if (slope >= 0.0f) {
+        return 0.0f;
+    }
 
-    const float ALF = 1e-4f;
+    // Compute minimum step size (alamin)
+    float my_test = 0.0f;
+    for (int i = idx.local_lane; i < ctx.n_change; i += Config::THREADS_PER_OPT) {
+        float temp = fabsf(all_p[i]);
+        if (temp > my_test) my_test = temp;
+    }
+    float test = shfl.reduce_max(my_test);
+    float alamin = (test > 0) ? (epsilon_fl / test) : epsilon_fl;
+
     float alpha = 1.0f;
+    float alpha2 = 0.0f, f2 = 0.0f;
+    bool first_backtrack = true;
 
-    for (int iter = 0; iter < 20; iter++) {
-        // x_new = x + alpha * p (using pre-gathered values)
-        for (int i = idx.local_lane; i < ctx.n_conf; i += Config::THREADS_PER_OPT) {
-            float p_i = (i < ctx.n_change) ? all_p[i] : 0.0f;
-            DA::set(state.x_new, i, all_x[i] + alpha * p_i, idx);
+    const int MAX_LINE_SEARCH_ITERS = 50;
+    for (int ls_iter = 0; ls_iter < MAX_LINE_SEARCH_ITERS; ls_iter++) {
+        // Check for too small step
+        if (alpha < alamin || !isfinite(alpha)) {
+            return 0.0f;
         }
 
-        // Temporarily swap x and x_new for evaluation
-        // Save x to temp, copy x_new to x
+        // x_new = x + alpha * p (with proper quaternion and torsion handling)
+        increment_conf_warp<Config>(all_x, all_p, alpha, ctx.nlig_roots,
+                                    ctx.n_conf, ctx.n_change, state, idx);
+
+        // Temporarily use x_new as x for evaluation
         float temp_x[Config::CONF_PER_THREAD];
         for (int i = 0; i < Config::CONF_PER_THREAD; i++) {
             temp_x[i] = state.x[i];
@@ -969,12 +1191,27 @@ __device__ float line_search_warp_coop(
         set_conf_warp_coop<Config>(ctx, state, idx, shfl);
         float f_new = eval_energy_warp_coop<Config>(ctx, state, idx, shfl);
 
-        // Armijo condition
+        // Restore x
+        for (int i = 0; i < Config::CONF_PER_THREAD; i++) {
+            state.x[i] = temp_x[i];
+        }
+
+        // Handle NaN energy
+        if (!isfinite(f_new)) {
+            return 0.0f;
+        }
+
+        // Check Armijo sufficient decrease condition
         if (f_new <= f0 + ALF * alpha * slope) {
-            // Compute gradient at new point
+            // Success - swap x and x_new, compute gradient
+            for (int i = 0; i < Config::CONF_PER_THREAD; i++) {
+                temp_x[i] = state.x[i];
+                state.x[i] = state.x_new[i];
+            }
+            set_conf_warp_coop<Config>(ctx, state, idx, shfl);
             compute_gradient_warp_coop<Config>(ctx, state, idx, shfl);
 
-            // Copy g to g_new (gather g first, then set g_new)
+            // Copy g to g_new
             for (int i = 0; i < ctx.n_change; i++) {
                 all_g[i] = DA::get(state.g, i, shfl);
             }
@@ -982,7 +1219,7 @@ __device__ float line_search_warp_coop(
                 DA::set(state.g_new, i, all_g[i], idx);
             }
 
-            // Restore x and keep x_new as accepted
+            // Restore x (keep x_new as accepted)
             for (int i = 0; i < Config::CONF_PER_THREAD; i++) {
                 state.x[i] = temp_x[i];
             }
@@ -991,13 +1228,55 @@ __device__ float line_search_warp_coop(
             return alpha;
         }
 
-        // Restore x
-        for (int i = 0; i < Config::CONF_PER_THREAD; i++) {
-            state.x[i] = temp_x[i];
+        // Backtrack using interpolation (matches reference)
+        float tmplam;
+        if (first_backtrack) {
+            // First backtrack: quadratic interpolation
+            float denom = 2.0f * (f_new - f0 - slope);
+            if (fabsf(denom) > epsilon_fl) {
+                tmplam = -slope / denom;
+            } else {
+                tmplam = 0.5f * alpha;
+            }
+            first_backtrack = false;
+        } else {
+            // Subsequent backtracks: cubic interpolation
+            float rhs1 = f_new - f0 - alpha * slope;
+            float rhs2 = f2 - f0 - alpha2 * slope;
+            float alpha_diff = alpha - alpha2;
+
+            if (fabsf(alpha_diff) < epsilon_fl) {
+                tmplam = 0.5f * alpha;
+            } else {
+                float a = (rhs1 / (alpha * alpha) - rhs2 / (alpha2 * alpha2)) / alpha_diff;
+                float b = (-alpha2 * rhs1 / (alpha * alpha) + alpha * rhs2 / (alpha2 * alpha2)) / alpha_diff;
+
+                if (fabsf(a) < epsilon_fl) {
+                    // Linear case
+                    tmplam = (fabsf(b) > epsilon_fl) ? (-slope / (2.0f * b)) : (0.5f * alpha);
+                } else {
+                    float disc = b * b - 3.0f * a * slope;
+                    if (disc < 0) {
+                        tmplam = 0.5f * alpha;
+                    } else if (b <= 0) {
+                        tmplam = (-b + sqrtf(disc)) / (3.0f * a);
+                    } else {
+                        tmplam = -slope / (b + sqrtf(disc));
+                    }
+                }
+                // Clamp to <= 0.5 * alpha
+                if (tmplam > 0.5f * alpha) {
+                    tmplam = 0.5f * alpha;
+                }
+            }
         }
 
-        // Backtrack
-        alpha *= 0.5f;
+        // Save for next cubic interpolation
+        alpha2 = alpha;
+        f2 = f_new;
+
+        // Update alpha with minimum bound
+        alpha = fmaxf(tmplam, 0.1f * alpha);
     }
 
     return 0.0f;
@@ -1034,8 +1313,11 @@ bfgs_warp_cooperative_kernel(
     using DA = DistributedArray<Config>;
 
     // Debug: only thread 0 of first optimizer prints
+#ifdef WARP_COOP_DEBUG
     bool debug_thread = (threadIdx.x == 0 && blockIdx.x == 0);
-    if (debug_thread) printf("KERNEL: Starting opt %d, n_conf=%d, n_change=%d\n", global_opt_id, n_conf, n_change);
+    (void)debug_thread;  // Suppress unused warning
+#endif
+    WARP_DEBUG_PRINT("KERNEL: Starting opt %d, n_conf=%d, n_change=%d\n", global_opt_id, n_conf, n_change);
 
     // === Initialize conformation from input ===
     for (int i = idx.local_lane; i < n_conf; i += Config::THREADS_PER_OPT) {
@@ -1043,32 +1325,81 @@ bfgs_warp_cooperative_kernel(
         DA::set(state.x, i, val, idx);
     }
 
-    if (debug_thread) printf("KERNEL: Initialized conformation\n");
+    WARP_DEBUG_PRINT("KERNEL: Initialized conformation\n");
 
-    // === Initialize Hessian to identity ===
+    // === Initialize Hessian to identity (all threads iterate in lockstep) ===
     int n_hessian = n_change * (n_change + 1) / 2;
-    for (int k = idx.local_lane; k < n_hessian; k += Config::THREADS_PER_OPT) {
+    for (int k = 0; k < n_hessian; k++) {
         // Diagonal elements: k = i + i*(i+1)/2 => k = i*(i+3)/2
         int j = (int)(sqrtf(2.0f * k + 0.25f) - 0.5f);
         int i = k - j * (j + 1) / 2;
         float val = (i == j) ? 1.0f : 0.0f;
-        DA::set(state.h, k, val, idx);
+        DA::set(state.h, k, val, idx);  // Only owner writes
     }
 
-    if (debug_thread) printf("KERNEL: Initialized Hessian\n");
+    WARP_DEBUG_PRINT("KERNEL: Initialized Hessian\n");
 
     state.energy = 1e10f;
     state.best_energy = 1e10f;
 
     // === Initial energy and gradient ===
-    if (debug_thread) printf("KERNEL: Calling set_conf_warp_coop\n");
+#ifdef USE_INLINE_DEBUG
+    // DEBUG: Compute atom[0] using simple inline math (matching reference)
+    // ALL threads gather conf (shuffles require all threads to participate)
+    float dbg_pos[3], dbg_quat[4];
+    dbg_pos[0] = DA::get(state.x, 0, shfl);
+    dbg_pos[1] = DA::get(state.x, 1, shfl);
+    dbg_pos[2] = DA::get(state.x, 2, shfl);
+    dbg_quat[0] = DA::get(state.x, 3, shfl);
+    dbg_quat[1] = DA::get(state.x, 4, shfl);
+    dbg_quat[2] = DA::get(state.x, 5, shfl);
+    dbg_quat[3] = DA::get(state.x, 6, shfl);
+
+    // Only one thread prints
+    if (global_opt_id == 0 && idx.local_lane == 0) {
+        float qnorm = sqrtf(dbg_quat[0]*dbg_quat[0] + dbg_quat[1]*dbg_quat[1] + dbg_quat[2]*dbg_quat[2] + dbg_quat[3]*dbg_quat[3]);
+        if (qnorm > 1e-10f) {
+            dbg_quat[0] /= qnorm; dbg_quat[1] /= qnorm; dbg_quat[2] /= qnorm; dbg_quat[3] /= qnorm;
+        }
+        float a = dbg_quat[0], b = dbg_quat[1], c = dbg_quat[2], d = dbg_quat[3];
+        float aa = a*a, bb = b*b, cc = c*c, dd = d*d;
+        float ab = a*b, ac = a*c, ad = a*d, bc = b*c, bd = b*d, cd = c*d;
+        float mat[9];
+        mat[0] = aa + bb - cc - dd;  mat[3] = 2*(bc - ad);       mat[6] = 2*(bd + ac);
+        mat[1] = 2*(bc + ad);        mat[4] = aa - bb + cc - dd; mat[7] = 2*(cd - ab);
+        mat[2] = 2*(bd - ac);        mat[5] = 2*(cd + ab);       mat[8] = aa - bb - cc + dd;
+        int owner = ctx.atom_owners[0];
+        if (owner == 0) {
+            float lx = ctx.atom_local_data[0].coords.x, ly = ctx.atom_local_data[0].coords.y, lz = ctx.atom_local_data[0].coords.z;
+            float rx = mat[0]*lx + mat[3]*ly + mat[6]*lz;
+            float ry = mat[1]*lx + mat[4]*ly + mat[7]*lz;
+            float rz = mat[2]*lx + mat[5]*ly + mat[8]*lz;
+            printf("DEBUG: EXPECTED atom[0]=(%.4f,%.4f,%.4f)\n", dbg_pos[0]+rx, dbg_pos[1]+ry, dbg_pos[2]+rz);
+        }
+    }
+#endif
+
     set_conf_warp_coop<Config>(ctx, state, idx, shfl);
-    if (debug_thread) printf("KERNEL: Calling eval_energy_warp_coop\n");
+
+#ifdef USE_INLINE_DEBUG
+    // Print warp-coop atom[0] coords for comparison
+    if (global_opt_id == 0) {
+        AtomPartition<Config> dbg_atoms(idx.local_lane, ctx.num_atoms);
+        if (dbg_atoms.start == 0) {
+            printf("DEBUG: ACTUAL   atom[0]=(%.4f,%.4f,%.4f)\n",
+                   state.my_coords[0], state.my_coords[1], state.my_coords[2]);
+        }
+    }
+    __syncwarp(idx.opt_mask);
+#endif
+
+    WARP_DEBUG_PRINT("KERNEL: Calling eval_energy_warp_coop\n");
     state.energy = eval_energy_warp_coop<Config>(ctx, state, idx, shfl);
-    if (debug_thread) printf("KERNEL: Initial energy = %f\n", state.energy);
-    if (debug_thread) printf("KERNEL: Calling compute_gradient_warp_coop\n");
+
+    WARP_DEBUG_PRINT("KERNEL: Initial energy = %f\n", state.energy);
+    WARP_DEBUG_PRINT("KERNEL: Calling compute_gradient_warp_coop\n");
     compute_gradient_warp_coop<Config>(ctx, state, idx, shfl);
-    if (debug_thread) printf("KERNEL: Gradient computed\n");
+    WARP_DEBUG_PRINT("KERNEL: Gradient computed\n");
     state.best_energy = state.energy;
 
     // Copy current conf to best (gather first to avoid divergent shuffle)
@@ -1080,20 +1411,56 @@ bfgs_warp_cooperative_kernel(
         DA::set(state.best_conf, i, temp_conf[i], idx);
     }
 
-    if (debug_thread) printf("KERNEL: Starting BFGS iterations (max=%d)\n", max_iterations);
+    WARP_DEBUG_PRINT("KERNEL: Starting BFGS iterations (max=%d)\n", max_iterations);
+#ifdef WARP_COOP_DEBUG
+    // Debug: print initial x values
+    float debug_x[6];
+    for (int i = 0; i < 6 && i < n_conf; i++) {
+        debug_x[i] = DA::get(state.x, i, shfl);
+    }
+    WARP_DEBUG_PRINT("KERNEL: initial x[0..5]=(%.4f,%.4f,%.4f,%.4f,%.4f,%.4f)\n",
+                     debug_x[0], debug_x[1], debug_x[2], debug_x[3], debug_x[4], debug_x[5]);
+#endif
 
     // === BFGS iterations ===
     for (int iter = 0; iter < max_iterations; iter++) {
-        if (debug_thread && iter < 3) printf("KERNEL: BFGS iter %d, calling hessian_vector_multiply\n", iter);
+#ifdef WARP_COOP_DEBUG
+        // Debug: compute gradient norm (pre-gather in lockstep to avoid divergent shuffles)
+        float all_g_debug[Config::N_CHANGE];
+        for (int i = 0; i < n_change; i++) {
+            all_g_debug[i] = DA::get(state.g, i, shfl);
+        }
+        float my_g_norm = 0.0f;
+        for (int i = idx.local_lane; i < n_change; i += Config::THREADS_PER_OPT) {
+            my_g_norm += all_g_debug[i] * all_g_debug[i];
+        }
+        float g_norm = sqrtf(shfl.reduce_sum(my_g_norm));
+        if (debug_thread && iter < 5) printf("KERNEL: iter %d, energy=%f, |g|=%f\n", iter, state.energy, g_norm);
+#endif
 
         // Search direction: p = -H * g
         hessian_vector_multiply<Config>(state, n_change, idx, shfl);
-        if (debug_thread && iter < 3) printf("KERNEL: iter %d, hessian done, calling line_search\n", iter);
+
+#ifdef WARP_COOP_DEBUG
+        // Debug: compute search direction norm (pre-gather in lockstep)
+        float all_p_debug[Config::N_CHANGE];
+        for (int i = 0; i < n_change; i++) {
+            all_p_debug[i] = DA::get(state.p, i, shfl);
+        }
+        float my_p_norm = 0.0f;
+        for (int i = idx.local_lane; i < n_change; i += Config::THREADS_PER_OPT) {
+            my_p_norm += all_p_debug[i] * all_p_debug[i];
+        }
+        float p_norm = sqrtf(shfl.reduce_sum(my_p_norm));
+        if (debug_thread && iter < 5) printf("KERNEL: iter %d, |p|=%f\n", iter, p_norm);
+#endif
 
         // Line search
         float alpha = line_search_warp_coop<Config>(ctx, state, state.energy, idx, shfl);
 
-        if (debug_thread && iter < 3) printf("KERNEL: iter %d, alpha=%f\n", iter, alpha);
+#ifdef WARP_COOP_DEBUG
+        if (debug_thread && iter < 5) printf("KERNEL: iter %d, alpha=%f, new_energy=%f\n", iter, alpha, state.energy);
+#endif
 
         if (alpha == 0.0f) break;  // Line search failed
 
@@ -1122,14 +1489,14 @@ bfgs_warp_cooperative_kernel(
 
             if (yy > 1e-10f) {
                 float scale = alpha * yp / yy;
-                // Reset Hessian to scaled identity
+                // Reset Hessian to scaled identity (all threads iterate all elements in lockstep)
                 int n_hessian = n_change * (n_change + 1) / 2;
-                for (int k = idx.local_lane; k < n_hessian; k += Config::THREADS_PER_OPT) {
-                    DA::set(state.h, k, 0.0f, idx);
-                }
-                for (int i = idx.local_lane; i < n_change; i += Config::THREADS_PER_OPT) {
-                    int diag_idx = i + i * (i + 1) / 2;
-                    DA::set(state.h, diag_idx, scale, idx);
+                for (int k = 0; k < n_hessian; k++) {
+                    // Decode triangular index to get (i, j)
+                    int j = (int)(sqrtf(2.0f * k + 0.25f) - 0.5f);
+                    int i = k - j * (j + 1) / 2;
+                    float val = (i == j) ? scale : 0.0f;
+                    DA::set(state.h, k, val, idx);  // Only owner writes
                 }
             }
         }
@@ -1194,6 +1561,7 @@ __global__ void init_random_confs_kernel(
     float* confs,
     int n_confs,
     int n_conf,
+    int nlig_roots,  // Number of ligand roots (for multi-root support)
     gfloat3 box_min,
     gfloat3 box_max,
     unsigned int seed
@@ -1206,28 +1574,41 @@ __global__ void init_random_confs_kernel(
 
     float* my_conf = confs + tid * n_conf;
 
-    // Random position within box
-    my_conf[0] = box_min.x + curand_uniform(&rng) * (box_max.x - box_min.x);
-    my_conf[1] = box_min.y + curand_uniform(&rng) * (box_max.y - box_min.y);
-    my_conf[2] = box_min.z + curand_uniform(&rng) * (box_max.z - box_min.z);
+    // Random position and quaternion for each ligand root
+    for (int r = 0; r < nlig_roots; r++) {
+        // Random position within box
+        my_conf[r * 7 + 0] = box_min.x + curand_uniform(&rng) * (box_max.x - box_min.x);
+        my_conf[r * 7 + 1] = box_min.y + curand_uniform(&rng) * (box_max.y - box_min.y);
+        my_conf[r * 7 + 2] = box_min.z + curand_uniform(&rng) * (box_max.z - box_min.z);
 
-    // Random quaternion (normalized)
-    float u1 = curand_uniform(&rng);
-    float u2 = curand_uniform(&rng) * 2.0f * 3.14159265f;
-    float u3 = curand_uniform(&rng) * 2.0f * 3.14159265f;
+        // Random quaternion (normalized)
+        float u1 = curand_uniform(&rng);
+        float u2 = curand_uniform(&rng) * 2.0f * 3.14159265f;
+        float u3 = curand_uniform(&rng) * 2.0f * 3.14159265f;
 
-    float sqrt1u1 = sqrtf(1.0f - u1);
-    float sqrtu1 = sqrtf(u1);
+        float sqrt1u1 = sqrtf(1.0f - u1);
+        float sqrtu1 = sqrtf(u1);
 
-    my_conf[3] = sqrt1u1 * sinf(u2);  // w
-    my_conf[4] = sqrt1u1 * cosf(u2);  // x
-    my_conf[5] = sqrtu1 * sinf(u3);   // y
-    my_conf[6] = sqrtu1 * cosf(u3);   // z
+        my_conf[r * 7 + 3] = sqrt1u1 * sinf(u2);  // w
+        my_conf[r * 7 + 4] = sqrt1u1 * cosf(u2);  // x
+        my_conf[r * 7 + 5] = sqrtu1 * sinf(u3);   // y
+        my_conf[r * 7 + 6] = sqrtu1 * cosf(u3);   // z
+    }
 
-    // Random torsions in [-pi, pi]
-    for (int i = 7; i < n_conf; i++) {
+    // Random torsions in [-pi, pi] (start after rigid body values)
+    int torsion_start = 7 * nlig_roots;
+    for (int i = torsion_start; i < n_conf; i++) {
         my_conf[i] = (curand_uniform(&rng) * 2.0f - 1.0f) * 3.14159265f;
     }
+
+#ifdef WARP_COOP_DEBUG
+    if (tid == 0) {
+        printf("INIT_RAND: tid=%d seed=%u box_min=(%.4f,%.4f,%.4f) box_max=(%.4f,%.4f,%.4f)\n",
+               tid, seed, box_min.x, box_min.y, box_min.z, box_max.x, box_max.y, box_max.z);
+        printf("INIT_RAND: conf[0..6]=(%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f)\n",
+               my_conf[0], my_conf[1], my_conf[2], my_conf[3], my_conf[4], my_conf[5], my_conf[6]);
+    }
+#endif
 }
 
 // ============================================================================
@@ -1263,31 +1644,25 @@ void run_warp_coop_bfgs_docking(
         fprintf(stderr, "  Poses: %d, Max iterations: %d\n", n_poses, max_iterations);
     }
 
-    // Validate configuration - print error and return if ligand is too large
+    // Validate configuration - throw exception if ligand is too large
     if (ctx.num_atoms > Config::MAX_ATOMS) {
-        fprintf(stderr, "ERROR: Warp-coop BFGS: ligand has %d atoms but MAX_ATOMS=%d.\n"
-                "       Use --gpu instead of --warp_coop for large ligands.\n",
-                ctx.num_atoms, Config::MAX_ATOMS);
-        out_energies.clear();
-        out_conformations.clear();
-        return;
+        std::ostringstream oss;
+        oss << "Warp-coop BFGS: ligand has " << ctx.num_atoms << " atoms but MAX_ATOMS="
+            << Config::MAX_ATOMS << ". Use --gpu instead of --warp_coop for large ligands.";
+        throw std::runtime_error(oss.str());
     }
     int num_torsions = ctx.num_nodes > 0 ? ctx.num_nodes - 1 : 0;
     if (num_torsions > Config::MAX_TORSIONS) {
-        fprintf(stderr, "ERROR: Warp-coop BFGS: ligand has %d torsions but MAX_TORSIONS=%d.\n"
-                "       Use --gpu instead of --warp_coop for large ligands.\n",
-                num_torsions, Config::MAX_TORSIONS);
-        out_energies.clear();
-        out_conformations.clear();
-        return;
+        std::ostringstream oss;
+        oss << "Warp-coop BFGS: ligand has " << num_torsions << " torsions but MAX_TORSIONS="
+            << Config::MAX_TORSIONS << ". Use --gpu instead of --warp_coop for large ligands.";
+        throw std::runtime_error(oss.str());
     }
     if (ctx.num_nodes > Config::MAX_NODES) {
-        fprintf(stderr, "ERROR: Warp-coop BFGS: ligand has %d nodes but MAX_NODES=%d.\n"
-                "       Use --gpu instead of --warp_coop for large ligands.\n",
-                ctx.num_nodes, Config::MAX_NODES);
-        out_energies.clear();
-        out_conformations.clear();
-        return;
+        std::ostringstream oss;
+        oss << "Warp-coop BFGS: ligand has " << ctx.num_nodes << " nodes but MAX_NODES="
+            << Config::MAX_NODES << ". Use --gpu instead of --warp_coop for large ligands.";
+        throw std::runtime_error(oss.str());
     }
 
     // Allocate device memory
@@ -1307,7 +1682,7 @@ void run_warp_coop_bfgs_docking(
     int init_blocks = (n_poses + 255) / 256;
     fprintf(stderr, "DEBUG: Launching init_random_confs_kernel...\n");
     init_random_confs_kernel<Config><<<init_blocks, 256>>>(
-        d_initial_confs, n_poses, n_conf, box_min, box_max, seed
+        d_initial_confs, n_poses, n_conf, ctx.nlig_roots, box_min, box_max, seed
     );
     CUDA_CHECK_WARP(cudaDeviceSynchronize());
     fprintf(stderr, "DEBUG: init_random_confs_kernel done\n");
@@ -1315,8 +1690,13 @@ void run_warp_coop_bfgs_docking(
     // Check for kernel launch errors
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        fprintf(stderr, "CUDA error after init kernel: %s\n", cudaGetErrorString(err));
-        return;
+        cudaFree(d_contexts);
+        cudaFree(d_initial_confs);
+        cudaFree(d_out_energies);
+        cudaFree(d_out_confs);
+        std::ostringstream oss;
+        oss << "CUDA error after init kernel: " << cudaGetErrorString(err);
+        throw std::runtime_error(oss.str());
     }
 
     // Launch kernel
@@ -1347,8 +1727,15 @@ void run_warp_coop_bfgs_docking(
     // Check for kernel launch errors
     err = cudaGetLastError();
     if (err != cudaSuccess) {
-        fprintf(stderr, "CUDA error after BFGS kernel launch: %s\n", cudaGetErrorString(err));
-        return;
+        cudaEventDestroy(start);
+        cudaEventDestroy(stop);
+        cudaFree(d_contexts);
+        cudaFree(d_initial_confs);
+        cudaFree(d_out_energies);
+        cudaFree(d_out_confs);
+        std::ostringstream oss;
+        oss << "CUDA error after BFGS kernel launch: " << cudaGetErrorString(err);
+        throw std::runtime_error(oss.str());
     }
 
     fprintf(stderr, "DEBUG: Waiting for kernel...\n");

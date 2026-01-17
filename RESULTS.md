@@ -352,3 +352,54 @@ GPU parallel BFGS finds excellent results competitive with or better than CPU Mo
 The parallel BFGS approach benefits from massively parallel local optimization from many random starting poses, which with sufficient exhaustiveness can find excellent near-native poses.
 
 **Direct pairwise scoring**: After `__ldg()` optimization, still 2.6-3.3x slower than grid-based. The fundamental computational cost of pairwise distance calculations + spatial hash traversal exceeds grid trilinear interpolation.
+
+---
+
+## Warp-Cooperative BFGS Kernel (2026-01-16)
+
+**Git commit**: `228fdaaf` (with gradient bug fixes)
+
+New GPU kernel using warp shuffle instructions (~5 cycle latency) instead of shared/global memory (~30-273 cycles) for inter-thread communication within optimizer groups.
+
+### Configuration
+- 4 optimizers per warp, 8 threads per optimizer (WarpCoop4)
+- Distributed state storage in registers across cooperating threads
+- DistributedArray pattern for register-distributed data access
+
+### Bug Fixes Applied
+Two critical bugs were fixed in the gradient computation:
+1. **Sign convention**: `trilinear_interp_warp` was returning force (F=-∇E) instead of gradient
+2. **Missing cross product**: Tree reduction was missing `cross(r, child_force)` term in torque propagation
+
+### Performance Comparison: Warp-Coop vs Standard GPU
+
+**Test**: 1dmp_rec.pdb + DMQ.sdf, autobox, seed=42, bfgs_iterations=50
+
+| Exhaustiveness | Metric | Standard GPU | Warp-Coop | Speedup |
+|----------------|--------|--------------|-----------|---------|
+| **256** | Throughput | 1,163 poses/sec | 7,427 poses/sec | **6.4x** |
+| | Best affinity | -13.26 kcal/mol | -11.78 kcal/mol | |
+| | Best CNN score | 0.9955 | 0.9900 | |
+| **1,024** | Throughput | 4,113 poses/sec | 26,389 poses/sec | **6.4x** |
+| | Best affinity | -13.26 kcal/mol | -11.72 kcal/mol | |
+| | Best CNN score | 0.9955 | 0.9810 | |
+| **7,000** | Throughput | 27,218 poses/sec | 51,989 poses/sec | **1.9x** |
+| | Best affinity | -13.71 kcal/mol | -12.49 kcal/mol | |
+| | Best CNN score | 0.9956 | 0.9911 | |
+
+### Summary
+
+| Aspect | Standard GPU | Warp-Coop |
+|--------|--------------|-----------|
+| **Throughput @ low exh** | Baseline | **6.4x faster** |
+| **Throughput @ high exh** | Baseline | **1.9x faster** |
+| Peak throughput | 27,218 p/s | **51,989 p/s** |
+| Best affinity quality | Slightly better (~1 kcal/mol) | Good |
+| Memory usage | 1858 MB | 756 MB (**59% less**) |
+
+**Key findings**:
+- Warp-coop is **6.4x faster** at low-medium exhaustiveness (256-1024)
+- Speedup decreases to **1.9x** at high exhaustiveness (7000) as standard GPU becomes fully utilized
+- Docking quality is ~1 kcal/mol worse (may need tuning)
+- 59% less GPU memory usage
+- Best for high-throughput virtual screening where speed matters more than exhaustive sampling

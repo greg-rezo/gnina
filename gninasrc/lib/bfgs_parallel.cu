@@ -18,6 +18,9 @@
 #include <vector>
 #include <algorithm>
 
+// Debug mode - uncomment to enable verbose kernel debug output
+#define BFGS_DEBUG
+
 // ============================================================================
 // Device Helper Functions
 // ============================================================================
@@ -1117,8 +1120,14 @@ __global__ void bfgs_parallel_kernel(
 
     // Initial energy and gradient
     set_conf_single_thread(ctx, state.x, state.coords, node_origins, node_orientations, node_axes);
-    state.energy = eval_intermolecular_energy(ctx, state.coords, state.forces);
-    state.energy += eval_intramolecular_single_thread(ctx, state.coords, state.forces);
+    float inter_e = eval_intermolecular_energy(ctx, state.coords, state.forces);
+    float intra_e = eval_intramolecular_single_thread(ctx, state.coords, state.forces);
+    state.energy = inter_e + intra_e;
+#ifdef BFGS_DEBUG
+    if (tid == 0) {
+        printf("GPU: eval_energy: inter=%f, intra=%f, total=%f\n", inter_e, intra_e, state.energy);
+    }
+#endif
     compute_gradient_single_thread(ctx, state.coords, state.forces, node_origins,
                                    node_axes, state.node_forces, state.node_torques, state.g);
     state.best_energy = state.energy;
@@ -1138,6 +1147,19 @@ __global__ void bfgs_parallel_kernel(
         state.h[idx] = 1.0f;
     }
 
+#ifdef BFGS_DEBUG
+    if (tid == 0) {
+        printf("GPU: initial x[0..5]=(%.4f,%.4f,%.4f,%.4f,%.4f,%.4f)\n",
+               state.x[0], state.x[1], state.x[2], state.x[3], state.x[4], state.x[5]);
+        for (int a = 0; a < 5 && a < (int)ctx.num_atoms; a++) {
+            printf("GPU: atom[%d] coords=(%.4f,%.4f,%.4f)\n",
+                   a, state.coords[a*3+0], state.coords[a*3+1], state.coords[a*3+2]);
+        }
+        printf("GPU: initial energy=%f, g[0..2]=(%.4f,%.4f,%.4f)\n",
+               state.energy, state.g[0], state.g[1], state.g[2]);
+    }
+#endif
+
     // BFGS iterations (with early stopping on line search failure, matching bfgs.h)
     for (int iter = 0; iter < max_iterations; iter++) {
         // Compute search direction: p = -H * g
@@ -1150,6 +1172,20 @@ __global__ void bfgs_parallel_kernel(
             state.p[i] = -state.p[i];
         }
 
+#ifdef BFGS_DEBUG
+        // Debug: compute gradient and search direction norms
+        if (tid == 0 && iter < 5) {
+            float g_norm = 0, p_norm = 0;
+            for (int i = 0; i < ctx.n_change; i++) {
+                g_norm += state.g[i] * state.g[i];
+                p_norm += state.p[i] * state.p[i];
+            }
+            g_norm = sqrtf(g_norm);
+            p_norm = sqrtf(p_norm);
+            printf("GPU iter %d, |g|=%f, |p|=%f\n", iter, g_norm, p_norm);
+        }
+#endif
+
         // Line search (accurate, matching bfgs.h default)
         float f_new;
         float alpha = accurate_line_search_single_thread(
@@ -1157,6 +1193,12 @@ __global__ void bfgs_parallel_kernel(
             state.energy, state.coords, state.forces,
             state.node_forces, state.node_torques, state.g_new, f_new
         );
+
+#ifdef BFGS_DEBUG
+        if (tid == 0 && iter < 5) {
+            printf("GPU iter %d, alpha=%f, new_energy=%f\n", iter, alpha, f_new);
+        }
+#endif
 
         // Check for line search failure (matches bfgs.h behavior)
         if (alpha == 0) {
@@ -1266,6 +1308,15 @@ __global__ void generate_random_confs_kernel(
         float torsion = (curand_uniform(&rng) * 2.0f - 1.0f) * 3.14159265f;
         conf[i + 6 * ctx.nlig_roots] = torsion;
     }
+
+#ifdef BFGS_DEBUG
+    if (tid == 0) {
+        printf("INIT_RAND_REF: tid=%d seed=%u box_min=(%.4f,%.4f,%.4f) box_max=(%.4f,%.4f,%.4f)\n",
+               tid, seed, box_min.x, box_min.y, box_min.z, box_max.x, box_max.y, box_max.z);
+        printf("INIT_RAND_REF: conf[0..6]=(%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f)\n",
+               conf[0], conf[1], conf[2], conf[3], conf[4], conf[5], conf[6]);
+    }
+#endif
 }
 
 // ============================================================================

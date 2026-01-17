@@ -711,15 +711,20 @@ void do_search(model &m, const boost::optional<model> &ref, const boost::optiona
 
       if (settings.warp_coop) {
           // Use warp-cooperative BFGS kernel (experimental)
-          run_warp_coop_bfgs_docking_default(
-              m.gdata, cacheInfo,
-              settings.exhaustiveness,
-              settings.bfgs_iterations,
-              box_min, box_max,
-              settings.seed,
-              energies, conformations,
-              settings.verbosity
-          );
+          try {
+              run_warp_coop_bfgs_docking_default(
+                  m.gdata, cacheInfo,
+                  settings.exhaustiveness,
+                  settings.bfgs_iterations,
+                  box_min, box_max,
+                  settings.seed,
+                  energies, conformations,
+                  settings.verbosity
+              );
+          } catch (const std::runtime_error& e) {
+              std::cerr << "Error: " << e.what() << std::endl;
+              throw;  // Re-throw to be caught by main()
+          }
       } else {
           run_parallel_bfgs_docking(
               m.gdata, cacheInfo,
@@ -1859,6 +1864,11 @@ Thank you!\n";
     // --warp_coop implies --gpu (both use GPU-based BFGS)
     if (settings.warp_coop) {
       settings.gpu = true;
+      // Fail early if GPU is not available
+      if (!torch::cuda::is_available()) {
+        std::cerr << "ERROR: --warp_coop requires GPU but no CUDA device is available.\n";
+        return 1;
+      }
     }
 
      // output banner
