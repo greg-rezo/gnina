@@ -21,7 +21,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 # Default values
-POD_NAME="${GNINA_BUILD_POD:-gpu-gnina-build-x7k2m9}"
+POD_NAME="gpu-gnina-build-x7k9m2"
 NAMESPACE="development"
 JOBS=16
 CLEAN=""
@@ -59,7 +59,7 @@ while [[ $# -gt 0 ]]; do
             exit 1
             ;;
         *)
-            POD_NAME="$1"
+            POD_NAME="gpu-gnina-build-x7k9m2"
             shift
             ;;
     esac

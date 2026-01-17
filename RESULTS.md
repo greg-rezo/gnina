@@ -403,3 +403,99 @@ Two critical bugs were fixed in the gradient computation:
 - Docking quality is ~1 kcal/mol worse (may need tuning)
 - 59% less GPU memory usage
 - Best for high-throughput virtual screening where speed matters more than exhaustive sampling
+
+---
+
+## Warp-Cooperative BFGS: Correctness Fix Performance Impact (2026-01-17)
+
+**Investigation**: The original warp-coop kernel (commit `8aa85953`) was fast but produced incorrect results. Commit `d4776d94` fixed the bugs but introduced a significant performance regression.
+
+### Bug Fixes in Commit d4776d94
+
+1. **Quaternion multiplication for orientation updates** - Original used simple addition, fixed uses proper quaternion math
+2. **Mandatory shuffle participation** - Original had `continue` statements that caused divergent shuffles (undefined behavior)
+3. **Torsion index formula** - Fixed for multi-root ligand support (`nid + 6 * nlig_roots` instead of `7 + nid - 1`)
+4. **Gradient sign handling** - Changed trilinear interp to return gradients directly instead of forces
+
+### Performance Comparison
+
+**Test**: 1dmp_rec.pdb + DMQ.sdf, seed=42, bfgs_iterations=50
+
+| Version | Exhaustiveness | Kernel Time | Throughput | Quality |
+|---------|----------------|-------------|------------|---------|
+| Original (buggy) | 7,000 | 155 ms | 45,179 p/s | All poses positive energy, ligands outside box |
+| Original (buggy) | 50,000 | 821 ms | **60,932 p/s** | All poses positive energy, ligands outside box |
+| Fixed (correct) | 7,000 | 954 ms | 7,339 p/s | Best: -14.06 kcal/mol |
+| Fixed (correct) | 50,000 | 5,903 ms | **8,470 p/s** | Best: -14.08 kcal/mol |
+
+### Analysis
+
+| Metric | Original (buggy) | Fixed (correct) | Difference |
+|--------|------------------|-----------------|------------|
+| Throughput @ 50k | 60,932 p/s | 8,470 p/s | **7.2x slower** |
+| Result quality | BROKEN | Correct | N/A |
+| Memory access pattern | Divergent (UB) | Uniform | Required for correctness |
+
+**Root cause of slowdown**: The original kernel allowed threads to skip shuffle operations with `continue`, which is undefined behavior in CUDA. The fix requires ALL threads in an optimizer group to participate in shuffles, even when some don't need the result. This eliminates the performance benefit of early exits but is required for correctness.
+
+### Architectural Constraint
+
+In warp-cooperative algorithms using shuffle instructions:
+- **ALL threads in the shuffle mask MUST participate** in every shuffle operation
+- Divergent code paths that skip shuffles cause undefined behavior (data corruption)
+- The performance cost of uniform execution is inherent to correct warp-cooperative algorithms
+
+### WarpCoop Configuration Comparison
+
+**Test**: Fixed (correct) version, 50k exhaustiveness, seed=42
+
+| Configuration | Threads/Opt | Opts/Warp | Kernel Time | Throughput |
+|---------------|-------------|-----------|-------------|------------|
+| **WarpCoop4** (default) | 8 | 4 | 5,903 ms | **8,470 p/s** |
+| WarpCoop8 | 4 | 8 | 6,539 ms | 7,646 p/s |
+
+**Analysis**: WarpCoop8 is **10% slower** than WarpCoop4 despite processing 2x more optimizers per warp. The reduced threads per optimizer (4 vs 8) causes:
+- Higher register pressure per thread (more distributed state per thread)
+- Register spills to local memory
+- Less parallelism for reduction operations within each optimizer
+
+The header file note is correct: "OPTS_PER_WARP must be <= 4 to avoid register spills."
+
+---
+
+## Standard GPU BFGS: Throughput vs Exhaustiveness Scaling (2026-01-17)
+
+**Git commit**: `d4776d94`
+
+**Test configuration**: 1dmp_rec.pdb + 1dmp_rand_pos_fix.sdf (DMQ), NVIDIA L4 GPU, bfgs_iterations=50, cnn_scoring=none
+
+### Results
+
+| Exhaustiveness | BFGS Kernel Time | Throughput | Time per Pose | Best Affinity |
+|----------------|------------------|------------|---------------|---------------|
+| 7,000 | 304 ms | 22,863 poses/sec | 43.74 µs | -14.10 kcal/mol |
+| 10,000 | 450 ms | 22,101 poses/sec | 45.25 µs | -14.12 kcal/mol |
+| 20,000 | 552 ms | **35,953 poses/sec** | 27.81 µs | -14.12 kcal/mol |
+| 50,000 | 1,513 ms | 32,828 poses/sec | 30.46 µs | -14.11 kcal/mol |
+| 100,000 | 2,881 ms | 34,500 poses/sec | 28.99 µs | -14.14 kcal/mol |
+
+### Key Findings
+
+1. **Non-linear throughput scaling**: There's a ~60% throughput jump between 10k and 20k exhaustiveness
+   - Below 20k: ~22k poses/sec (43-45 µs/pose)
+   - At/above 20k: ~33-36k poses/sec (28-30 µs/pose)
+
+2. **Peak throughput at 20k**: The sweet spot is around 20k exhaustiveness where GPU utilization is optimal
+
+3. **Root cause - L2 cache warming effect**:
+   - Scoring function grids need to be loaded into L2 cache at kernel start
+   - At low exhaustiveness (7-10k), we finish before fully amortizing this cache warm-up cost
+   - At 20k+, the grid data becomes L2-resident and highly reused across poses
+
+4. **Docking quality is consistent**: All configurations find best scores of ~-14.1 kcal/mol
+
+### Recommendations
+
+- **For benchmarking**: Use ≥20k exhaustiveness to measure true sustained GPU throughput
+- **For production**: The ~35k poses/sec throughput is achievable at any exhaustiveness ≥20k
+- **Standard GPU kernel vs Warp-Coop**: At 50k exhaustiveness, standard GPU (32,828 p/s) outperforms fixed warp-coop (8,470 p/s) by **3.9x**
