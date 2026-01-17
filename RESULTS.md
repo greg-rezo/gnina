@@ -527,14 +527,15 @@ New batch docking mode that processes multiple ligands together in GPU batches f
 
 **Results**:
 
-| Metric | Value |
-|--------|-------|
-| Ligands loaded | 1000 |
-| Ligands docked | 998 |
-| Total poses | 1,024,000 |
-| Total batches | 21 |
-| **Total time** | **118.7 seconds** |
-| Overall throughput | ~8,600 poses/sec |
+| Metric | With CNN | Without CNN |
+|--------|----------|-------------|
+| Ligands loaded | 1000 | 1000 |
+| Ligands docked | 998 | 999 |
+| Total poses | 1,024,000 | 1,024,000 |
+| Total batches | 21 | 21 |
+| **Total time** | 121.7 sec | **36.4 sec** |
+| **Ligand throughput** | 8.4 lig/sec | **27.5 lig/sec** |
+| **Pose throughput** | 8,627 p/sec | **28,132 p/sec** |
 
 ### Batch-Level Performance
 
@@ -555,30 +556,20 @@ The batching algorithm grouped ligands by atom count (15-42 atoms) into 21 batch
 
 ### Performance Analysis
 
-1. **Throughput scales with molecule size**:
+1. **CNN scoring is the bottleneck**: With CNN, 93% of time is spent on refinement (not GPU BFGS)
+   - GPU BFGS batch processing: ~8.5 sec for 1M poses = **120,000 poses/sec**
+   - CNN adds 3.3x overhead; use `--cnn_scoring none` for high-throughput screening
+
+2. **Throughput scales with molecule size** (GPU kernel only):
    - Small molecules (15 atoms): ~470k poses/sec
    - Medium molecules (25 atoms): ~125k poses/sec
    - Large molecules (42 atoms): ~50k poses/sec
 
-2. **GPU kernel efficiency**: 88-97% of batch time is spent in BFGS kernel (setup/collection minimal)
-
-3. **Effective ligand throughput**: 998 ligands / 118.7s = **8.4 ligands/sec**
-
-4. **Pose throughput**: 1,024,000 poses / 118.7s = **8,627 poses/sec** overall
+3. **GPU kernel efficiency**: 88-97% of batch time is spent in BFGS kernel (setup/collection minimal)
 
 ### Memory Efficiency
 
-Batch memory estimation formula (per optimizer):
-```
-3 × n_conf × 4 bytes (x, x_new, best_confs)
-+ 4 × n_change × 4 bytes (g, g_new, p, y)
-+ n_change × (n_change+1)/2 × 4 bytes (Hessian)
-+ 2 × num_atoms × 3 × 4 bytes (coords, forces)
-+ 2 × num_nodes × 3 × 4 bytes (node_forces, node_torques)
-+ 8 bytes (energies)
-```
-
-Total batch memory ranged from 42.8 MB (small molecules) to 121.9 MB (large molecules).
+Batch memory ranged from 42.8 MB (small molecules) to 121.9 MB (large molecules).
 
 ### Known Limitations
 
