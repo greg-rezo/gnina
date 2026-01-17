@@ -565,10 +565,34 @@ The batching algorithm grouped ligands by atom count (15-42 atoms) into 21 batch
 3. **Skip CPU refinement**: GPU BFGS already optimized poses
 4. **Remove debug output**: Eliminated per-pose stderr logging
 
-### Known Limitations
+### Large-Scale Test: 91k ChEMBL SMILES
 
-- **SMILES input not supported in batch mode**: Currently causes internal error in tree.h(185). Use SDF input with 3D coordinates.
-- Input molecules must have 3D coordinates pre-generated
+**Configuration**:
+- Input: 91,000 SMILES from ChEMBL (MW 150-550, rotatable bonds 1-10)
+- Exhaustiveness: 1024
+- BFGS iterations: 50
+- CNN scoring: none
+
+**Results**:
+
+| Metric | Value |
+|--------|-------|
+| Input molecules | 91,000 |
+| **Successfully loaded** | **16,781** (18.4%) |
+| Failed 3D generation | 74,219 (81.6%) |
+| Total batches | 350 |
+| **Total time** | **491.5 sec** |
+| **Ligand throughput** | **34.2 lig/sec** |
+| Time per ligand | 29.3 ms |
+
+Note: High failure rate due to OBBuilder limitations with complex molecules. For production use, pre-convert SMILES to 3D SDF for better success rates.
+
+### SMILES Input Support
+
+SMILES input is now supported in batch mode:
+- 3D coordinates generated automatically with OpenBabel's OBBuilder
+- Molecules that fail 3D generation are skipped with warning
+- ~18% success rate on ChEMBL drug-like molecules
 
 ### Usage
 
