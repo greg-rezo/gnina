@@ -530,12 +530,12 @@ New batch docking mode that processes multiple ligands together in GPU batches f
 | Metric | With CNN | Without CNN |
 |--------|----------|-------------|
 | Ligands loaded | 1000 | 1000 |
-| Ligands docked | 998 | 999 |
+| Ligands docked | 1000 | 1000 |
 | Total poses | 1,024,000 | 1,024,000 |
 | Total batches | 21 | 21 |
-| **Total time** | 121.7 sec | **36.4 sec** |
-| **Ligand throughput** | 8.4 lig/sec | **27.5 lig/sec** |
-| **Pose throughput** | 8,627 p/sec | **28,132 p/sec** |
+| **Total time** | 114.3 sec | **32.8 sec** |
+| **Ligand throughput** | 8.8 lig/sec | **30.5 lig/sec** |
+| **Pose throughput** | 8,961 p/sec | **31,220 p/sec** |
 
 ### Batch-Level Performance
 
