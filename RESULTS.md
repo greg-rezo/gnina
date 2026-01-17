@@ -499,3 +499,102 @@ The header file note is correct: "OPTS_PER_WARP must be <= 4 to avoid register s
 - **For benchmarking**: Use ≥20k exhaustiveness to measure true sustained GPU throughput
 - **For production**: The ~35k poses/sec throughput is achievable at any exhaustiveness ≥20k
 - **Standard GPU kernel vs Warp-Coop**: At 50k exhaustiveness, standard GPU (32,828 p/s) outperforms fixed warp-coop (8,470 p/s) by **3.9x**
+
+---
+
+## Multi-Ligand Batch Docking (2026-01-17)
+
+**Git commit**: `290fad2f`
+
+New batch docking mode that processes multiple ligands together in GPU batches for efficient virtual screening.
+
+### Features
+
+- **Automatic batching**: Enabled by default when `--gpu` is passed
+- **Smart grouping**: Ligands sorted by size and grouped to minimize memory waste from padding
+- **Configurable batch size**: `--batch_size N` (default: 50,000 poses per batch)
+- **Memory-aware**: Respects GPU memory limits when creating batches
+
+### Test: 1000 ChEMBL Molecules (SDF Input)
+
+**Configuration**:
+- Receptor: 184l_rec.pdb
+- Ligands: 1000 drug-like molecules from ChEMBL (MW 150-500, Lipinski compliant)
+- Exhaustiveness: 1024
+- BFGS iterations: 50
+- Batch size: 50,000 poses
+- GPU: NVIDIA L4
+
+**Results**:
+
+| Metric | Value |
+|--------|-------|
+| Ligands loaded | 1000 |
+| Ligands docked | 998 |
+| Total poses | 1,024,000 |
+| Total batches | 21 |
+| **Total time** | **118.7 seconds** |
+| Overall throughput | ~8,600 poses/sec |
+
+### Batch-Level Performance
+
+The batching algorithm grouped ligands by atom count (15-42 atoms) into 21 batches:
+
+| Batch | Ligands | Max Atoms | Max Torsions | Est. Memory | Throughput |
+|-------|---------|-----------|--------------|-------------|------------|
+| 1 | 48 | 15 | 3 | 42.8 MB | **471,745 p/s** |
+| 2 | 48 | 16 | 4 | 48.2 MB | 440,839 p/s |
+| 3 | 48 | 18 | 4 | 50.4 MB | 325,285 p/s |
+| 4 | 48 | 19 | 4 | 51.6 MB | 273,920 p/s |
+| 5 | 48 | 20 | 5 | 57.2 MB | 244,585 p/s |
+| ... | ... | ... | ... | ... | ... |
+| 18 | 48 | 33 | 14 | 120.8 MB | 74,794 p/s |
+| 19 | 48 | 34 | 14 | 121.9 MB | 66,771 p/s |
+| 20 | 48 | 36 | 13 | 117.9 MB | 58,878 p/s |
+| 21 | 40 | 42 | 11 | 94.1 MB | **50,023 p/s** |
+
+### Performance Analysis
+
+1. **Throughput scales with molecule size**:
+   - Small molecules (15 atoms): ~470k poses/sec
+   - Medium molecules (25 atoms): ~125k poses/sec
+   - Large molecules (42 atoms): ~50k poses/sec
+
+2. **GPU kernel efficiency**: 88-97% of batch time is spent in BFGS kernel (setup/collection minimal)
+
+3. **Effective ligand throughput**: 998 ligands / 118.7s = **8.4 ligands/sec**
+
+4. **Pose throughput**: 1,024,000 poses / 118.7s = **8,627 poses/sec** overall
+
+### Memory Efficiency
+
+Batch memory estimation formula (per optimizer):
+```
+3 × n_conf × 4 bytes (x, x_new, best_confs)
++ 4 × n_change × 4 bytes (g, g_new, p, y)
++ n_change × (n_change+1)/2 × 4 bytes (Hessian)
++ 2 × num_atoms × 3 × 4 bytes (coords, forces)
++ 2 × num_nodes × 3 × 4 bytes (node_forces, node_torques)
++ 8 bytes (energies)
+```
+
+Total batch memory ranged from 42.8 MB (small molecules) to 121.9 MB (large molecules).
+
+### Known Limitations
+
+- **SMILES input not supported in batch mode**: Currently causes internal error in tree.h(185). Use SDF input with 3D coordinates.
+- Input molecules must have 3D coordinates pre-generated
+
+### Usage
+
+```bash
+# Default batch mode (enabled with --gpu)
+gnina --gpu -r receptor.pdb -l ligands.sdf --autobox_ligand ref.sdf \
+    --exhaustiveness 1024 -o output.sdf
+
+# Custom batch size
+gnina --gpu --batch_size 100000 -r receptor.pdb -l ligands.sdf ...
+
+# Disable batching (single-ligand mode)
+gnina --gpu --no_batch -r receptor.pdb -l ligands.sdf ...
+```
