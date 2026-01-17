@@ -799,6 +799,27 @@ void do_search(model &m, const boost::optional<model> &ref, const boost::optiona
         }
       }
 
+      // Debug: count poses by energy range
+      if (settings.verbosity >= 1) {
+        int n_invalid = 0, n_positive = 0, n_negative = 0;
+        float min_e = 1e10, max_e = -1e10;
+        for (size_t i = 0; i < energies.size(); i++) {
+          if (energies[i] >= 1e10 || !std::isfinite(energies[i])) {
+            n_invalid++;
+          } else {
+            if (energies[i] < min_e) min_e = energies[i];
+            if (energies[i] > max_e) max_e = energies[i];
+            if (energies[i] > 0) n_positive++;
+            else n_negative++;
+          }
+        }
+        log << "GPU BFGS pose stats: " << energies.size() << " total, "
+            << n_invalid << " invalid (>=1e10), "
+            << n_positive << " positive, " << n_negative << " negative\n";
+        log << "  Energy range: [" << min_e << ", " << max_e << "]\n";
+        log << "  Valid poses after filtering: " << out_cont.size() << "\n";
+      }
+
       // Sort by energy first to limit refinement to best initial poses
       out_cont.sort();  // Default sort is by energy
 
@@ -843,10 +864,14 @@ void do_search(model &m, const boost::optional<model> &ref, const boost::optiona
 
       // Now cluster by RMSD - this keeps the best-scoring pose from each cluster
       // Use symmetry-aware RMSD for clustering if RDKit mol is available
+      sz before_cluster = out_cont.size();
       if (ref_data && ref_data->rdkit_mol) {
         out_cont = remove_redundant(out_cont, settings.out_min_rmsd, ref_data->rdkit_mol);
       } else {
         out_cont = remove_redundant(out_cont, settings.out_min_rmsd);
+      }
+      if (settings.verbosity >= 1) {
+        log << "Clustering: " << before_cluster << " -> " << out_cont.size() << " unique poses (min_rmsd=" << settings.out_min_rmsd << ")\n";
       }
       done(settings.verbosity, log);
 

@@ -144,6 +144,30 @@ This image contains:
 - libtorch (compatible with gnina build)
 - Required dependencies for gnina
 
+### Syncing Source Code to VM
+
+To sync source files for rebuilding on the VM (faster than rsync through IAP):
+```bash
+# Copy .cu and .h files from lib/
+gcloud compute scp --zone=us-west1-a --tunnel-through-iap \
+  /Users/gregfriedland/src/external/gnina/gninasrc/lib/*.cu \
+  /Users/gregfriedland/src/external/gnina/gninasrc/lib/*.h \
+  gnina-profile-vm:/home/greg_rezotx_com/gnina/gninasrc/lib/
+
+# Copy main.cpp
+gcloud compute scp --zone=us-west1-a --tunnel-through-iap \
+  /Users/gregfriedland/src/external/gnina/gninasrc/main/main.cpp \
+  gnina-profile-vm:/home/greg_rezotx_com/gnina/gninasrc/main/
+```
+
+Then rebuild in container:
+```bash
+sudo podman run --rm --privileged --device nvidia.com/gpu=all \
+  -v /home/greg_rezotx_com/gnina:/gnina -v /home/greg_rezotx_com:/data \
+  us-central1-docker.pkg.dev/gke-test-421317/flyte/gnina-build-base:latest \
+  /data/build_full.sh
+```
+
 ### Notes
 
 - Use `--security-opt label=disable` to work around SELinux volume mount issues

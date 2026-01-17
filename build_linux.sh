@@ -101,8 +101,8 @@ if [ ! -f build.ninja ]; then
     echo ""
 fi
 
-echo "Building gnina and gninacheck with $JOBS parallel jobs..."
-ninja -j"$JOBS" gnina gninacheck
+echo "Building gnina with $JOBS parallel jobs..."
+ninja -j"$JOBS" gnina
 
 echo ""
 echo "=== Build complete ==="
