@@ -525,7 +525,7 @@ New batch docking mode that processes multiple ligands together in GPU batches f
 - Batch size: 50,000 poses
 - GPU: NVIDIA L4
 
-**Results**:
+**Results** (after optimizations removing CPU energy recalc and single grid population):
 
 | Metric | With CNN | Without CNN |
 |--------|----------|-------------|
@@ -533,43 +533,37 @@ New batch docking mode that processes multiple ligands together in GPU batches f
 | Ligands docked | 1000 | 1000 |
 | Total poses | 1,024,000 | 1,024,000 |
 | Total batches | 21 | 21 |
-| **Total time** | 114.3 sec | **32.8 sec** |
-| **Ligand throughput** | 8.8 lig/sec | **30.5 lig/sec** |
-| **Pose throughput** | 8,961 p/sec | **31,220 p/sec** |
+| **Total time** | 91.2 sec | **10.8 sec** |
+| **Ligand throughput** | 11 lig/sec | **93 lig/sec** |
+| **Pose throughput** | 11,228 p/sec | **94,815 p/sec** |
 
-### Batch-Level Performance
+### Performance Breakdown
+
+| Component | Without CNN | With CNN |
+|-----------|-------------|----------|
+| GPU BFGS kernel | ~6.0 sec | ~6.0 sec |
+| Grid population | ~1-2 sec | ~1-2 sec |
+| Molecule loading | ~2 sec | ~2 sec |
+| Output writing | ~1-2 sec | ~1-2 sec |
+| **CNN scoring** | N/A | **~85 sec** |
+| **Total** | **10.8 sec** | **91.2 sec** |
+
+### Batch-Level Throughput
 
 The batching algorithm grouped ligands by atom count (15-42 atoms) into 21 batches:
 
-| Batch | Ligands | Max Atoms | Max Torsions | Est. Memory | Throughput |
-|-------|---------|-----------|--------------|-------------|------------|
-| 1 | 48 | 15 | 3 | 42.8 MB | **471,745 p/s** |
-| 2 | 48 | 16 | 4 | 48.2 MB | 440,839 p/s |
-| 3 | 48 | 18 | 4 | 50.4 MB | 325,285 p/s |
-| 4 | 48 | 19 | 4 | 51.6 MB | 273,920 p/s |
-| 5 | 48 | 20 | 5 | 57.2 MB | 244,585 p/s |
-| ... | ... | ... | ... | ... | ... |
-| 18 | 48 | 33 | 14 | 120.8 MB | 74,794 p/s |
-| 19 | 48 | 34 | 14 | 121.9 MB | 66,771 p/s |
-| 20 | 48 | 36 | 13 | 117.9 MB | 58,878 p/s |
-| 21 | 40 | 42 | 11 | 94.1 MB | **50,023 p/s** |
+| Molecule Size | Throughput (poses/sec) | Throughput (lig/sec) |
+|---------------|------------------------|----------------------|
+| Small (15 atoms) | **620,000 p/s** | **605 lig/s** |
+| Medium (25 atoms) | ~230,000 p/s | ~225 lig/s |
+| Large (42 atoms) | **80,000 p/s** | **78 lig/s** |
 
-### Performance Analysis
+### Key Optimizations
 
-1. **CNN scoring is the bottleneck**: With CNN, 93% of time is spent on refinement (not GPU BFGS)
-   - GPU BFGS batch processing: ~8.5 sec for 1M poses = **120,000 poses/sec**
-   - CNN adds 3.3x overhead; use `--cnn_scoring none` for high-throughput screening
-
-2. **Throughput scales with molecule size** (GPU kernel only):
-   - Small molecules (15 atoms): ~470k poses/sec
-   - Medium molecules (25 atoms): ~125k poses/sec
-   - Large molecules (42 atoms): ~50k poses/sec
-
-3. **GPU kernel efficiency**: 88-97% of batch time is spent in BFGS kernel (setup/collection minimal)
-
-### Memory Efficiency
-
-Batch memory ranged from 42.8 MB (small molecules) to 121.9 MB (large molecules).
+1. **Single grid population**: Grid cache populated once with all atom types (was per-batch)
+2. **Skip CPU energy recalculation**: Use GPU-computed energies directly
+3. **Skip CPU refinement**: GPU BFGS already optimized poses
+4. **Remove debug output**: Eliminated per-pose stderr logging
 
 ### Known Limitations
 

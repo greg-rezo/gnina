@@ -29,6 +29,7 @@
 #include <string>
 #include <torch/torch.h>
 #include <vector> // ligand paths
+#include <set>
 
 // RDKit for symmetry-aware RMSD calculation
 #include <GraphMol/GraphMol.h>
@@ -2202,8 +2203,21 @@ Thank you!\n";
       else
         dl_scorer = std::make_shared<CNNTorchScorer<false>>(cnnopts, &log);
 
-      precalculate_exact exact_prec(wt);
-      const vec authentic_v(settings.forcecap, settings.forcecap, settings.forcecap);
+      // Collect all atom types from all ligands (for grid population)
+      std::set<smt> all_atom_types_set;
+      for (const auto& lig : batch_mgr.all_ligands) {
+        std::vector<smt> lig_types;
+        lig.m->get_movable_atom_types(lig_types);
+        all_atom_types_set.insert(lig_types.begin(), lig_types.end());
+      }
+      std::vector<smt> all_atom_types(all_atom_types_set.begin(), all_atom_types_set.end());
+
+      // Create cache_gpu ONCE and populate with all atom types
+      cache_gpu cgpu("scoring_function_version001", gd, 1000 /*slope*/, prec_gpu);
+      cgpu.set_forcecap(settings.forcecap);
+      cgpu.populate(*(batch_mgr.all_ligands[0].m), *prec, all_atom_types, user_grid);
+      log << "Grid cache populated with " << all_atom_types.size() << " atom types\n";
+      log.endl();
 
       // Phase 3: Process each batch
       for (size_t batch_idx = 0; batch_idx < batch_mgr.num_batches(); batch_idx++) {
@@ -2214,15 +2228,7 @@ Thank you!\n";
             << group.total_optimizers << " poses)\n";
         log.endl();
 
-        // Create cache_gpu for this batch (using first ligand's grid dims)
-        // All ligands share the same receptor grids
-        cache_gpu cgpu("scoring_function_version001", gd, 1000 /*slope*/, prec_gpu);
-        cgpu.set_forcecap(settings.forcecap);
-        std::vector<smt> batch_atom_types;
-        group.ligands[0]->m->get_movable_atom_types(batch_atom_types);
-        cgpu.populate(*(group.ligands[0]->m), *prec, batch_atom_types, user_grid);
-
-        // Process the batch
+        // Process the batch (reuse same grid cache)
         batch_mgr.process_batch(group, cgpu, box_min, box_max,
                                settings.bfgs_iterations, settings.seed + batch_idx, settings.verbosity);
       }
@@ -2240,7 +2246,6 @@ Thank you!\n";
       // Process each ligand's results
       for (LigandDescriptor& lig : batch_mgr.all_ligands) {
         model& m = *lig.m;
-        szv_grid_cache grid_cache(m, prec->cutoff_sqr());
 
         // Skip if no results
         if (lig.energies.empty()) continue;
@@ -2248,24 +2253,6 @@ Thank you!\n";
         // Convert GPU results to output_container
         output_container out_cont;
         conf init_conf = m.get_initial_conf(false);
-
-        // Debug: print first few conformations
-        if (settings.verbosity >= 1) {
-          std::cerr << "DEBUG: Ligand " << lig.name << " results:\n";
-          for (size_t i = 0; i < std::min(lig.energies.size(), (size_t)5); i++) {
-            std::cerr << "  [" << i << "] e=" << lig.energies[i];
-            if (lig.conformations[i].size() >= 7) {
-              std::cerr << " pos=(" << lig.conformations[i][0] << ","
-                        << lig.conformations[i][1] << "," << lig.conformations[i][2]
-                        << ") quat=(" << lig.conformations[i][3] << ","
-                        << lig.conformations[i][4] << "," << lig.conformations[i][5]
-                        << "," << lig.conformations[i][6] << ")";
-            }
-            std::cerr << "\n";
-          }
-          std::cerr << "  Box: (" << box_min.x << "," << box_min.y << "," << box_min.z
-                    << ") to (" << box_max.x << "," << box_max.y << "," << box_max.z << ")\n";
-        }
 
         for (size_t i = 0; i < lig.energies.size(); i++) {
           float e = lig.energies[i];
@@ -2304,20 +2291,6 @@ Thank you!\n";
           output_type out(c, e);
           m.set(out.c);
 
-          // Debug: check atom coords after m.set()
-          if (settings.verbosity >= 1 && i < 2) {
-            std::cerr << "DEBUG: After m.set() for pose " << i << ":\n";
-            for (sz a = 0; a < m.num_movable_atoms() && a < 10; a++) {
-              const vec& ac = m.coords[a];
-              std::cerr << "  atom[" << a << "]=(" << ac[0] << "," << ac[1] << "," << ac[2] << ")";
-              bool inside = (ac[0] >= gd[0].begin && ac[0] <= gd[0].end &&
-                            ac[1] >= gd[1].begin && ac[1] <= gd[1].end &&
-                            ac[2] >= gd[2].begin && ac[2] <= gd[2].end);
-              if (!inside) std::cerr << " OUTSIDE!";
-              std::cerr << "\n";
-            }
-          }
-
           out.coords = m.get_heavy_atom_movable_coords();
           out_cont.push_back(new output_type(out));
         }
@@ -2329,54 +2302,19 @@ Thank you!\n";
           out_cont.pop_back();
         }
 
-        // Refine and score results (using CPU refinement for final accuracy)
-        non_cache nc(grid_cache, gd, prec.get(), 1000 /*slope*/);
-        non_cache nc_new(grid_cache, gd, prec.get(), 1000 /*slope*/);
-
+        // Score results with CNN if enabled (skip CPU refinement - GPU already optimized)
+        bool use_cnn = (cnnopts.cnn_scoring != CNNnone);
         VINA_FOR_IN(i, out_cont) {
-          m.set(out_cont[i].c);  // Set model to this conformation before refinement
-
-          // Debug: check within directly
-          if (settings.verbosity >= 1 && i < 2) {
-            bool iw = nc.within(m);
-            std::cerr << "DEBUG: Before refine for pose " << i << ": within=" << iw
-                      << " num_movable_atoms=" << m.num_movable_atoms() << "\n";
-            std::cerr << "DEBUG: gd[0]=(" << gd[0].begin << "," << gd[0].end << ")\n";
-            std::cerr << "DEBUG: gd[1]=(" << gd[1].begin << "," << gd[1].end << ")\n";
-            std::cerr << "DEBUG: gd[2]=(" << gd[2].begin << "," << gd[2].end << ")\n";
-            // Check each atom
-            int outside_count = 0;
-            for (sz a = 0; a < m.num_movable_atoms(); a++) {
-              if (m.atoms[a].is_hydrogen()) continue;
-              const vec& c = m.coords[a];
-              if (c[0] < gd[0].begin || c[0] > gd[0].end ||
-                  c[1] < gd[1].begin || c[1] > gd[1].end ||
-                  c[2] < gd[2].begin || c[2] > gd[2].end) {
-                outside_count++;
-                if (outside_count <= 3)
-                  std::cerr << "DEBUG: atom[" << a << "]=(" << c[0] << "," << c[1] << ","
-                            << c[2] << ") OUTSIDE\n";
-              }
-            }
-            std::cerr << "DEBUG: total atoms outside: " << outside_count << "/" << m.num_movable_atoms() << "\n";
+          if (use_cnn) {
+            m.set(out_cont[i].c);
+            dl_scorer->set_center_from_model(m);
+            float cnnscore = 0, cnnaffinity = 0, cnnvariance = 0;
+            get_cnn_info(m, *dl_scorer, log, cnnscore, cnnaffinity, cnnvariance);
+            out_cont[i].cnnscore = cnnscore;
+            out_cont[i].cnnaffinity = cnnaffinity;
+            out_cont[i].cnnvariance = cnnvariance;
           }
-
-          refine_structure(m, *prec, nc, out_cont[i], authentic_v, minparms, user_grid,
-                          settings.verbosity, log, nc_new);
-
-          float cnnscore = 0, cnnaffinity = 0, cnnvariance = 0;
-          m.set(out_cont[i].c);
-          dl_scorer->set_center_from_model(m);
-          get_cnn_info(m, *dl_scorer, log, cnnscore, cnnaffinity, cnnvariance);
-          out_cont[i].cnnscore = cnnscore;
-          out_cont[i].cnnaffinity = cnnaffinity;
-          out_cont[i].cnnvariance = cnnvariance;
-
-          if (not_max(out_cont[i].e)) {
-            fl intramolecular_energy = m.eval_intramolecular(exact_prec, authentic_v, out_cont[i].c);
-            out_cont[i].e = m.eval_adjusted(wt, exact_prec, nc_new, authentic_v, out_cont[i].c, intramolecular_energy, user_grid);
-            out_cont[i].intramol = intramolecular_energy;
-          }
+          // Use GPU-computed energy directly (no CPU recalculation)
         }
 
         // Sort by user's preferred metric
