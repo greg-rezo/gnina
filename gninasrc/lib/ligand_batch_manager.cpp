@@ -124,33 +124,55 @@ size_t LigandBatchManager::load_all_ligands(
     all_ligands.clear();
     unsigned int lig_id = 0;
 
+    unsigned int skipped = 0;
     for (const std::string& fname : ligand_names) {
         mols.setInputFile(fname);
 
         // Read all molecules from this file
         while (true) {
             auto m = std::make_unique<model>();
-            if (!mols.readMoleculeIntoModel(*m)) {
-                break;
+            try {
+                if (!mols.readMoleculeIntoModel(*m)) {
+                    break;
+                }
+
+                LigandDescriptor desc;
+                desc.ligand_id = lig_id++;
+                desc.name = m->get_name();
+                desc.m = std::move(m);
+
+                // Extract size metrics
+                extract_size_metrics(*desc.m, desc.num_atoms, desc.num_torsions,
+                                   desc.num_nodes, desc.n_conf, desc.n_change);
+
+                if (verbosity >= 2) {
+                    log << "Loaded ligand " << desc.ligand_id << ": " << desc.name
+                        << " (atoms=" << desc.num_atoms
+                        << ", torsions=" << desc.num_torsions << ")\n";
+                }
+
+                all_ligands.push_back(std::move(desc));
+            } catch (const internal_error& e) {
+                // Skip molecules with degenerate geometry (e.g., from SMILES 3D generation)
+                skipped++;
+                if (verbosity >= 1) {
+                    log << "Warning: Skipping molecule " << lig_id << " - internal error at "
+                        << e.file << ":" << e.line << "\n";
+                }
+                lig_id++;
+            } catch (const std::exception& e) {
+                // Skip molecules that fail to load for other reasons
+                skipped++;
+                if (verbosity >= 1) {
+                    log << "Warning: Skipping molecule " << lig_id << " - " << e.what() << "\n";
+                }
+                lig_id++;
             }
-
-            LigandDescriptor desc;
-            desc.ligand_id = lig_id++;
-            desc.name = m->get_name();
-            desc.m = std::move(m);
-
-            // Extract size metrics
-            extract_size_metrics(*desc.m, desc.num_atoms, desc.num_torsions,
-                               desc.num_nodes, desc.n_conf, desc.n_change);
-
-            if (verbosity >= 2) {
-                log << "Loaded ligand " << desc.ligand_id << ": " << desc.name
-                    << " (atoms=" << desc.num_atoms
-                    << ", torsions=" << desc.num_torsions << ")\n";
-            }
-
-            all_ligands.push_back(std::move(desc));
         }
+    }
+
+    if (skipped > 0 && verbosity >= 0) {
+        log << "Skipped " << skipped << " molecules due to loading errors\n";
     }
 
     if (verbosity >= 1) {

@@ -462,6 +462,17 @@ bool MolGetter::readMoleculeIntoModel(model &m) {
           std::cerr << "\nEmpty molecule " << mol.GetTitle() << ". No output will be generated for the molecule.\n";
           continue;
         }
+
+        // Generate 3D coordinates if molecule is 2D or 0D (e.g., from SMILES)
+        if (mol.GetDimension() < 3) {
+          OBBuilder builder;
+          if (!builder.Build(mol)) {
+            std::cerr << "\nFailed to generate 3D coordinates for " << mol.GetTitle() << ". Skipping.\n";
+            continue;
+          }
+          mol.AddHydrogens();
+        }
+
         try {
           parsing_struct p;
           context c;
