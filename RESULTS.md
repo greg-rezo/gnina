@@ -688,14 +688,14 @@ Detailed timing breakdown for SMILES batch docking pipeline.
 
 ### Phase Timing Breakdown
 
-| Phase | Time | % of Total | Rate |
-|-------|------|------------|------|
-| **RDKit 3D Embedding** | 121.3s | 82.1% | 16.5 mol/s |
-| **Model Conversion** | 2.3s | 1.6% | 868 mol/s |
-| **Batching + Grid Setup** | ~0.3s | 0.2% | - |
-| **GPU BFGS Kernels** | ~14.7s | 10.0% | ~2.0M poses/s |
-| **Result Collection + Output** | ~9.0s | 6.1% | - |
-| **Total Wall Time** | **147.6s** | 100% | - |
+| Phase | Time | % of Total | Rate | Ligands/sec |
+|-------|------|------------|------|-------------|
+| **RDKit 3D Embedding** | 121.3s | 82.1% | 16.5 mol/s | 16.5 |
+| **Model Conversion** | 2.3s | 1.6% | 868 mol/s | 868 |
+| **Batching + Grid Setup** | ~0.3s | 0.2% | - | ~6,600 |
+| **GPU BFGS Kernels** | ~14.7s | 10.0% | ~2.0M poses/s | ~136 |
+| **Result Collection + Output** | ~9.0s | 6.1% | - | ~222 |
+| **Total Wall Time** | **147.6s** | 100% | - | **13.5** |
 
 ### Overall Throughput
 
