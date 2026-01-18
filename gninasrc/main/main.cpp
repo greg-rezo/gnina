@@ -2152,7 +2152,7 @@ Thank you!\n";
       log << "  BFGS iterations: " << settings.bfgs_iterations << "\n";
       log.endl();
 
-      // Phase 1: Load all ligands
+      // Load all ligands
       LigandBatchManager batch_mgr;
       batch_mgr.target_total_poses = settings.batch_size;
       batch_mgr.exhaustiveness = settings.exhaustiveness;
@@ -2181,7 +2181,7 @@ Thank you!\n";
         return 0;
       }
 
-      // Phase 2: Sort and group into batches
+      // Sort and group into batches
       batch_mgr.sort_and_group_ligands(settings.verbosity);
 
       // Setup precalculate for GPU
@@ -2209,60 +2209,17 @@ Thank you!\n";
       // Determine if CNN scoring is needed
       bool use_cnn = (cnnopts.cnn_scoring != CNNnone);
 
-      // ========================================================================
-      // INITIALIZE CNN MODEL BEFORE BFGS
-      // ========================================================================
-      // Initialize PyTorch and cuBLAS handles BEFORE running GPU BFGS kernels.
-      // This ensures all cuBLAS handles (including batched matmul) are created
-      // before any custom CUDA kernels run.
+      // Load CNN model
       std::shared_ptr<DLScorer> dl_scorer;
       if (use_cnn) {
-        log << "Initializing CNN model BEFORE BFGS (pre-initializing cuBLAS handles)...\n";
-
-        try {
-          if (torchgpu) {
-            log << "Loading GPU CNN model...\n";
-            dl_scorer = std::make_shared<CNNTorchScorer<true>>(cnnopts, &log);
-          } else {
-            log << "Loading CPU CNN model...\n";
-            dl_scorer = std::make_shared<CNNTorchScorer<false>>(cnnopts, &log);
-          }
-
-          // Warmup with batched scoring to initialize cuBLAS handles before BFGS kernels run
-          if (!batch_mgr.all_ligands.empty() && batch_mgr.all_ligands[0].m) {
-            model& warmup_model = *(batch_mgr.all_ligands[0].m);
-
-            // Single-pose warmup (initializes basic cuBLAS)
-            log << "  Single-pose warmup...\n";
-            float variance;
-            float score = dl_scorer->score(warmup_model, variance);
-            cudaDeviceSynchronize();
-
-            // Batched warmup with 20 poses (slightly larger than MAX_CHUNK_SIZE=16 to test chunking)
-            log << "  Batched warmup (20 poses, chunk size 16)...\n";
-            std::vector<conf> warmup_confs;
-            conf init_conf = warmup_model.get_initial_conf(false);
-            for (int w = 0; w < 20; w++) warmup_confs.push_back(init_conf);
-            auto batch_results = dl_scorer->score_batch(warmup_model, warmup_confs);
-            cudaDeviceSynchronize();
-            log << "    OK\n";
-
-            cudaError_t cuda_err = cudaGetLastError();
-            if (cuda_err != cudaSuccess) {
-              log << "ERROR: CUDA error after CNN warmup: " << cudaGetErrorString(cuda_err) << "\n";
-              throw std::runtime_error("CNN warmup failed");
-            }
-
-            log << "CNN model initialized and warmed up (score: " << score << ")\n";
-          }
-        } catch (const std::exception& e) {
-          log << "ERROR: CNN initialization failed: " << e.what() << "\n";
-          throw;
+        if (torchgpu) {
+          dl_scorer = std::make_shared<CNNTorchScorer<true>>(cnnopts, &log);
+        } else {
+          dl_scorer = std::make_shared<CNNTorchScorer<false>>(cnnopts, &log);
         }
-        log.endl();
       }
 
-      // Phase 3: BFGS optimization (in separate scope so cache_gpu is destroyed before CNN)
+      // BFGS optimization
       {
         // Create cache_gpu ONCE and populate with all atom types
         cache_gpu cgpu("scoring_function_version001", gd, 1000 /*slope*/, prec_gpu);
@@ -2287,35 +2244,12 @@ Thank you!\n";
         // cgpu destructor called here, freeing grid memory
       }
 
-      // ========================================================================
-      // CUDA STATE CLEANUP AFTER BFGS
-      // ========================================================================
-      log << "\nCleaning up CUDA state after BFGS...\n";
-
-      // Check for any CUDA errors from BFGS processing
-      cudaError_t cuda_err = cudaGetLastError();
-      if (cuda_err != cudaSuccess) {
-        log << "WARNING: CUDA error after BFGS: " << cudaGetErrorString(cuda_err) << "\n";
-      }
-
-      // Wait for all GPU operations to complete
+      // Free BFGS GPU memory before CNN scoring
       cudaDeviceSynchronize();
-
-      // Free all BFGS-related GPU memory
       batch_mgr.clear_gpu_memory();
-      cudaDeviceSynchronize();
-
-      // Clear PyTorch cached memory
       c10::cuda::CUDACachingAllocator::emptyCache();
 
-      // Log GPU memory state
-      size_t free_mem, total_mem;
-      cudaMemGetInfo(&free_mem, &total_mem);
-      log << "GPU memory after cleanup: " << (free_mem / 1024 / 1024) << " MB free / "
-          << (total_mem / 1024 / 1024) << " MB total\n";
-      log.endl();
-
-      // Phase 4: Refine and output results in original order
+      // Refine and output results
       std::cerr << "\nRefining and writing results...\n" << std::flush;
 
       // Timing accumulators for post-processing phases
