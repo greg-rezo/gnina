@@ -34,9 +34,41 @@ Set `verbosity >= 1` when calling `run_parallel_bfgs_docking()` or `run_parallel
 
 ## GPU Profiling with NVIDIA Tools
 
+### Quick Start: Profile bfgs_parallel_kernel
+
+Use the `profile_on_vm.sh` script to profile the BFGS kernel's L1 cache hit rate:
+
+```bash
+./profile_on_vm.sh [exhaustiveness] [bfgs_iterations]
+
+# Examples:
+./profile_on_vm.sh 128 1    # Fast: 128 poses, 1 BFGS iteration
+./profile_on_vm.sh 1024 5   # More comprehensive
+```
+
+The script:
+- Syncs code to VM and runs NCU in a podman container
+- Uses `--replay-mode kernel` for faster profiling
+- Skips 6 kernel launches to profile `bfgs_parallel_kernel` (not setup kernels)
+- Reports L1 cache hit rate (`l1tex__t_sector_hit_rate`)
+
+**Important flags for gnina:**
+- `--gpu` - Required to use GPU BFGS (otherwise uses CPU Monte Carlo)
+- `--bfgs_iterations N` - Fewer iterations = faster NCU profiling
+
+### Kernel Launch Order
+
+NCU profiles kernels in launch order. For `--gpu` mode:
+1. `generate_random_confs_kernel`
+2-4. Thrust radix sort kernels (spatial sorting)
+5. `compute_pose_cell_ids_kernel`
+6. `reorder_confs_kernel`
+7. **`bfgs_parallel_kernel`** ← target (use `--launch-skip 6`)
+
 ### VM Setup (One-time)
 
-1. Create a GCE VM with GPU support:
+The VM `gnina-profile-vm` should already exist. If not:
+
 ```bash
 gcloud compute instances create gnina-profile-vm \
   --zone=us-west1-a \
@@ -48,129 +80,39 @@ gcloud compute instances create gnina-profile-vm \
   --maintenance-policy=TERMINATE
 ```
 
-2. SSH into the VM (use IAP if direct SSH times out):
+Then install drivers and authenticate:
 ```bash
 gcloud compute ssh gnina-profile-vm --zone=us-west1-a --tunnel-through-iap
-```
-
-3. Install NVIDIA drivers and container tools:
-```bash
 sudo dnf install -y nvidia-driver nvidia-container-toolkit
-```
-
-4. Configure podman for GPU access:
-```bash
 sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
-```
-
-5. Authenticate with Artifact Registry:
-```bash
-# First run: gcloud auth login
 TOKEN=$(gcloud auth print-access-token)
 echo "$TOKEN" | sudo podman login -u oauth2accesstoken --password-stdin us-central1-docker.pkg.dev
 ```
 
-6. Copy the gnina binary and test files to the VM:
-```bash
-gcloud compute scp ./gnina_bin gnina-profile-vm:~/ --zone=us-west1-a --tunnel-through-iap
-gcloud compute scp ./test_files/*.pdb gnina-profile-vm:~/ --zone=us-west1-a --tunnel-through-iap
-gcloud compute scp ./test_files/*.sdf gnina-profile-vm:~/ --zone=us-west1-a --tunnel-through-iap
-```
-
-### Running Profiling
-
-#### Nsight Systems (Timeline Profiling)
-
-Create a script `run_profile.sh`:
-```bash
-#!/bin/bash
-cd /data
-apt-get update
-apt-get install -y nsight-systems-2025.5.2
-nsys profile -o /data/gnina_profile /data/gnina_bin --gpu --exhaustiveness 1024 --bfgs_iterations 50 \
-  -r 1dmp_rec.pdb -l 1dmp_rand_pos_fix.sdf --autobox_ligand 1dmp_rand_pos_fix.sdf -o /data/gnina_nsys_out.sdf
-nsys stats /data/gnina_profile.nsys-rep
-```
-
-Run in container:
-```bash
-sudo podman run --rm --security-opt label=disable --device nvidia.com/gpu=all \
-  -v /home/$(whoami):/data -w /data \
-  us-central1-docker.pkg.dev/gke-test-421317/flyte/gnina-build-base:latest \
-  /data/run_profile.sh
-```
-
-#### Nsight Compute (Detailed Kernel Analysis)
-
-Create a script `run_ncu.sh`:
-```bash
-#!/bin/bash
-cd /data
-apt-get update
-apt-get install -y nsight-compute-2025.4.0
-ncu --target-processes all --kernel-name "bfgs_parallel_kernel" --set full \
-  -o /data/gnina_ncu /data/gnina_bin --gpu --exhaustiveness 128 --bfgs_iterations 50 \
-  -r 1dmp_rec.pdb -l 1dmp_rand_pos_fix.sdf --autobox_ligand 1dmp_rand_pos_fix.sdf -o /data/gnina_ncu_out.sdf
-```
-
-Then analyze:
-```bash
-ncu --import /data/gnina_ncu.ncu-rep --print-summary per-kernel
-```
-
-### Downloading Profile Files
-
-```bash
-gcloud compute scp gnina-profile-vm:~/gnina_profile.nsys-rep ./ --zone=us-west1-a --tunnel-through-iap
-gcloud compute scp gnina-profile-vm:~/gnina_ncu.ncu-rep ./ --zone=us-west1-a --tunnel-through-iap
-```
-
-Open `.nsys-rep` files with Nsight Systems GUI and `.ncu-rep` files with Nsight Compute GUI.
-
-### Key Metrics to Look For
-
-- **Grid Size**: Should have multiple blocks (at least 58 for L4 GPU with 58 SMs)
-- **Achieved Occupancy**: Target >50%
-- **Warp Divergence**: Avg. Active Threads Per Warp should be close to 32
-- **SM Busy**: Target >50%
-- **L1/L2 Hit Rate**: Higher is better, 95%+ is good
-
-### Container Image
-
-Uses: `us-central1-docker.pkg.dev/gke-test-421317/flyte/gnina-build-base:latest`
-
-This image contains:
-- CUDA 12.1
-- libtorch (compatible with gnina build)
-- Required dependencies for gnina
-
 ### Syncing Source Code to VM
 
-To sync source files for rebuilding on the VM (faster than rsync through IAP):
 ```bash
-# Copy .cu and .h files from lib/
 gcloud compute scp --zone=us-west1-a --tunnel-through-iap \
-  /Users/gregfriedland/src/external/gnina/gninasrc/lib/*.cu \
-  /Users/gregfriedland/src/external/gnina/gninasrc/lib/*.h \
+  gninasrc/lib/*.cu gninasrc/lib/*.h \
   gnina-profile-vm:/home/greg_rezotx_com/gnina/gninasrc/lib/
-
-# Copy main.cpp
-gcloud compute scp --zone=us-west1-a --tunnel-through-iap \
-  /Users/gregfriedland/src/external/gnina/gninasrc/main/main.cpp \
-  gnina-profile-vm:/home/greg_rezotx_com/gnina/gninasrc/main/
 ```
 
 Then rebuild in container:
 ```bash
-sudo podman run --rm --privileged --device nvidia.com/gpu=all \
-  -v /home/greg_rezotx_com/gnina:/gnina -v /home/greg_rezotx_com:/data \
+gcloud compute ssh gnina-profile-vm --zone=us-west1-a --tunnel-through-iap --command="sudo podman run --rm --privileged --device nvidia.com/gpu=all \
+  -v /home/greg_rezotx_com/gnina:/gnina \
   us-central1-docker.pkg.dev/gke-test-421317/flyte/gnina-build-base:latest \
-  /data/build_full.sh
+  bash -c 'cd /gnina/build && ninja -j16'"
 ```
+
+### Key Metrics
+
+- **L1 cache hit rate**: Target >90% (spatial sorting achieved 93%)
+- **Achieved Occupancy**: Target >50%
+- **SM Busy**: Target >50%
 
 ### Notes
 
-- Use `--security-opt label=disable` to work around SELinux volume mount issues
-- Use `--tunnel-through-iap` for gcloud SSH/SCP if direct SSH times out
-- Profile with lower exhaustiveness (128-1024) for ncu to avoid very long runtimes
-- Profile with higher exhaustiveness (7000-20000) for nsys to see real-world performance
+- Use `--tunnel-through-iap` if direct SSH times out
+- Use `--bfgs_iterations 1` for fast NCU profiling
+- Container image: `us-central1-docker.pkg.dev/gke-test-421317/flyte/gnina-build-base:latest`
