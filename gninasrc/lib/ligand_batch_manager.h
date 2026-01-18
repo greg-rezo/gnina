@@ -93,6 +93,7 @@ public:
     int target_total_poses;    // Target number of poses per GPU batch (~50000)
     int exhaustiveness;        // Poses per ligand (uniform across all ligands)
     size_t max_gpu_memory;     // Maximum GPU memory to use (bytes)
+    bool fast_embed;           // Use fast template-based 3D generation (skips distance geometry)
 
     // Loaded ligands
     std::vector<LigandDescriptor> all_ligands;
@@ -102,7 +103,7 @@ public:
 
     LigandBatchManager()
         : target_total_poses(50000), exhaustiveness(1024),
-          max_gpu_memory(0) {}
+          max_gpu_memory(0), fast_embed(false) {}
 
     // Phase 1: Load all ligands from input files into CPU memory
     // Returns number of ligands loaded
@@ -145,6 +146,9 @@ public:
 
     // Utility: Query available GPU memory
     static size_t get_available_gpu_memory();
+
+    // Free GPU memory after batch processing (before CNN scoring)
+    void clear_gpu_memory();
 
 private:
     // Helper: Extract size metrics from a model

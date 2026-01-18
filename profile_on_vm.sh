@@ -17,7 +17,7 @@ gcloud compute ssh gnina-profile-vm --zone=us-west1-a --tunnel-through-iap --com
   bash -c 'ncu \
     --target-processes all \
     --replay-mode kernel \
-    --metrics l1tex__t_sector_hit_rate \
+    --metrics sm__throughput.avg.pct_of_peak_sustained_elapsed,dram__throughput.avg.pct_of_peak_sustained_elapsed,l1tex__t_sector_hit_rate.pct,lts__t_sector_hit_rate.pct,sm__warps_active.avg.pct_of_peak_sustained_active,smsp__sass_average_data_bytes_per_sector_mem_global_op_ld.pct \
     --kernel-name bfgs_parallel_kernel \
     --launch-count 1 \
     /gnina/build/bin/gnina \

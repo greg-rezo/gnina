@@ -13,6 +13,7 @@
 #include <boost/thread/mutex.hpp>
 #include <boost/thread/recursive_mutex.hpp>
 #include <memory>
+#include <tuple>
 #include <vector>
 
 #include "model.h"
@@ -53,6 +54,12 @@ public:
 
   virtual float score(model &m, float &variance) = 0; // score only - no gradient
   virtual float score(model &m, bool compute_gradient, float &affinity, float &loss, float &variance) = 0;
+
+  // Batched scoring - scores multiple poses efficiently in a single pass
+  // Returns vector of (cnnscore, cnnaffinity, cnnvariance) for each pose
+  // Default implementation falls back to sequential scoring
+  virtual std::vector<std::tuple<float, float, float>> score_batch(
+      model &m, const std::vector<conf> &conformations);
 
   // readjust center
   virtual void set_center_from_model(model &m);

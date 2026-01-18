@@ -8,6 +8,7 @@
 #include "cache_gpu.h"
 #include "gpu_util.h"
 #include <algorithm>
+#include <unordered_map>
 #include <cuda_runtime.h>
 #include <iostream>
 #include <iomanip>
@@ -15,6 +16,8 @@
 #include <sstream>
 #include <chrono>
 #include <omp.h>
+#include <queue>
+#include <cmath>
 #include "parsing.h"
 #include "parse_pdbqt.h"
 #include "GninaConverter.h"
@@ -24,6 +27,7 @@
 #include <GraphMol/SmilesParse/SmilesParse.h>
 #include <GraphMol/MolOps.h>
 #include <GraphMol/DistGeomHelpers/Embedder.h>
+#include <Geometry/point.h>
 
 // ============================================================================
 // LigandBatchGroup Methods
@@ -217,10 +221,215 @@ struct SmilesEntry {
     unsigned int original_index;
 };
 
+// Bond length lookup table: key = (min_atomic_num, max_atomic_num, bond_order)
+// Bond order: 1=single, 2=double, 3=triple, 4=aromatic
+struct BondKey {
+    int a1, a2, order;
+    bool operator==(const BondKey& o) const { return a1 == o.a1 && a2 == o.a2 && order == o.order; }
+};
+struct BondKeyHash {
+    size_t operator()(const BondKey& k) const { return k.a1 * 10000 + k.a2 * 100 + k.order; }
+};
+
+static const std::unordered_map<BondKey, double, BondKeyHash> BOND_LENGTHS = {
+    // Single bonds (order=1): H=1, C=6, N=7, O=8, F=9, P=15, S=16, Cl=17, Br=35, I=53
+    {{1, 6, 1}, 1.09},   // C-H
+    {{1, 7, 1}, 1.01},   // N-H
+    {{1, 8, 1}, 0.96},   // O-H
+    {{1, 16, 1}, 1.34},  // S-H
+    {{6, 6, 1}, 1.54},   // C-C
+    {{6, 7, 1}, 1.47},   // C-N
+    {{6, 8, 1}, 1.43},   // C-O
+    {{6, 9, 1}, 1.35},   // C-F
+    {{6, 15, 1}, 1.84},  // C-P
+    {{6, 16, 1}, 1.82},  // C-S
+    {{6, 17, 1}, 1.77},  // C-Cl
+    {{6, 35, 1}, 1.94},  // C-Br
+    {{6, 53, 1}, 2.14},  // C-I
+    {{7, 7, 1}, 1.45},   // N-N
+    {{7, 8, 1}, 1.40},   // N-O
+    {{8, 8, 1}, 1.48},   // O-O
+    {{8, 15, 1}, 1.63},  // P-O
+    {{8, 16, 1}, 1.58},  // S-O
+    {{16, 16, 1}, 2.05}, // S-S
+    // Double bonds (order=2)
+    {{6, 6, 2}, 1.34},   // C=C
+    {{6, 7, 2}, 1.29},   // C=N
+    {{6, 8, 2}, 1.23},   // C=O
+    {{6, 16, 2}, 1.60},  // C=S
+    {{7, 7, 2}, 1.25},   // N=N
+    {{7, 8, 2}, 1.21},   // N=O
+    {{8, 15, 2}, 1.48},  // P=O
+    {{8, 16, 2}, 1.43},  // S=O
+    // Triple bonds (order=3)
+    {{6, 6, 3}, 1.20},   // C≡C
+    {{6, 7, 3}, 1.16},   // C≡N
+    {{7, 7, 3}, 1.10},   // N≡N
+    // Aromatic bonds (order=4)
+    {{6, 6, 4}, 1.40},   // C:C
+    {{6, 7, 4}, 1.34},   // C:N
+    {{6, 8, 4}, 1.36},   // C:O (furan, etc)
+    {{6, 16, 4}, 1.74},  // C:S (thiophene)
+    {{7, 7, 4}, 1.35},   // N:N
+    {{7, 8, 4}, 1.30},   // N:O
+};
+
+static const double DEFAULT_BOND_LENGTHS[] = {0.0, 1.50, 1.34, 1.20, 1.40}; // indexed by order
+
+static double get_bond_length(int atomic_num1, int atomic_num2, RDKit::Bond::BondType bond_type) {
+    // Convert bond type to order (1=single, 2=double, 3=triple, 4=aromatic)
+    int order;
+    switch (bond_type) {
+        case RDKit::Bond::SINGLE: order = 1; break;
+        case RDKit::Bond::DOUBLE: order = 2; break;
+        case RDKit::Bond::TRIPLE: order = 3; break;
+        case RDKit::Bond::AROMATIC: order = 4; break;
+        default: order = 1; break;
+    }
+
+    // Normalize key so a1 <= a2 (handles both permutations)
+    int a1 = std::min(atomic_num1, atomic_num2);
+    int a2 = std::max(atomic_num1, atomic_num2);
+
+    auto it = BOND_LENGTHS.find({a1, a2, order});
+    if (it != BOND_LENGTHS.end()) {
+        return it->second;
+    }
+
+    // Fallback to default for this bond order
+    std::cerr << "Warning: Unknown bond " << a1 << "-" << a2 << " order=" << order
+              << ", using default " << DEFAULT_BOND_LENGTHS[order] << " A\n";
+    return DEFAULT_BOND_LENGTHS[order];
+}
+
+// Get ideal bond angle based on hybridization
+static double get_bond_angle(RDKit::Atom::HybridizationType hyb) {
+    switch (hyb) {
+        case RDKit::Atom::SP3: return 109.5 * M_PI / 180.0;
+        case RDKit::Atom::SP2: return 120.0 * M_PI / 180.0;
+        case RDKit::Atom::SP:  return 180.0 * M_PI / 180.0;
+        default: return 109.5 * M_PI / 180.0;
+    }
+}
+
+// Fast template-based 3D coordinate generation (thread-safe)
+// Builds coordinates outward from first atom using bond lengths and angles
+// Much faster than distance geometry, sufficient for docking since poses get randomized
+static std::unique_ptr<RDKit::RWMol> generate_3d_fast(
+    const std::string& smiles, const std::string& name) {
+
+    // Parse SMILES
+    std::unique_ptr<RDKit::RWMol> mol(RDKit::SmilesToMol(smiles));
+    if (!mol || mol->getNumAtoms() == 0) {
+        return nullptr;
+    }
+
+    // Add hydrogens
+    RDKit::MolOps::addHs(*mol);
+
+    unsigned int nAtoms = mol->getNumAtoms();
+
+    // Create conformer
+    auto *conf = new RDKit::Conformer(nAtoms);
+    conf->set3D(true);
+
+    // BFS to assign coordinates
+    std::vector<bool> visited(nAtoms, false);
+    std::vector<int> parent(nAtoms, -1);
+    std::queue<unsigned int> queue;
+
+    // Start from atom 0 at origin
+    conf->setAtomPos(0, RDGeom::Point3D(0, 0, 0));
+    visited[0] = true;
+    queue.push(0);
+
+    // Track placement direction for each atom
+    std::vector<RDGeom::Point3D> directions(nAtoms);
+    directions[0] = RDGeom::Point3D(1, 0, 0);
+
+    while (!queue.empty()) {
+        unsigned int curr = queue.front();
+        queue.pop();
+
+        RDGeom::Point3D currPos = conf->getAtomPos(curr);
+        RDKit::Atom* atom = mol->getAtomWithIdx(curr);
+        RDKit::Atom::HybridizationType hyb = atom->getHybridization();
+        double angle = get_bond_angle(hyb);
+
+        // Get direction we came from (for angle placement)
+        RDGeom::Point3D inDir = directions[curr];
+
+        // Count unvisited neighbors
+        std::vector<unsigned int> unvisitedNbrs;
+        for (const auto& nbr : mol->atomNeighbors(atom)) {
+            unsigned int nbrIdx = nbr->getIdx();
+            if (!visited[nbrIdx]) {
+                unvisitedNbrs.push_back(nbrIdx);
+            }
+        }
+
+        // Place each unvisited neighbor
+        int nbrCount = 0;
+        for (unsigned int nbrIdx : unvisitedNbrs) {
+            RDKit::Atom* nbrAtom = mol->getAtomWithIdx(nbrIdx);
+            RDKit::Bond* bond = mol->getBondBetweenAtoms(curr, nbrIdx);
+
+            double bondLen = get_bond_length(
+                atom->getAtomicNum(),
+                nbrAtom->getAtomicNum(),
+                bond->getBondType()
+            );
+
+            // Calculate direction for this neighbor
+            // Rotate around incoming direction based on neighbor index
+            double theta = angle;  // Angle from incoming direction
+            double phi = nbrCount * (2.0 * M_PI / std::max((int)unvisitedNbrs.size(), 1));  // Rotation around axis
+
+            // Create orthogonal basis
+            RDGeom::Point3D up(0, 0, 1);
+            if (std::abs(inDir.z) > 0.9) up = RDGeom::Point3D(1, 0, 0);
+
+            RDGeom::Point3D right = inDir.crossProduct(up);
+            right.normalize();
+            up = right.crossProduct(inDir);
+            up.normalize();
+
+            // Calculate new direction
+            double sinTheta = sin(theta);
+            double cosTheta = cos(theta);
+            RDGeom::Point3D outDir =
+                inDir * (-cosTheta) +
+                right * (sinTheta * cos(phi)) +
+                up * (sinTheta * sin(phi));
+            outDir.normalize();
+
+            // Place atom
+            RDGeom::Point3D newPos = currPos + outDir * bondLen;
+            conf->setAtomPos(nbrIdx, newPos);
+            directions[nbrIdx] = outDir;
+
+            visited[nbrIdx] = true;
+            parent[nbrIdx] = curr;
+            queue.push(nbrIdx);
+            nbrCount++;
+        }
+    }
+
+    mol->addConformer(conf, true);
+    mol->setProp("_Name", name);
+
+    return mol;
+}
+
 // Process a single SMILES to RDKit RWMol with 3D coords (thread-safe)
 // Uses RDKit EmbedMolecule with ETKDGv3 - no force field optimization
 static std::unique_ptr<RDKit::RWMol> generate_3d_from_smiles_rdkit(
-    const std::string& smiles, const std::string& name) {
+    const std::string& smiles, const std::string& name, bool fast_embed = false) {
+
+    // Use fast template-based generation if requested
+    if (fast_embed) {
+        return generate_3d_fast(smiles, name);
+    }
 
     // Parse SMILES
     std::unique_ptr<RDKit::RWMol> mol(RDKit::SmilesToMol(smiles));
@@ -315,7 +524,11 @@ size_t LigandBatchManager::load_smiles_parallel(
     }
 
     if (verbosity >= 1) {
-        log << "Generating 3D coordinates with " << num_threads << " threads...\n";
+        log << "Generating 3D coordinates with " << num_threads << " threads";
+        if (fast_embed) {
+            log << " (fast template-based)";
+        }
+        log << "...\n";
     }
 
     // Step 3: Generate 3D coordinates in parallel using RDKit (thread-safe)
@@ -323,11 +536,12 @@ size_t LigandBatchManager::load_smiles_parallel(
 
     auto start_time = std::chrono::high_resolution_clock::now();
 
+    bool use_fast = fast_embed;  // Capture for OpenMP
     #pragma omp parallel for num_threads(num_threads) schedule(dynamic, 10)
     for (size_t i = 0; i < entries.size(); i++) {
         const SmilesEntry& entry = entries[i];
         try {
-            rdkit_mols[i] = generate_3d_from_smiles_rdkit(entry.smiles, entry.name);
+            rdkit_mols[i] = generate_3d_from_smiles_rdkit(entry.smiles, entry.name, use_fast);
         } catch (...) {
             // Failed - leave as nullptr
         }
@@ -342,7 +556,8 @@ size_t LigandBatchManager::load_smiles_parallel(
             if (mol) success_count++;
         }
         double rate = entries.size() / embed_elapsed;
-        log << "RDKit 3D embedding: " << std::fixed << std::setprecision(1)
+        log << (use_fast ? "Fast 3D embedding: " : "RDKit 3D embedding: ")
+            << std::fixed << std::setprecision(1)
             << embed_elapsed << "s, " << rate << " mol/s, "
             << success_count << "/" << entries.size() << " succeeded\n";
     }
@@ -654,4 +869,17 @@ size_t LigandBatchManager::get_available_gpu_memory() {
     size_t free_mem, total_mem;
     CUDA_CHECK_GNINA(cudaMemGetInfo(&free_mem, &total_mem));
     return free_mem;
+}
+
+void LigandBatchManager::clear_gpu_memory() {
+    // Free GPU state for all ligands
+    for (auto& lig : all_ligands) {
+        if (lig.gpu_initialized && lig.m) {
+            lig.m->deallocate_gpu();
+            lig.gpu_initialized = false;
+        }
+    }
+
+    // Synchronize and compact GPU memory
+    cudaDeviceSynchronize();
 }

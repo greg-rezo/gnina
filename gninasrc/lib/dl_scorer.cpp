@@ -193,6 +193,24 @@ void DLScorer::setReceptor(const model &m) {
   }
 }
 
+// Default implementation of batch scoring - falls back to sequential scoring
+// Subclasses can override this with optimized batched implementations
+std::vector<std::tuple<float, float, float>> DLScorer::score_batch(
+    model &m, const std::vector<conf> &conformations) {
+  std::vector<std::tuple<float, float, float>> results;
+  results.reserve(conformations.size());
+
+  for (const auto &c : conformations) {
+    m.set(c);
+    set_center_from_model(m);
+    float cnnscore = 0, cnnaffinity = 0, cnnvariance = 0, loss = 0;
+    cnnscore = score(m, false, cnnaffinity, loss, cnnvariance);
+    results.emplace_back(cnnscore, cnnaffinity, cnnvariance);
+  }
+
+  return results;
+}
+
 // reset center to be around ligand; reset receptor transformation
 // call this before minimizing a ligand
 void DLScorer::set_center_from_model(model &m) {

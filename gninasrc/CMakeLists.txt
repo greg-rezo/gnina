@@ -282,6 +282,7 @@ target_link_libraries(gnina
     RDKitDistGeomHelpers
     RDKitForceFieldHelpers
     RDKitRDGeneral
+    RDKitRDGeometryLib
 )
 
 add_executable(gninavis gninavis/gninavis.cpp lib/CommandLine2/CommandLine.cpp gninavis/cnn_visualization.cpp gninavis/cnn_visualization.hpp)

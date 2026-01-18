@@ -1,5 +1,6 @@
 #include <boost/program_options.hpp>
 #include <torch/torch.h>
+#include <c10/cuda/CUDACachingAllocator.h>
 #include <algorithm>
 #include <boost/algorithm/string.hpp>
 #include <boost/assign.hpp>
@@ -1682,6 +1683,8 @@ Thank you!\n";
         "target total poses per GPU batch for multi-ligand batch docking (default: 50000)")(
         "no_batch", bool_switch(&settings.no_batch)->default_value(false),
         "disable batch docking (process one ligand at a time, for debugging)")(
+        "fast_embed", bool_switch(&settings.fast_embed)->default_value(false),
+        "use fast template-based 3D coordinate generation for SMILES (skips distance geometry)")(
         "cpu_grid", bool_switch(&settings.cpu_grid)->default_value(false),
         "use grid-based scoring for CPU local_only (to match GPU behavior)")(
         "bfgs_iterations", value<int>(&settings.bfgs_iterations)->default_value(50),
@@ -2154,6 +2157,7 @@ Thank you!\n";
       batch_mgr.target_total_poses = settings.batch_size;
       batch_mgr.exhaustiveness = settings.exhaustiveness;
       batch_mgr.max_gpu_memory = (size_t)(LigandBatchManager::get_available_gpu_memory() * 0.8);
+      batch_mgr.fast_embed = settings.fast_embed;
 
       // Check if all inputs are SMILES files - use parallel RDKit loader if so
       bool all_smiles = true;
@@ -2193,13 +2197,6 @@ Thank you!\n";
       gfloat3 box_min(corner1[0], corner1[1], corner1[2]);
       gfloat3 box_max(corner2[0], corner2[1], corner2[2]);
 
-      // Create DLScorer for CNN scoring
-      std::shared_ptr<DLScorer> dl_scorer;
-      if (torchgpu)
-        dl_scorer = std::make_shared<CNNTorchScorer<true>>(cnnopts, &log);
-      else
-        dl_scorer = std::make_shared<CNNTorchScorer<false>>(cnnopts, &log);
-
       // Collect all atom types from all ligands (for grid population)
       std::set<smt> all_atom_types_set;
       for (const auto& lig : batch_mgr.all_ligands) {
@@ -2209,30 +2206,126 @@ Thank you!\n";
       }
       std::vector<smt> all_atom_types(all_atom_types_set.begin(), all_atom_types_set.end());
 
-      // Create cache_gpu ONCE and populate with all atom types
-      cache_gpu cgpu("scoring_function_version001", gd, 1000 /*slope*/, prec_gpu);
-      cgpu.set_forcecap(settings.forcecap);
-      cgpu.populate(*(batch_mgr.all_ligands[0].m), *prec, all_atom_types, user_grid);
-      log << "Grid cache populated with " << all_atom_types.size() << " atom types\n";
-      log.endl();
+      // Determine if CNN scoring is needed
+      bool use_cnn = (cnnopts.cnn_scoring != CNNnone);
 
-      // Phase 3: Process each batch
-      for (size_t batch_idx = 0; batch_idx < batch_mgr.num_batches(); batch_idx++) {
-        LigandBatchGroup& group = batch_mgr.batch_groups[batch_idx];
+      // ========================================================================
+      // INITIALIZE CNN MODEL BEFORE BFGS
+      // ========================================================================
+      // Initialize PyTorch and cuBLAS handles BEFORE running GPU BFGS kernels.
+      // This ensures all cuBLAS handles (including batched matmul) are created
+      // before any custom CUDA kernels run.
+      std::shared_ptr<DLScorer> dl_scorer;
+      if (use_cnn) {
+        log << "Initializing CNN model BEFORE BFGS (pre-initializing cuBLAS handles)...\n";
 
-        log << "Processing batch " << (batch_idx + 1) << "/" << batch_mgr.num_batches()
-            << " (" << group.ligands.size() << " ligands, "
-            << group.total_optimizers << " poses)\n";
+        try {
+          if (torchgpu) {
+            log << "Loading GPU CNN model...\n";
+            dl_scorer = std::make_shared<CNNTorchScorer<true>>(cnnopts, &log);
+          } else {
+            log << "Loading CPU CNN model...\n";
+            dl_scorer = std::make_shared<CNNTorchScorer<false>>(cnnopts, &log);
+          }
+
+          // Warmup with batched scoring to initialize cuBLAS handles before BFGS kernels run
+          if (!batch_mgr.all_ligands.empty() && batch_mgr.all_ligands[0].m) {
+            model& warmup_model = *(batch_mgr.all_ligands[0].m);
+
+            // Single-pose warmup (initializes basic cuBLAS)
+            log << "  Single-pose warmup...\n";
+            float variance;
+            float score = dl_scorer->score(warmup_model, variance);
+            cudaDeviceSynchronize();
+
+            // Batched warmup with 20 poses (slightly larger than MAX_CHUNK_SIZE=16 to test chunking)
+            log << "  Batched warmup (20 poses, chunk size 16)...\n";
+            std::vector<conf> warmup_confs;
+            conf init_conf = warmup_model.get_initial_conf(false);
+            for (int w = 0; w < 20; w++) warmup_confs.push_back(init_conf);
+            auto batch_results = dl_scorer->score_batch(warmup_model, warmup_confs);
+            cudaDeviceSynchronize();
+            log << "    OK\n";
+
+            cudaError_t cuda_err = cudaGetLastError();
+            if (cuda_err != cudaSuccess) {
+              log << "ERROR: CUDA error after CNN warmup: " << cudaGetErrorString(cuda_err) << "\n";
+              throw std::runtime_error("CNN warmup failed");
+            }
+
+            log << "CNN model initialized and warmed up (score: " << score << ")\n";
+          }
+        } catch (const std::exception& e) {
+          log << "ERROR: CNN initialization failed: " << e.what() << "\n";
+          throw;
+        }
         log.endl();
-
-        // Process the batch (reuse same grid cache)
-        batch_mgr.process_batch(group, cgpu, box_min, box_max,
-                               settings.bfgs_iterations, settings.seed + batch_idx, settings.verbosity);
       }
 
-      // Phase 4: Refine and output results in original order
-      log << "\nRefining and writing results...\n";
+      // Phase 3: BFGS optimization (in separate scope so cache_gpu is destroyed before CNN)
+      {
+        // Create cache_gpu ONCE and populate with all atom types
+        cache_gpu cgpu("scoring_function_version001", gd, 1000 /*slope*/, prec_gpu);
+        cgpu.set_forcecap(settings.forcecap);
+        cgpu.populate(*(batch_mgr.all_ligands[0].m), *prec, all_atom_types, user_grid);
+        log << "Grid cache populated with " << all_atom_types.size() << " atom types\n";
+        log.endl();
+
+        // Process each batch
+        for (size_t batch_idx = 0; batch_idx < batch_mgr.num_batches(); batch_idx++) {
+          LigandBatchGroup& group = batch_mgr.batch_groups[batch_idx];
+
+          log << "Processing batch " << (batch_idx + 1) << "/" << batch_mgr.num_batches()
+              << " (" << group.ligands.size() << " ligands, "
+              << group.total_optimizers << " poses)\n";
+          log.endl();
+
+          // Process the batch (reuse same grid cache)
+          batch_mgr.process_batch(group, cgpu, box_min, box_max,
+                                 settings.bfgs_iterations, settings.seed + batch_idx, settings.verbosity);
+        }
+        // cgpu destructor called here, freeing grid memory
+      }
+
+      // ========================================================================
+      // CUDA STATE CLEANUP AFTER BFGS
+      // ========================================================================
+      log << "\nCleaning up CUDA state after BFGS...\n";
+
+      // Check for any CUDA errors from BFGS processing
+      cudaError_t cuda_err = cudaGetLastError();
+      if (cuda_err != cudaSuccess) {
+        log << "WARNING: CUDA error after BFGS: " << cudaGetErrorString(cuda_err) << "\n";
+      }
+
+      // Wait for all GPU operations to complete
+      cudaDeviceSynchronize();
+
+      // Free all BFGS-related GPU memory
+      batch_mgr.clear_gpu_memory();
+      cudaDeviceSynchronize();
+
+      // Clear PyTorch cached memory
+      c10::cuda::CUDACachingAllocator::emptyCache();
+
+      // Log GPU memory state
+      size_t free_mem, total_mem;
+      cudaMemGetInfo(&free_mem, &total_mem);
+      log << "GPU memory after cleanup: " << (free_mem / 1024 / 1024) << " MB free / "
+          << (total_mem / 1024 / 1024) << " MB total\n";
       log.endl();
+
+      // Phase 4: Refine and output results in original order
+      std::cerr << "\nRefining and writing results...\n" << std::flush;
+
+      // Timing accumulators for post-processing phases
+      double time_pose_validation = 0;
+      double time_model_set = 0;
+      double time_cnn_scoring = 0;
+      double time_rmsd_clustering = 0;
+      double time_result_creation = 0;
+      double time_file_writing = 0;
+      boost::timer::cpu_timer phase_timer;
 
       // Sort ligands back to original order
       std::sort(batch_mgr.all_ligands.begin(), batch_mgr.all_ligands.end(),
@@ -2251,6 +2344,7 @@ Thank you!\n";
         output_container out_cont;
         conf init_conf = m.get_initial_conf(false);
 
+        phase_timer.start();
         for (size_t i = 0; i < lig.energies.size(); i++) {
           float e = lig.energies[i];
           const std::vector<float>& conformation = lig.conformations[i];
@@ -2286,11 +2380,16 @@ Thank you!\n";
           }
 
           output_type out(c, e);
+
+          // Time model.set() separately as it can be expensive
+          boost::timer::cpu_timer set_timer;
           m.set(out.c);
+          time_model_set += set_timer.elapsed().wall / 1e9;
 
           out.coords = m.get_heavy_atom_movable_coords();
           out_cont.push_back(new output_type(out));
         }
+        time_pose_validation += phase_timer.elapsed().wall / 1e9;
 
         // Sort by energy and limit
         out_cont.sort();
@@ -2300,19 +2399,29 @@ Thank you!\n";
         }
 
         // Score results with CNN if enabled (skip CPU refinement - GPU already optimized)
-        bool use_cnn = (cnnopts.cnn_scoring != CNNnone);
-        VINA_FOR_IN(i, out_cont) {
-          if (use_cnn) {
-            m.set(out_cont[i].c);
-            dl_scorer->set_center_from_model(m);
-            float cnnscore = 0, cnnaffinity = 0, cnnvariance = 0;
-            get_cnn_info(m, *dl_scorer, log, cnnscore, cnnaffinity, cnnvariance);
-            out_cont[i].cnnscore = cnnscore;
-            out_cont[i].cnnaffinity = cnnaffinity;
-            out_cont[i].cnnvariance = cnnvariance;
+        phase_timer.start();
+        if (use_cnn && dl_scorer && !out_cont.empty()) {
+          // Collect all conformations for batch scoring
+          std::vector<conf> batch_confs;
+          batch_confs.reserve(out_cont.size());
+          VINA_FOR_IN(i, out_cont) {
+            batch_confs.push_back(out_cont[i].c);
           }
-          // Use GPU-computed energy directly (no CPU recalculation)
+
+          // Score all poses in a single batched call
+          auto batch_results = dl_scorer->score_batch(m, batch_confs);
+
+          // Store results back
+          VINA_FOR_IN(i, out_cont) {
+            out_cont[i].cnnscore = std::get<0>(batch_results[i]);
+            out_cont[i].cnnaffinity = std::get<1>(batch_results[i]);
+            out_cont[i].cnnvariance = std::get<2>(batch_results[i]);
+          }
+
+          // Clear GPU cache after each ligand to prevent memory accumulation
+          c10::cuda::CUDACachingAllocator::emptyCache();
         }
+        time_cnn_scoring += phase_timer.elapsed().wall / 1e9;
 
         // Sort by user's preferred metric
         auto sorter = [&settings](const output_type& lhs, const output_type& rhs) {
@@ -2329,9 +2438,12 @@ Thank you!\n";
         out_cont.sort(sorter);
 
         // Cluster by RMSD
+        phase_timer.start();
         out_cont = remove_redundant(out_cont, settings.out_min_rmsd);
+        time_rmsd_clustering += phase_timer.elapsed().wall / 1e9;
 
         // Convert to result_info and write
+        phase_timer.start();
         std::vector<result_info> results;
         sz how_many = 0;
         VINA_FOR_IN(i, out_cont) {
@@ -2347,8 +2459,10 @@ Thank you!\n";
           }
           how_many++;
         }
+        time_result_creation += phase_timer.elapsed().wall / 1e9;
 
         // Write results
+        phase_timer.start();
         if (outfile) {
           for (unsigned j = 0; j < results.size(); j++) {
             results[j].write(outfile, outext, settings.include_atom_info, &wt, j + 1);
@@ -2364,7 +2478,20 @@ Thank you!\n";
             results[j].writeAtomValues(atomoutfile, &wt);
           }
         }
+        time_file_writing += phase_timer.elapsed().wall / 1e9;
       }
+
+      // Print post-processing timing breakdown
+      log << "\nPost-processing timing breakdown:\n";
+      log << "  Pose validation (incl. model.set): " << std::fixed << std::setprecision(2) << time_pose_validation << "s\n";
+      log << "    - model.set() calls:             " << time_model_set << "s\n";
+      log << "  CNN scoring:                       " << time_cnn_scoring << "s\n";
+      log << "  RMSD clustering:                   " << time_rmsd_clustering << "s\n";
+      log << "  Result creation:                   " << time_result_creation << "s\n";
+      log << "  File writing:                      " << time_file_writing << "s\n";
+      double total_pp = time_pose_validation + time_cnn_scoring + time_rmsd_clustering + time_result_creation + time_file_writing;
+      log << "  Total post-processing:             " << total_pp << "s\n";
+      log.endl();
 
       // Print timing summary
       log << "\nBatch docking completed.\n";

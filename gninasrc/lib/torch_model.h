@@ -35,6 +35,15 @@ public:
                const std::vector<float3> &lig_coords, const std::vector<smt> &lig_types, const vec& center,
                bool rotate, bool compute_gradient);
 
+  // Batched forward pass - scores multiple poses in a single inference call
+  // Returns vector of {pose_score, affinity, loss} for each pose
+  std::vector<std::vector<float>> forward_batch(
+      const std::vector<float3> &rec_coords, const std::vector<smt> &rec_types,
+      const std::vector<std::vector<float3>> &lig_coords_batch,
+      const std::vector<std::vector<smt>> &lig_types_batch,
+      const std::vector<vec> &centers_batch,
+      bool rotate);
+
   //assumes forward was called with compute_gradient
   void getLigandGradient(std::vector<gfloat3>& grad);
   void getReceptorGradient(std::vector<gfloat3>& grad);

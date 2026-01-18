@@ -251,6 +251,117 @@ template <bool isCUDA> fl CNNTorchScorer<isCUDA>::get_grid_res() const {
   return models[0]->get_grid_res();
 }
 
+// Batched scoring - scores multiple poses efficiently in a single GPU pass
+// This is optimized for the GPU batch docking path where we have many poses to score
+//
+// NOTE: The CNN model must be initialized and warmed up with batched scoring BEFORE
+// running GPU BFGS kernels. This ensures cuBLAS batched matmul handles are created
+// before custom CUDA kernels potentially invalidate them.
+template <bool isCUDA>
+std::vector<std::tuple<float, float, float>> CNNTorchScorer<isCUDA>::score_batch(
+    model &m, const std::vector<conf> &conformations) {
+  boost::lock_guard<boost::recursive_mutex> guard(*mtx);
+
+  if (!initialized() || conformations.empty()) {
+    return {};
+  }
+
+  size_t batch_size = conformations.size();
+
+  // Get receptor data once (same for all poses)
+  // We need to set up the model first to extract receptor coords
+  m.set(conformations[0]);
+  setReceptor(m);
+
+  // Extract ligand data for each pose
+  std::vector<std::vector<float3>> lig_coords_batch(batch_size);
+  std::vector<std::vector<smt>> lig_types_batch(batch_size);
+  std::vector<vec> centers_batch(batch_size);
+
+  for (size_t i = 0; i < batch_size; i++) {
+    m.set(conformations[i]);
+    setLigand(m);
+
+    // Copy ligand coords and types
+    lig_coords_batch[i] = ligand_coords;
+    lig_types_batch[i] = ligand_smtypes;
+
+    // Calculate center for this pose (using NAN triggers auto-center from ligand)
+    if (!isnan(cnnopts.cnn_center[0])) {
+      centers_batch[i] = cnnopts.cnn_center;
+    } else {
+      // Use ligand center
+      vec center(0, 0, 0);
+      for (const auto& coord : ligand_coords) {
+        center[0] += coord.x;
+        center[1] += coord.y;
+        center[2] += coord.z;
+      }
+      if (!ligand_coords.empty()) {
+        center /= (float)ligand_coords.size();
+      }
+      centers_batch[i] = center;
+    }
+  }
+
+  // Accumulate results across models (for ensemble)
+  std::vector<float> scores_sum(batch_size, 0.0f);
+  std::vector<float> affinities_sum(batch_size, 0.0f);
+  std::vector<std::vector<float>> all_affinities(batch_size);  // For variance calculation
+
+  unsigned nscores_per_pose = models.size() * max(cnnopts.cnn_rotations, 1U);
+  if (nscores_per_pose > 1) {
+    for (auto& affs : all_affinities) {
+      affs.reserve(nscores_per_pose);
+    }
+  }
+
+  // Loop over models in the ensemble
+  for (auto &model : models) {
+    torch::manual_seed(cnnopts.seed);
+    libmolgrid::random_engine.seed(cnnopts.seed);
+
+    // Loop over rotations (if requested)
+    for (unsigned r = 0, n = max(cnnopts.cnn_rotations, 1U); r < n; r++) {
+      // Call batched forward pass
+      auto batch_results = model->forward_batch(
+          receptor_coords, receptor_smtypes,
+          lig_coords_batch, lig_types_batch,
+          centers_batch, r > 0);
+
+      // Accumulate results
+      for (size_t i = 0; i < batch_size; i++) {
+        scores_sum[i] += batch_results[i][0];  // pose score
+        affinities_sum[i] += batch_results[i][1];  // affinity
+        if (nscores_per_pose > 1) {
+          all_affinities[i].push_back(batch_results[i][1]);
+        }
+      }
+    }
+  }
+
+  // Average and compute variance
+  std::vector<std::tuple<float, float, float>> results(batch_size);
+  for (size_t i = 0; i < batch_size; i++) {
+    float mean_score = scores_sum[i] / nscores_per_pose;
+    float mean_affinity = affinities_sum[i] / nscores_per_pose;
+
+    float variance = 0.0f;
+    if (all_affinities[i].size() > 1) {
+      float sum = 0.0f;
+      for (float a : all_affinities[i]) {
+        float diff = mean_affinity - a;
+        sum += diff * diff;
+      }
+      variance = sum / all_affinities[i].size();
+    }
+
+    results[i] = std::make_tuple(mean_score, mean_affinity, variance);
+  }
+
+  return results;
+}
+
 // explicit instantiations
 template class CNNTorchScorer<true>;
 template class CNNTorchScorer<false>;

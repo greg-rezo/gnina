@@ -91,6 +91,7 @@ struct user_settings {
     bool warp_coop; //use warp-cooperative BFGS kernel (GPU only, experimental)
     int batch_size; //target total poses per GPU batch for multi-ligand batch docking
     bool no_batch; //disable batch docking (process one ligand at a time)
+    bool fast_embed; //use fast template-based 3D coordinate generation for SMILES
 
     cnn_options cnnopts;
 
@@ -103,7 +104,7 @@ struct user_settings {
             randomize_only(false), local_only(false), dominimize(false),
             include_atom_info(false), no_gpu(false), no_lig(false),
             gpu(false), cpu_grid(false), bfgs_iterations(50), verbose_grad(false),
-            direct_pairwise(false), warp_coop(false), batch_size(50000), no_batch(false) {
+            direct_pairwise(false), warp_coop(false), batch_size(50000), no_batch(false), fast_embed(false) {
 
     }
 };

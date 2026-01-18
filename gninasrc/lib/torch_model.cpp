@@ -9,6 +9,7 @@
 #include "common.h"
 #include <json/json.h>
 #include <string>
+#include <c10/cuda/CUDACachingAllocator.h>
 
 using namespace std;
 using namespace libmolgrid;
@@ -221,6 +222,111 @@ std::vector<float> TorchModel<isCUDA>::forward(const std::vector<float3> &rec_co
   }
   vector<float> scores{pose, affinity, loss.item<float>()};
   return scores;
+}
+
+// Batched forward pass - scores multiple poses in a single inference call
+// No gradient computation or rotation support in batch mode (inference only)
+// Internally chunks large batches to avoid GPU memory exhaustion
+template <bool isCUDA>
+std::vector<std::vector<float>> TorchModel<isCUDA>::forward_batch(
+    const std::vector<float3> &rec_coords, const std::vector<smt> &rec_types,
+    const std::vector<std::vector<float3>> &lig_coords_batch,
+    const std::vector<std::vector<smt>> &lig_types_batch,
+    const std::vector<vec> &centers_batch,
+    bool rotate) {
+
+  size_t total_batch_size = lig_coords_batch.size();
+  if (total_batch_size == 0) {
+    return {};
+  }
+
+  torch::NoGradGuard no_grad;  // Disable gradients for inference
+
+  // Create receptor CoordinateSet once (reused for all poses)
+  CoordinateSet rec = make_coordset(rec_coords, rec_types, rec_typer);
+
+  // Calculate grid dimensions
+  long ntypes = rec_typer->num_types() + lig_typer->num_types();
+  long gd = gmaker.get_first_dim();
+
+  // Each grid takes ntypes * gd^3 * 4 bytes ≈ 12 MB for typical settings (28 * 48^3 * 4)
+  // NOTE: Reduced from 32 to 16 to avoid cuBLASLt CUBLAS_STATUS_NOT_INITIALIZED errors.
+  // PyTorch uses cuBLASLt (cublasLtMatmul) for batch sizes >= 32, which has initialization
+  // issues on some CUDA configurations. Batch sizes <= 16 use regular cuBLAS and work reliably.
+  // See: https://github.com/pytorch/pytorch/issues/99397
+  const size_t MAX_CHUNK_SIZE = 16;
+
+  auto options = torch::TensorOptions()
+      .dtype(torch::kFloat32)
+      .device(isCUDA ? torch::kCUDA : torch::kCPU);
+
+  std::vector<std::vector<float>> all_scores(total_batch_size);
+
+  // Process in chunks
+  for (size_t chunk_start = 0; chunk_start < total_batch_size; chunk_start += MAX_CHUNK_SIZE) {
+    size_t chunk_end = std::min(chunk_start + MAX_CHUNK_SIZE, total_batch_size);
+    size_t chunk_size = chunk_end - chunk_start;
+
+    // Create batched grid tensor for this chunk
+    torch::Tensor gtensor = torch::zeros({(long)chunk_size, ntypes, gd, gd, gd}, options);
+
+    // Fill each grid in the chunk
+    for (size_t i = 0; i < chunk_size; i++) {
+      size_t global_idx = chunk_start + i;
+      CoordinateSet lig = make_coordset(lig_coords_batch[global_idx], lig_types_batch[global_idx], lig_typer);
+
+      // Set center from ligand if not specified
+      float3 gcenter = {centers_batch[global_idx].x(), centers_batch[global_idx].y(), centers_batch[global_idx].z()};
+      if (!isfinite(centers_batch[global_idx].x())) {
+        gcenter = lig.center();
+      }
+
+      CoordinateSet combined(rec, lig);
+
+      // Apply rotation if requested (random rotation for each pose)
+      libmolgrid::Transform transform(gcenter, 0, rotate);
+      if (rotate) {
+        transform.forward(combined, combined);
+      }
+
+      // Create grid for this pose
+      Grid<float, 4, isCUDA> out_slice(gtensor[i].data_ptr<float>(), ntypes, gd, gd, gd);
+      gmaker.forward(gcenter, combined, out_slice);
+    }
+
+    // Run batched model inference for this chunk
+    vector<torch::jit::IValue> inputs{gtensor};
+    auto result = module.forward(inputs).toTuple()->elements();
+
+    // Extract results for each pose in chunk
+    auto pose_logits = result[0].toTensor();  // (chunk_size, 2)
+    auto affinities = result[1].toTensor();   // (chunk_size,)
+
+    // Apply softmax if needed and extract scores
+    torch::Tensor pose_scores;
+    if (skip_softmax) {
+      pose_scores = pose_logits.index({"...", 1});  // Just take logit for class 1
+    } else {
+      pose_scores = torch::softmax(pose_logits, 1).index({"...", 1});  // Softmax and take prob for class 1
+    }
+
+    // Convert to CPU for extraction
+    auto pose_scores_cpu = pose_scores.cpu();
+    auto affinities_cpu = affinities.cpu();
+
+    for (size_t i = 0; i < chunk_size; i++) {
+      float pose = pose_scores_cpu[i].item<float>();
+      float aff = affinities_cpu[i].item<float>();
+      all_scores[chunk_start + i] = {pose, aff, 0.0f};  // No loss computed in batch inference mode
+    }
+
+    // Explicitly free GPU memory before next chunk to reduce fragmentation
+    if (isCUDA) {
+      c10::cuda::CUDACachingAllocator::emptyCache();
+    }
+  }
+
+  return all_scores;
 }
 
 template <bool isCUDA> void TorchModel<isCUDA>::getLigandGradient(std::vector<gfloat3> &grad) {
