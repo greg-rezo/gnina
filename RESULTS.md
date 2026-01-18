@@ -785,3 +785,43 @@ Fixed a double-free memory corruption that occurred with >1750 molecules:
 **Root cause**: When `load_smiles_parallel()` returned, both the `rdkit_mols` vector (containing `unique_ptr<RDKit::RWMol>`) and the `models` vector were destroyed simultaneously. RDKit mol objects contained references to OpenBabel data structures, causing memory corruption during concurrent destruction.
 
 **Fix**: Explicitly clear `rdkit_mols` before the function returns, ensuring RDKit objects are fully destroyed before OpenBabel-based model destruction begins.
+
+---
+
+## RDKit Embedding Speed Investigation (2026-01-18)
+
+**Git commit**: `21db9b54`
+
+Investigated alternatives to ETKDGv3 for faster 3D coordinate generation.
+
+### Tested Configurations
+
+| Method | Time | Rate | Notes |
+|--------|------|------|-------|
+| **ETKDGv3** (default) | 121.3s / 2000 mol | **16.5 mol/s** | Best performance |
+| `useRandomCoords=true` | 194.7s / 500 mol | 2.6 mol/s | 6x slower |
+| `ETversion=1`, no torsion prefs | 182.3s / 500 mol | 2.7 mol/s | Still slow |
+
+### Analysis
+
+1. **`useRandomCoords=true` is NOT faster** - Per RDKit blog, it's more robust for difficult molecules but actually slightly slower
+2. **ETKDGv3 is already optimized** - Default since RDKit 2024.03
+3. **Distance geometry is the bottleneck** - All embedding methods run the same core algorithm
+4. **`EmbedMultipleConfs` with threading** gives ~4x speedup for multiple conformers, but we only need one per molecule
+
+### Recommendations
+
+For production virtual screening with SMILES input:
+
+1. **Pre-compute 3D structures offline** - Convert SMILES to SDF beforehand
+2. **Use SDF input** - Skips embedding entirely, ~100 ligands/sec throughput
+3. **Batch molecule preparation** - Run RDKit embedding as a separate preprocessing step
+
+### Pipeline Efficiency
+
+| Input Type | 3D Gen | End-to-End | Notes |
+|------------|--------|------------|-------|
+| SDF (pre-computed) | 0s | ~100 lig/s | Best for production |
+| SMILES (ETKDGv3) | 82% of time | ~13.5 lig/s | RDKit embedding bottleneck |
+
+The GPU BFGS kernel (10% of time, ~136 lig/s) is 8x faster than the embedding step.
