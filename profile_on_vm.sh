@@ -18,7 +18,7 @@ gcloud compute ssh gnina-profile-vm --zone=us-west1-a --tunnel-through-iap --com
     --target-processes all \
     --replay-mode kernel \
     --metrics l1tex__t_sector_hit_rate \
-    --launch-skip 6 \
+    --kernel-name bfgs_parallel_kernel \
     --launch-count 1 \
     /gnina/build/bin/gnina \
       --gpu \
