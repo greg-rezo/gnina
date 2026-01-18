@@ -231,17 +231,17 @@ static std::unique_ptr<RDKit::RWMol> generate_3d_from_smiles_rdkit(
     // Add hydrogens
     RDKit::MolOps::addHs(*mol);
 
-    // Generate 3D coordinates with ETKDGv3 (no MMFF optimization)
+    // Generate 3D coordinates with ETKDGv3 (fast, good quality)
     RDKit::DGeomHelpers::EmbedParameters params = RDKit::DGeomHelpers::ETKDGv3;
     params.randomSeed = -1;  // Use random seed for variety
     int result = RDKit::DGeomHelpers::EmbedMolecule(*mol, params);
 
     // Fallback to random coordinates if embedding fails
     if (result == -1) {
-        RDKit::DGeomHelpers::EmbedParameters fallback_params;
-        fallback_params.useRandomCoords = true;
-        fallback_params.randomSeed = -1;
-        result = RDKit::DGeomHelpers::EmbedMolecule(*mol, fallback_params);
+        RDKit::DGeomHelpers::EmbedParameters fallback;
+        fallback.useRandomCoords = true;
+        fallback.randomSeed = -1;
+        result = RDKit::DGeomHelpers::EmbedMolecule(*mol, fallback);
     }
 
     if (result == -1) {
