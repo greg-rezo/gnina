@@ -672,40 +672,113 @@ gnina --gpu -r receptor.pdb -l ligands.smi --autobox_ligand ref.sdf \
 
 ---
 
-## 10k SMILES with Exhaustiveness=1024 (2026-01-18)
+## 2k SMILES with Exhaustiveness=1024 - Full Timing Breakdown (2026-01-18)
 
-**Git commit**: `b6b034e1` (+ double-free fix)
+**Git commit**: `070563f3`
 
-Updated results with higher exhaustiveness for proper throughput comparison.
+Detailed timing breakdown for SMILES batch docking pipeline.
 
 ### Test Configuration
-- **Input**: 10,000 ChEMBL SMILES
+- **Input**: 2,000 ChEMBL SMILES
 - **Receptor**: 184l_rec.pdb
-- **Exhaustiveness**: 1024 (16x higher than previous test)
+- **Exhaustiveness**: 1024
 - **GPU**: NVIDIA L4 (24GB)
+- **Threads**: 16 (for RDKit embedding)
 - **Build**: Release
 
-### Results
+### Phase Timing Breakdown
+
+| Phase | Time | % of Total | Rate |
+|-------|------|------------|------|
+| **RDKit 3D Embedding** | 121.3s | 82.1% | 16.5 mol/s |
+| **Model Conversion** | 2.3s | 1.6% | 868 mol/s |
+| **Batching + Grid Setup** | ~0.3s | 0.2% | - |
+| **GPU BFGS Kernels** | ~14.7s | 10.0% | ~2.0M poses/s |
+| **Result Collection + Output** | ~9.0s | 6.1% | - |
+| **Total Wall Time** | **147.6s** | 100% | - |
+
+### Overall Throughput
 
 | Metric | Value |
 |--------|-------|
-| Molecules processed | 9,995 (99.95% success) |
-| Total batches | 209 |
-| Total time | 404.4s |
-| **GPU throughput** | **~58-76 ligands/sec** |
-| Time per ligand | 40.5 ms |
-| Best batch throughput | 77,947 poses/sec |
+| Ligands processed | 1,997 (99.85% success) |
+| Total poses | 2,044,928 (1997 × 1024) |
+| Total batches | 42 |
+| **End-to-end throughput** | **13.5 ligands/sec** |
+| **Time per ligand** | **73.9 ms** |
 
-### Comparison: Exhaustiveness 64 vs 1024
+### Bottleneck Analysis
 
-| Exhaustiveness | GPU Throughput | Poses/sec | Notes |
-|----------------|---------------|-----------|-------|
-| 64 | ~2000 lig/s | 250k-350k | Small batches, less GPU utilization |
-| **1024** | **~58-76 lig/s** | 59k-78k | Full GPU utilization, 16x more work |
+The **RDKit 3D embedding is the bottleneck** (82% of runtime). The GPU BFGS kernel is 10% of total time, suggesting:
+1. 3D coordinate generation should be pre-computed for production screening
+2. GPU is underutilized waiting for molecules
+3. With pre-computed 3D structures, throughput would be ~100 ligands/sec
 
-The 26-34x reduction in ligand throughput for 16x more exhaustiveness shows excellent scaling - only ~2x overhead from batch management.
+### GPU Batch Throughput by Molecule Size
 
-### Bug Fix: Double-Free in RDKit/OpenBabel Interop
+All batches have 48 ligands × 1024 poses = 49,152 poses (except batch 41 with 29 ligands).
+
+| Batch | Atoms | Torsions | Total (ms) | Poses/sec | Ligands/sec |
+|-------|-------|----------|------------|-----------|-------------|
+| 0 | 19 | 10 | 96.5 | 509,424 | 497 |
+| 1 | 20 | 9 | 85.0 | 578,445 | 565 |
+| 2 | 20 | 4 | 96.2 | 511,066 | 499 |
+| 3 | 20 | 8 | 103.3 | 475,943 | 465 |
+| 4 | 21 | 10 | 148.7 | 330,578 | 323 |
+| 5 | 21 | 6 | 130.0 | 378,167 | 369 |
+| 6 | 22 | 9 | 132.7 | 370,530 | 362 |
+| 7 | 22 | 5 | 144.0 | 341,440 | 333 |
+| 8 | 23 | 9 | 159.4 | 308,315 | 301 |
+| 9 | 23 | 4 | 177.5 | 276,974 | 271 |
+| 10 | 23 | 6 | 163.5 | 300,581 | 294 |
+| 11 | 24 | 10 | 225.2 | 218,290 | 213 |
+| 12 | 24 | 4 | 174.7 | 281,312 | 275 |
+| 13 | 24 | 6 | 199.0 | 247,020 | 241 |
+| 14 | 25 | 11 | 232.5 | 211,366 | 206 |
+| 15 | 25 | 4 | 207.2 | 237,206 | 232 |
+| 16 | 25 | 6 | 233.6 | 210,439 | 206 |
+| 17 | 26 | 10 | 290.5 | 169,216 | 165 |
+| 18 | 26 | 4 | 223.5 | 219,899 | 215 |
+| 19 | 26 | 6 | 278.2 | 176,660 | 173 |
+| 20 | 27 | 10 | 350.7 | 140,173 | 137 |
+| 21 | 27 | 5 | 278.5 | 176,488 | 172 |
+| 22 | 27 | 6 | 319.4 | 153,873 | 150 |
+| 23 | 28 | 10 | 321.6 | 152,831 | 149 |
+| 24 | 28 | 5 | 341.1 | 144,084 | 141 |
+| 25 | 28 | 8 | 422.7 | 116,280 | 114 |
+| 26 | 29 | 11 | 505.2 | 97,285 | 95 |
+| 27 | 29 | 5 | 523.1 | 93,965 | 92 |
+| 28 | 29 | 8 | 643.0 | 76,437 | 75 |
+| 29 | 30 | 11 | 585.0 | 84,026 | 82 |
+| 30 | 30 | 6 | 559.6 | 87,837 | 86 |
+| 31 | 31 | 11 | 612.1 | 80,296 | 78 |
+| 32 | 31 | 6 | 514.7 | 95,500 | 93 |
+| 33 | 31 | 9 | 705.9 | 69,626 | 68 |
+| 34 | 32 | 11 | 570.6 | 86,143 | 84 |
+| 35 | 33 | 11 | 658.8 | 74,607 | 73 |
+| 36 | 33 | 8 | 623.0 | 78,890 | 77 |
+| 37 | 34 | 10 | 651.6 | 75,428 | 74 |
+| 38 | 35 | 11 | 696.5 | 70,566 | 69 |
+| 39 | 36 | 11 | 707.5 | 69,472 | 68 |
+| 40 | 39 | 10 | 659.8 | 74,500 | 73 |
+| 41 | 46 | 11 | 381.0 | 77,947 | 76 |
+
+### Throughput vs Molecule Size Summary
+
+| Molecule Size | Atoms | Avg Poses/sec | Avg Ligands/sec |
+|---------------|-------|---------------|-----------------|
+| **Small** | 19-22 | 450,000 | 440 |
+| **Medium** | 23-27 | 200,000 | 195 |
+| **Large** | 28-35 | 85,000 | 83 |
+| **Very Large** | 36-46 | 73,000 | 71 |
+
+**Key insight**: Throughput scales roughly as 1/atoms² due to O(n²) pairwise interactions in scoring.
+
+---
+
+## Bug Fix: Double-Free in RDKit/OpenBabel Interop (2026-01-18)
+
+**Git commit**: `070563f3`
 
 Fixed a double-free memory corruption that occurred with >1750 molecules:
 
