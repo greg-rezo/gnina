@@ -7,6 +7,10 @@ find_package(OpenMP)
 
 find_package(jsoncpp REQUIRED)
 
+# RDKit is required for symmetry-aware RMSD calculations and 3D generation
+find_package(RDKit REQUIRED)
+include_directories(${RDKIT_INCLUDE_DIR})
+
 if("${CMAKE_BUILD_TYPE}" STREQUAL "Release" OR "${CMAKE_BUILD_TYPE}" STREQUAL "RelWithDebInfo")
   list(APPEND CUDA_NVCC_FLAGS -O3 --default-stream per-thread -Xptxas -dlcm=ca)
 elseif("${CMAKE_BUILD_TYPE}" STREQUAL "Debug")
@@ -207,6 +211,11 @@ set_property(TARGET gninalibobj PROPERTY POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(gninalibobj ${MODEL_OBJS} jsoncpp_lib)
 add_dependencies(gninalibobj libmolgrid torch)
 
+# Add OpenMP support for parallel SMILES loading
+if(OpenMP_CXX_FOUND)
+    target_compile_options(gninalibobj PRIVATE ${OpenMP_CXX_FLAGS})
+endif()
+
 
 ## Get all properties that cmake supports
 execute_process(COMMAND cmake --help-property-list OUTPUT_VARIABLE CMAKE_PROPERTY_LIST)
@@ -219,11 +228,13 @@ list(REMOVE_DUPLICATES CMAKE_PROPERTY_LIST)
 
 add_library(gninalib_static STATIC $<TARGET_OBJECTS:gninalibobj>)
 set_target_properties(gninalib_static PROPERTIES OUTPUT_NAME gnina)
-target_link_libraries(gninalib_static  ${Boost_LIBRARIES} ${OpenBabel3_LIBRARIES} ${LIBMOLGRID_LIBRARY} ${TORCH_LIBRARIES} jsoncpp_lib ZLIB::ZLIB gninalibobj)
+target_link_libraries(gninalib_static  ${Boost_LIBRARIES} ${OpenBabel3_LIBRARIES} ${LIBMOLGRID_LIBRARY} ${TORCH_LIBRARIES} jsoncpp_lib ZLIB::ZLIB gninalibobj
+    RDKitDistGeomHelpers RDKitForceFieldHelpers RDKitSmilesParse RDKitGraphMol RDKitRDGeneral)
 
 add_library(gninalib SHARED $<TARGET_OBJECTS:gninalibobj>)
 set_target_properties(gninalib PROPERTIES OUTPUT_NAME gnina)
-target_link_libraries(gninalib  ${Boost_LIBRARIES} ${OpenBabel3_LIBRARIES} ${LIBMOLGRID_LIBRARY} ${TORCH_LIBRARIES} jsoncpp_lib ZLIB::ZLIB gninalibobj)
+target_link_libraries(gninalib  ${Boost_LIBRARIES} ${OpenBabel3_LIBRARIES} ${LIBMOLGRID_LIBRARY} ${TORCH_LIBRARIES} jsoncpp_lib ZLIB::ZLIB gninalibobj
+    RDKitDistGeomHelpers RDKitForceFieldHelpers RDKitSmilesParse RDKitGraphMol RDKitRDGeneral)
 
 # MESSAGE(STATUS "variable is: " ${NVCC_FLAGS_EXTRA})
 
@@ -236,6 +247,11 @@ include_directories(${LIBMOLGRID_INCLUDE})
 # compile in libgnina - there are enough dependencies to deal with
 add_executable(gnina main/main.cpp $<TARGET_OBJECTS:gninalibobj> )
 target_link_libraries(gnina  ${Boost_LIBRARIES} ${OpenBabel3_LIBRARIES} ${LIBMOLGRID_LIBRARY} ${TORCH_LIBRARIES} jsoncpp_lib ZLIB::ZLIB gninalibobj)
+
+# Link OpenMP for parallel SMILES loading
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(gnina OpenMP::OpenMP_CXX)
+endif()
 
 add_subdirectory(gninaserver)
 add_subdirectory(pygnina)
@@ -254,12 +270,8 @@ target_link_libraries(tognina   gninalib ${Boost_LIBRARIES} ${OpenBabel3_LIBRARI
 
 install(TARGETS gnina gninagrid gninatyper fromgnina tognina RUNTIME DESTINATION bin)
 
-# RDKit is required for symmetry-aware RMSD calculations
-find_package(RDKit REQUIRED)
-include_directories(${RDKIT_INCLUDE_DIR})
-
-# Link RDKit libraries for symmetry-aware RMSD calculations
-# We need MolAlign for getBestRMS, GraphMol for molecule handling, and their dependencies
+# Link RDKit libraries for symmetry-aware RMSD calculations and 3D generation
+# We need MolAlign for getBestRMS, DistGeomHelpers for EmbedMolecule, and dependencies
 target_link_libraries(gnina
     RDKitMolAlign
     RDKitMolTransforms
@@ -267,6 +279,8 @@ target_link_libraries(gnina
     RDKitGraphMol
     RDKitFileParsers
     RDKitSmilesParse
+    RDKitDistGeomHelpers
+    RDKitForceFieldHelpers
     RDKitRDGeneral
 )
 

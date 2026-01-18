@@ -16,6 +16,14 @@
 #include <boost/iostreams/filter/gzip.hpp>
 #include <map>
 #include <openbabel/obconversion.h>
+#include <openbabel/bond.h>
+
+// RDKit includes for RDKit->OpenBabel conversion
+#include <GraphMol/GraphMol.h>
+#include <GraphMol/Atom.h>
+#include <GraphMol/Bond.h>
+#include <GraphMol/MolOps.h>
+#include <GraphMol/PeriodicTable.h>
 
 namespace GninaConverter {
 
@@ -179,6 +187,88 @@ void convertBinary(OBMol& mol, ostream& out, int rootatom,
 void convertBinary(OpenBabel::OBMol& mol, std::ostream& out) {
   std::vector<int> nr;
   convertBinary(mol, out, 0, nr);
+}
+
+// Convert RDKit ROMol to OpenBabel OBMol
+void convertRDKitToOBMol(const RDKit::ROMol& rdmol, OpenBabel::OBMol& obmol) {
+  obmol.Clear();
+  obmol.BeginModify();
+
+  // Reserve space
+  obmol.ReserveAtoms(rdmol.getNumAtoms());
+
+  // Copy atoms
+  const RDKit::Conformer& conf = rdmol.getConformer();
+  for (unsigned int i = 0; i < rdmol.getNumAtoms(); i++) {
+    const RDKit::Atom* rdatom = rdmol.getAtomWithIdx(i);
+    OBAtom* obatom = obmol.NewAtom();
+
+    // Set atomic number
+    obatom->SetAtomicNum(rdatom->getAtomicNum());
+
+    // Set coordinates
+    const RDGeom::Point3D& pos = conf.getAtomPos(i);
+    obatom->SetVector(pos.x, pos.y, pos.z);
+
+    // Set formal charge
+    obatom->SetFormalCharge(rdatom->getFormalCharge());
+
+    // Set aromaticity
+    if (rdatom->getIsAromatic()) {
+      obatom->SetAromatic();
+    }
+  }
+
+  // Copy bonds
+  for (unsigned int i = 0; i < rdmol.getNumBonds(); i++) {
+    const RDKit::Bond* rdbond = rdmol.getBondWithIdx(i);
+    unsigned int beginIdx = rdbond->getBeginAtomIdx();
+    unsigned int endIdx = rdbond->getEndAtomIdx();
+
+    // OpenBabel uses 1-based indexing
+    int order = 1;
+    switch (rdbond->getBondType()) {
+      case RDKit::Bond::SINGLE: order = 1; break;
+      case RDKit::Bond::DOUBLE: order = 2; break;
+      case RDKit::Bond::TRIPLE: order = 3; break;
+      case RDKit::Bond::AROMATIC: order = 5; break; // OB aromatic
+      default: order = 1; break;
+    }
+
+    obmol.AddBond(beginIdx + 1, endIdx + 1, order);
+
+    // Set aromaticity on bond
+    if (rdbond->getIsAromatic()) {
+      OBBond* obbond = obmol.GetBond(beginIdx + 1, endIdx + 1);
+      if (obbond) {
+        obbond->SetAromatic();
+      }
+    }
+  }
+
+  obmol.EndModify();
+
+  // Set molecule name
+  if (rdmol.hasProp("_Name")) {
+    std::string name;
+    rdmol.getProp("_Name", name);
+    obmol.SetTitle(name);
+  }
+
+  // Perceive properties needed for atom typing
+  obmol.PerceiveBondOrders();
+  obmol.SetAromaticPerceived();
+}
+
+// Convert RDKit mol to smina parsing struct and context
+unsigned convertParsing(const RDKit::ROMol& rdmol, parsing_struct& p, context& c,
+    bool addH) {
+  // Convert RDKit to OpenBabel
+  OBMol obmol;
+  convertRDKitToOBMol(rdmol, obmol);
+
+  // Use existing OpenBabel conversion
+  return convertParsing(obmol, p, c, addH);
 }
 
 } //namespace GninaConverter

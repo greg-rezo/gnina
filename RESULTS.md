@@ -607,3 +607,108 @@ gnina --gpu --batch_size 100000 -r receptor.pdb -l ligands.sdf ...
 # Disable batching (single-ligand mode)
 gnina --gpu --no_batch -r receptor.pdb -l ligands.sdf ...
 ```
+
+---
+
+## Parallel RDKit 3D Generation for SMILES Input (2026-01-18)
+
+**Git commit**: `b6b034e1` (+ uncommitted changes)
+
+Implemented parallel 3D coordinate generation using RDKit instead of OpenBabel for SMILES input files.
+
+### Implementation
+
+- **RDKit EmbedMolecule**: Uses ETKDGv3 distance geometry (no MMFF optimization)
+- **Parallel embedding**: OpenMP parallelization with auto-detected thread count
+- **Serial conversion**: OpenBabel conversion done serially (not thread-safe)
+- **Auto-detection**: `.smi` files automatically use parallel RDKit path
+
+### Performance Results (10k ChEMBL SMILES, L4 GPU)
+
+| Phase | Time | Rate |
+|-------|------|------|
+| **RDKit 3D Embedding** | 142.4s | 70.2 mol/s (16 threads) |
+| **Model Conversion** | 11.7s | 854 mol/s (serial) |
+| **GPU Docking** | 7.9s | ~2000 ligands/sec avg |
+| **Total** | ~162s | **61.7 ligands/sec end-to-end** |
+
+**Success rate**: 9995/10000 (99.95%)
+
+### Comparison to Previous Implementation
+
+| Method | 3D Generation Rate | Notes |
+|--------|-------------------|-------|
+| OpenBabel serial | ~1.5 mol/s | Thread-unsafe, slow |
+| **RDKit parallel (16 threads)** | **70.2 mol/s** | **47x faster** |
+
+### Batch Processing Details
+
+The 10k molecules were grouped into 13 GPU batches by atom count:
+
+| Batch | Ligands | Poses | Max Atoms | Throughput |
+|-------|---------|-------|-----------|------------|
+| 0-2 | 781 each | 49,984 | 20-23 | 250k-357k p/s |
+| 3-6 | 781 each | 49,984 | 24-28 | 115k-203k p/s |
+| 7-11 | 781 each | 49,984 | 29-36 | 65k-107k p/s |
+| 12 | 623 | 39,872 | 47 | 66k p/s |
+
+### Usage
+
+```bash
+# SMILES input automatically uses parallel RDKit
+gnina --gpu -r receptor.pdb -l ligands.smi --autobox_ligand ref.sdf \
+    --exhaustiveness 64 -o output.sdf
+
+# Works with any .smi or .smiles file
+```
+
+### Files Modified
+
+- `gninasrc/lib/GninaConverter.h` - Added RDKit overloads
+- `gninasrc/lib/GninaConverter.cpp` - Implemented RDKit→OpenBabel conversion
+- `gninasrc/lib/ligand_batch_manager.cpp` - Parallel RDKit 3D generation
+- `gninasrc/main/main.cpp` - Auto-detect `.smi` files and use parallel loader
+- `gninasrc/CMakeLists.txt` - Added RDKit DistGeomHelpers library
+
+---
+
+## 10k SMILES with Exhaustiveness=1024 (2026-01-18)
+
+**Git commit**: `b6b034e1` (+ double-free fix)
+
+Updated results with higher exhaustiveness for proper throughput comparison.
+
+### Test Configuration
+- **Input**: 10,000 ChEMBL SMILES
+- **Receptor**: 184l_rec.pdb
+- **Exhaustiveness**: 1024 (16x higher than previous test)
+- **GPU**: NVIDIA L4 (24GB)
+- **Build**: Release
+
+### Results
+
+| Metric | Value |
+|--------|-------|
+| Molecules processed | 9,995 (99.95% success) |
+| Total batches | 209 |
+| Total time | 404.4s |
+| **GPU throughput** | **~58-76 ligands/sec** |
+| Time per ligand | 40.5 ms |
+| Best batch throughput | 77,947 poses/sec |
+
+### Comparison: Exhaustiveness 64 vs 1024
+
+| Exhaustiveness | GPU Throughput | Poses/sec | Notes |
+|----------------|---------------|-----------|-------|
+| 64 | ~2000 lig/s | 250k-350k | Small batches, less GPU utilization |
+| **1024** | **~58-76 lig/s** | 59k-78k | Full GPU utilization, 16x more work |
+
+The 26-34x reduction in ligand throughput for 16x more exhaustiveness shows excellent scaling - only ~2x overhead from batch management.
+
+### Bug Fix: Double-Free in RDKit/OpenBabel Interop
+
+Fixed a double-free memory corruption that occurred with >1750 molecules:
+
+**Root cause**: When `load_smiles_parallel()` returned, both the `rdkit_mols` vector (containing `unique_ptr<RDKit::RWMol>`) and the `models` vector were destroyed simultaneously. RDKit mol objects contained references to OpenBabel data structures, causing memory corruption during concurrent destruction.
+
+**Fix**: Explicitly clear `rdkit_mols` before the function returns, ensuring RDKit objects are fully destroyed before OpenBabel-based model destruction begins.

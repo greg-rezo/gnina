@@ -113,6 +113,15 @@ public:
         int verbosity = 1
     );
 
+    // Phase 1 (parallel): Load SMILES files with parallel 3D generation
+    // Much faster than serial OpenBabel for SMILES input
+    size_t load_smiles_parallel(
+        const std::vector<std::string>& ligand_names,
+        tee& log,
+        int num_threads = 0,  // 0 = auto-detect
+        int verbosity = 1
+    );
+
     // Phase 2: Sort ligands by size and group into batches
     void sort_and_group_ligands(int verbosity = 1);
 

@@ -19,6 +19,7 @@ set -e
 # Defaults
 JOBS=""
 CLEAN=false
+DEBUG=false
 SRC_DIR="/gnina/src"
 BUILD_DIR="/gnina/build"
 
@@ -31,6 +32,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --clean)
             CLEAN=true
+            shift
+            ;;
+        --debug)
+            DEBUG=true
             shift
             ;;
         --src)
@@ -89,15 +94,27 @@ cd "$BUILD_DIR"
 
 # Only run cmake if build.ninja doesn't exist (first run or after clean)
 if [ ! -f build.ninja ]; then
-    echo "Running cmake with Ninja..."
-    cmake "$SRC_DIR" \
-        -G Ninja \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DBUILD_TESTING=ON \
-        -DLIBMOLGRID_LIBRARY=/usr/local/lib/libmolgrid.so \
-        -DLIBMOLGRID_INCLUDE=/usr/local/include \
-        -DCMAKE_PREFIX_PATH="/opt/libtorch" \
-        -DCMAKE_CUDA_ARCHITECTURES="89"
+    if [ "$DEBUG" = true ]; then
+        echo "Running cmake with Ninja (DEBUG mode)..."
+        cmake "$SRC_DIR" \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DBUILD_TESTING=ON \
+            -DLIBMOLGRID_LIBRARY=/usr/local/lib/libmolgrid.so \
+            -DLIBMOLGRID_INCLUDE=/usr/local/include \
+            -DCMAKE_PREFIX_PATH="/opt/libtorch" \
+            -DCMAKE_CUDA_ARCHITECTURES="89"
+    else
+        echo "Running cmake with Ninja..."
+        cmake "$SRC_DIR" \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=ON \
+            -DLIBMOLGRID_LIBRARY=/usr/local/lib/libmolgrid.so \
+            -DLIBMOLGRID_INCLUDE=/usr/local/include \
+            -DCMAKE_PREFIX_PATH="/opt/libtorch" \
+            -DCMAKE_CUDA_ARCHITECTURES="89"
+    fi
     echo ""
 fi
 

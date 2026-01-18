@@ -18,6 +18,10 @@
 #include <vector>
 #include <algorithm>
 
+// Thrust for spatial sorting
+#include <thrust/device_ptr.h>
+#include <thrust/sort.h>
+
 // Debug mode - uncomment to enable verbose kernel debug output
 #define BFGS_DEBUG
 
@@ -106,6 +110,136 @@ __device__ inline float normalize_angle_device(float a) {
     if (a > pi) a -= 2*pi;
     if (a < -pi) a += 2*pi;
     return a;
+}
+
+// ============================================================================
+// Spatial Sorting for Cache Locality
+// ============================================================================
+// Sort poses by 3D position using Morton codes (Z-order curve) so that
+// adjacent threads/blocks process spatially-nearby poses, improving L1 cache hit rate.
+
+// Morton encoding: spread bits of a 10-bit integer for 3D interleaving
+__device__ __forceinline__ unsigned int morton_spread_bits(unsigned int v) {
+    v = (v | (v << 16)) & 0x030000FF;
+    v = (v | (v <<  8)) & 0x0300F00F;
+    v = (v | (v <<  4)) & 0x030C30C3;
+    v = (v | (v <<  2)) & 0x09249249;
+    return v;
+}
+
+// Encode 3D grid cell coordinates into Morton code
+__device__ __forceinline__ unsigned int morton_encode_3d(unsigned int x, unsigned int y, unsigned int z) {
+    return morton_spread_bits(x) | (morton_spread_bits(y) << 1) | (morton_spread_bits(z) << 2);
+}
+
+// Kernel to compute Morton-encoded cell IDs for each pose based on position
+__global__ void compute_pose_cell_ids_kernel(
+    const float* __restrict__ confs,      // [n_poses * n_conf]
+    unsigned int* __restrict__ cell_ids,  // [n_poses] output
+    int* __restrict__ pose_indices,       // [n_poses] initialized to 0,1,2,...
+    int n_poses,
+    int n_conf,
+    float3 box_min,
+    float3 box_size,
+    int grid_divisions  // e.g., 8 -> 8x8x8 = 512 cells
+) {
+    int pose_id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pose_id >= n_poses) return;
+
+    // Pose position is first 3 floats (translation x, y, z)
+    float px = confs[pose_id * n_conf + 0];
+    float py = confs[pose_id * n_conf + 1];
+    float pz = confs[pose_id * n_conf + 2];
+
+    // Normalize to [0, grid_divisions) range
+    float inv_size_x = (box_size.x > 0) ? grid_divisions / box_size.x : 0;
+    float inv_size_y = (box_size.y > 0) ? grid_divisions / box_size.y : 0;
+    float inv_size_z = (box_size.z > 0) ? grid_divisions / box_size.z : 0;
+
+    int cx = min(grid_divisions - 1, max(0, (int)((px - box_min.x) * inv_size_x)));
+    int cy = min(grid_divisions - 1, max(0, (int)((py - box_min.y) * inv_size_y)));
+    int cz = min(grid_divisions - 1, max(0, (int)((pz - box_min.z) * inv_size_z)));
+
+    // Morton code for Z-order curve spatial locality
+    cell_ids[pose_id] = morton_encode_3d(cx, cy, cz);
+    pose_indices[pose_id] = pose_id;
+}
+
+// Kernel to reorder conformations according to sorted indices
+__global__ void reorder_confs_kernel(
+    const float* __restrict__ confs_in,       // [n_poses * n_conf]
+    float* __restrict__ confs_out,            // [n_poses * n_conf]
+    const int* __restrict__ sorted_indices,   // [n_poses]
+    int n_poses,
+    int n_conf
+) {
+    int new_pose_id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (new_pose_id >= n_poses) return;
+
+    int old_pose_id = sorted_indices[new_pose_id];
+
+    // Copy all n_conf floats for this pose
+    const float* src = confs_in + old_pose_id * n_conf;
+    float* dst = confs_out + new_pose_id * n_conf;
+    for (int i = 0; i < n_conf; i++) {
+        dst[i] = src[i];
+    }
+}
+
+// Host function to sort poses spatially for better cache locality
+void sort_poses_spatially(
+    float* d_confs,           // Device pointer to conformations, will be reordered
+    int n_poses,
+    int n_conf,
+    float3 box_min,
+    float3 box_max,
+    int verbosity
+) {
+    const int GRID_DIVISIONS = 8;  // 8x8x8 = 512 cells
+    float3 box_size = make_float3(box_max.x - box_min.x, box_max.y - box_min.y, box_max.z - box_min.z);
+
+    // Allocate temporary buffers
+    unsigned int* d_cell_ids;
+    int* d_pose_indices;
+    float* d_confs_sorted;
+
+    CUDA_CHECK_GNINA(cudaMalloc(&d_cell_ids, n_poses * sizeof(unsigned int)));
+    CUDA_CHECK_GNINA(cudaMalloc(&d_pose_indices, n_poses * sizeof(int)));
+    CUDA_CHECK_GNINA(cudaMalloc(&d_confs_sorted, n_poses * n_conf * sizeof(float)));
+
+    // Step 1: Compute cell IDs for each pose
+    int block_size = 256;
+    int grid_size = (n_poses + block_size - 1) / block_size;
+    compute_pose_cell_ids_kernel<<<grid_size, block_size>>>(
+        d_confs, d_cell_ids, d_pose_indices,
+        n_poses, n_conf, box_min, box_size, GRID_DIVISIONS
+    );
+    CUDA_CHECK_GNINA(cudaDeviceSynchronize());
+
+    // Step 2: Sort pose indices by cell ID using thrust
+    thrust::device_ptr<unsigned int> keys(d_cell_ids);
+    thrust::device_ptr<int> values(d_pose_indices);
+    thrust::sort_by_key(keys, keys + n_poses, values);
+
+    // Step 3: Reorder confs according to sorted indices
+    reorder_confs_kernel<<<grid_size, block_size>>>(
+        d_confs, d_confs_sorted, d_pose_indices,
+        n_poses, n_conf
+    );
+    CUDA_CHECK_GNINA(cudaDeviceSynchronize());
+
+    // Step 4: Copy sorted confs back to original buffer
+    CUDA_CHECK_GNINA(cudaMemcpy(d_confs, d_confs_sorted, n_poses * n_conf * sizeof(float), cudaMemcpyDeviceToDevice));
+
+    // Cleanup temporary buffers
+    cudaFree(d_cell_ids);
+    cudaFree(d_pose_indices);
+    cudaFree(d_confs_sorted);
+
+    if (verbosity >= 1) {
+        fprintf(stderr, "  Spatial sorting: %d poses into %d^3 grid cells\n",
+                n_poses, GRID_DIVISIONS);
+    }
 }
 
 // ============================================================================
@@ -1458,6 +1592,18 @@ void launch_parallel_bfgs(
         make_float3(box_min.x, box_min.y, box_min.z),
         make_float3(box_max.x, box_max.y, box_max.z),
         random_seed
+    );
+    CUDA_CHECK_GNINA(cudaDeviceSynchronize());
+
+    // Sort poses spatially for better L1 cache locality
+    // Adjacent threads will process spatially-nearby poses, improving grid cache reuse
+    sort_poses_spatially(
+        d_initial_confs,
+        batch.total_optimizers,
+        mem.max_conf_size,
+        make_float3(box_min.x, box_min.y, box_min.z),
+        make_float3(box_max.x, box_max.y, box_max.z),
+        verbosity
     );
 
     // Run BFGS

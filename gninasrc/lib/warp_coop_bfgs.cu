@@ -17,8 +17,164 @@
 #include <stdexcept>
 #include <sstream>
 
+// Thrust for spatial sorting (DISABLED - warp_coop not actively developed)
+// #include <thrust/device_ptr.h>
+// #include <thrust/sort.h>
+// #include <thrust/sequence.h>
+
 // Debug mode - uncomment to enable verbose kernel debug output
 // #define WARP_COOP_DEBUG
+
+// Error checking macro (defined early for spatial sorting functions)
+#define CUDA_CHECK_WARP(call) do { \
+    cudaError_t err = call; \
+    if (err != cudaSuccess) { \
+        fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, \
+                cudaGetErrorString(err)); \
+    } \
+} while(0)
+
+// ============================================================================
+// Spatial Sorting for Cache Locality (DISABLED - warp_coop not actively developed)
+// ============================================================================
+// See bfgs_parallel.cu for active spatial sorting implementation
+#if 0
+// Sort poses by 3D position using Morton codes (Z-order curve) so that
+// adjacent threads/warps process spatially-nearby poses, improving L1 cache hit rate.
+
+// Morton encoding: spread bits of a 10-bit integer for 3D interleaving
+__device__ __forceinline__ unsigned int morton_spread_bits(unsigned int v) {
+    v = (v | (v << 16)) & 0x030000FF;
+    v = (v | (v <<  8)) & 0x0300F00F;
+    v = (v | (v <<  4)) & 0x030C30C3;
+    v = (v | (v <<  2)) & 0x09249249;
+    return v;
+}
+
+// Encode 3D grid cell coordinates into Morton code
+__device__ __forceinline__ unsigned int morton_encode_3d(unsigned int x, unsigned int y, unsigned int z) {
+    return morton_spread_bits(x) | (morton_spread_bits(y) << 1) | (morton_spread_bits(z) << 2);
+}
+
+// Kernel to compute Morton-encoded cell IDs for each pose based on position
+__global__ void compute_pose_cell_ids_kernel(
+    const float* __restrict__ confs,      // [n_poses * n_conf]
+    unsigned int* __restrict__ cell_ids,  // [n_poses] output
+    int* __restrict__ pose_indices,       // [n_poses] initialized to 0,1,2,...
+    int n_poses,
+    int n_conf,
+    gfloat3 box_min,
+    gfloat3 box_size,
+    int grid_divisions  // e.g., 8 -> 8x8x8 = 512 cells
+) {
+    int pose_id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pose_id >= n_poses) return;
+
+    // Pose position is first 3 floats (translation x, y, z)
+    float px = confs[pose_id * n_conf + 0];
+    float py = confs[pose_id * n_conf + 1];
+    float pz = confs[pose_id * n_conf + 2];
+
+    // Normalize to [0, grid_divisions) range
+    float inv_size_x = (box_size.x > 0) ? grid_divisions / box_size.x : 0;
+    float inv_size_y = (box_size.y > 0) ? grid_divisions / box_size.y : 0;
+    float inv_size_z = (box_size.z > 0) ? grid_divisions / box_size.z : 0;
+
+    int cx = min(grid_divisions - 1, max(0, (int)((px - box_min.x) * inv_size_x)));
+    int cy = min(grid_divisions - 1, max(0, (int)((py - box_min.y) * inv_size_y)));
+    int cz = min(grid_divisions - 1, max(0, (int)((pz - box_min.z) * inv_size_z)));
+
+    // Morton code for Z-order curve spatial locality
+    cell_ids[pose_id] = morton_encode_3d(cx, cy, cz);
+    pose_indices[pose_id] = pose_id;
+}
+
+// Kernel to reorder conformations according to sorted indices
+__global__ void reorder_confs_kernel(
+    const float* __restrict__ confs_in,       // [n_poses * n_conf]
+    float* __restrict__ confs_out,            // [n_poses * n_conf]
+    const int* __restrict__ sorted_indices,   // [n_poses]
+    int* __restrict__ original_indices,       // [n_poses] output: maps new pose index -> original
+    int n_poses,
+    int n_conf
+) {
+    int new_pose_id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (new_pose_id >= n_poses) return;
+
+    int old_pose_id = sorted_indices[new_pose_id];
+
+    // Store mapping from new index to original index
+    original_indices[new_pose_id] = old_pose_id;
+
+    // Copy all n_conf floats for this pose
+    const float* src = confs_in + old_pose_id * n_conf;
+    float* dst = confs_out + new_pose_id * n_conf;
+    for (int i = 0; i < n_conf; i++) {
+        dst[i] = src[i];
+    }
+}
+
+// Host function to sort poses spatially for better cache locality
+// Returns device pointer to original_indices array (caller must free)
+int* sort_poses_spatially(
+    float* d_confs,           // Device pointer to conformations, will be reordered
+    int n_poses,
+    int n_conf,
+    gfloat3 box_min,
+    gfloat3 box_max,
+    int verbosity
+) {
+    const int GRID_DIVISIONS = 8;  // 8x8x8 = 512 cells
+    gfloat3 box_size = {box_max.x - box_min.x, box_max.y - box_min.y, box_max.z - box_min.z};
+
+    // Allocate temporary buffers
+    unsigned int* d_cell_ids;
+    int* d_pose_indices;
+    int* d_original_indices;
+    float* d_confs_sorted;
+
+    CUDA_CHECK_WARP(cudaMalloc(&d_cell_ids, n_poses * sizeof(unsigned int)));
+    CUDA_CHECK_WARP(cudaMalloc(&d_pose_indices, n_poses * sizeof(int)));
+    CUDA_CHECK_WARP(cudaMalloc(&d_original_indices, n_poses * sizeof(int)));
+    CUDA_CHECK_WARP(cudaMalloc(&d_confs_sorted, n_poses * n_conf * sizeof(float)));
+
+    // Step 1: Compute cell IDs for each pose
+    int block_size = 256;
+    int grid_size = (n_poses + block_size - 1) / block_size;
+    compute_pose_cell_ids_kernel<<<grid_size, block_size>>>(
+        d_confs, d_cell_ids, d_pose_indices,
+        n_poses, n_conf, box_min, box_size, GRID_DIVISIONS
+    );
+    CUDA_CHECK_WARP(cudaDeviceSynchronize());
+
+    // Step 2: Sort pose indices by cell ID using thrust
+    thrust::device_ptr<unsigned int> keys(d_cell_ids);
+    thrust::device_ptr<int> values(d_pose_indices);
+    thrust::sort_by_key(keys, keys + n_poses, values);
+
+    // Step 3: Reorder confs according to sorted indices
+    reorder_confs_kernel<<<grid_size, block_size>>>(
+        d_confs, d_confs_sorted, d_pose_indices, d_original_indices,
+        n_poses, n_conf
+    );
+    CUDA_CHECK_WARP(cudaDeviceSynchronize());
+
+    // Step 4: Copy sorted confs back to original buffer
+    CUDA_CHECK_WARP(cudaMemcpy(d_confs, d_confs_sorted, n_poses * n_conf * sizeof(float), cudaMemcpyDeviceToDevice));
+
+    // Cleanup temporary buffers (but keep original_indices)
+    cudaFree(d_cell_ids);
+    cudaFree(d_pose_indices);
+    cudaFree(d_confs_sorted);
+
+    if (verbosity >= 1) {
+        fprintf(stderr, "  Spatial sorting: %d poses into %d^3 grid cells\n",
+                n_poses, GRID_DIVISIONS);
+    }
+
+    return d_original_indices;  // Caller must free this
+}
+#endif
 
 // Use inline single-threaded computation for debugging
 // #define USE_INLINE_DEBUG
@@ -28,15 +184,6 @@
 #else
 #define WARP_DEBUG_PRINT(fmt, ...) ((void)0)
 #endif
-
-// Error checking macro
-#define CUDA_CHECK_WARP(call) do { \
-    cudaError_t err = call; \
-    if (err != cudaSuccess) { \
-        fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, \
-                cudaGetErrorString(err)); \
-    } \
-} while(0)
 
 // Normalize angle to [-pi, pi] (matches reference)
 __device__ inline float normalize_angle_warp(float a) {
@@ -1686,6 +1833,8 @@ void run_warp_coop_bfgs_docking(
     );
     CUDA_CHECK_WARP(cudaDeviceSynchronize());
     fprintf(stderr, "DEBUG: init_random_confs_kernel done\n");
+
+    // Spatial sorting disabled for warp_coop - see bfgs_parallel.cu instead
 
     // Check for kernel launch errors
     cudaError_t err = cudaGetLastError();

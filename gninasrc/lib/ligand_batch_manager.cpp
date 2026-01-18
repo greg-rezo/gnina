@@ -11,6 +11,19 @@
 #include <cuda_runtime.h>
 #include <iostream>
 #include <iomanip>
+#include <fstream>
+#include <sstream>
+#include <chrono>
+#include <omp.h>
+#include "parsing.h"
+#include "parse_pdbqt.h"
+#include "GninaConverter.h"
+
+// RDKit includes for parallel 3D generation (thread-safe)
+#include <GraphMol/GraphMol.h>
+#include <GraphMol/SmilesParse/SmilesParse.h>
+#include <GraphMol/MolOps.h>
+#include <GraphMol/DistGeomHelpers/Embedder.h>
 
 // ============================================================================
 // LigandBatchGroup Methods
@@ -145,6 +158,21 @@ size_t LigandBatchManager::load_all_ligands(
                 extract_size_metrics(*desc.m, desc.num_atoms, desc.num_torsions,
                                    desc.num_nodes, desc.n_conf, desc.n_change);
 
+                // Skip molecules that are too large for GPU processing
+                // (peptides, macrocycles, etc. cause memory issues)
+                const unsigned int MAX_ATOMS = 150;
+                const unsigned int MAX_TORSIONS = 30;
+                if (desc.num_atoms > MAX_ATOMS || desc.num_torsions > MAX_TORSIONS) {
+                    skipped++;
+                    if (verbosity >= 1) {
+                        log << "Warning: Skipping molecule " << lig_id << " (" << desc.name
+                            << ") - too large (atoms=" << desc.num_atoms
+                            << ", torsions=" << desc.num_torsions << ")\n";
+                    }
+                    lig_id++;
+                    continue;
+                }
+
                 if (verbosity >= 2) {
                     log << "Loaded ligand " << desc.ligand_id << ": " << desc.name
                         << " (atoms=" << desc.num_atoms
@@ -177,6 +205,238 @@ size_t LigandBatchManager::load_all_ligands(
 
     if (verbosity >= 1) {
         log << "Loaded " << all_ligands.size() << " ligands for batch docking\n";
+    }
+
+    return all_ligands.size();
+}
+
+// Helper struct for parallel SMILES processing
+struct SmilesEntry {
+    std::string smiles;
+    std::string name;
+    unsigned int original_index;
+};
+
+// Process a single SMILES to RDKit RWMol with 3D coords (thread-safe)
+// Uses RDKit EmbedMolecule with ETKDGv3 - no force field optimization
+static std::unique_ptr<RDKit::RWMol> generate_3d_from_smiles_rdkit(
+    const std::string& smiles, const std::string& name) {
+
+    // Parse SMILES
+    std::unique_ptr<RDKit::RWMol> mol(RDKit::SmilesToMol(smiles));
+    if (!mol || mol->getNumAtoms() == 0) {
+        return nullptr;
+    }
+
+    // Add hydrogens
+    RDKit::MolOps::addHs(*mol);
+
+    // Generate 3D coordinates with ETKDGv3 (no MMFF optimization)
+    RDKit::DGeomHelpers::EmbedParameters params = RDKit::DGeomHelpers::ETKDGv3;
+    params.randomSeed = -1;  // Use random seed for variety
+    int result = RDKit::DGeomHelpers::EmbedMolecule(*mol, params);
+
+    // Fallback to random coordinates if embedding fails
+    if (result == -1) {
+        RDKit::DGeomHelpers::EmbedParameters fallback_params;
+        fallback_params.useRandomCoords = true;
+        fallback_params.randomSeed = -1;
+        result = RDKit::DGeomHelpers::EmbedMolecule(*mol, fallback_params);
+    }
+
+    if (result == -1) {
+        return nullptr;
+    }
+
+    // Set molecule name
+    mol->setProp("_Name", name);
+
+    return mol;
+}
+
+size_t LigandBatchManager::load_smiles_parallel(
+    const std::vector<std::string>& ligand_names,
+    tee& log,
+    int num_threads,
+    int verbosity
+) {
+    all_ligands.clear();
+
+    // Step 1: Read all SMILES entries (serial, fast)
+    std::vector<SmilesEntry> entries;
+    unsigned int idx = 0;
+
+    for (const std::string& fname : ligand_names) {
+        // Check if file is SMILES format
+        std::string ext = fname.substr(fname.find_last_of(".") + 1);
+        if (ext != "smi" && ext != "smiles") {
+            log << "Warning: load_smiles_parallel only supports .smi files, skipping: " << fname << "\n";
+            continue;
+        }
+
+        std::ifstream infile(fname);
+        if (!infile) {
+            log << "Warning: Cannot open file: " << fname << "\n";
+            continue;
+        }
+
+        std::string line;
+        while (std::getline(infile, line)) {
+            if (line.empty()) continue;
+
+            std::istringstream iss(line);
+            SmilesEntry entry;
+            iss >> entry.smiles;
+
+            // Name is optional (second column or after tab)
+            if (iss >> entry.name) {
+                // Got name
+            } else {
+                entry.name = "mol_" + std::to_string(idx);
+            }
+
+            entry.original_index = idx++;
+            entries.push_back(std::move(entry));
+        }
+    }
+
+    if (entries.empty()) {
+        log << "No SMILES entries found\n";
+        return 0;
+    }
+
+    if (verbosity >= 1) {
+        log << "Read " << entries.size() << " SMILES entries\n";
+    }
+
+    // Step 2: Set up thread count
+    if (num_threads <= 0) {
+        num_threads = omp_get_max_threads();
+    }
+
+    if (verbosity >= 1) {
+        log << "Generating 3D coordinates with " << num_threads << " threads...\n";
+    }
+
+    // Step 3: Generate 3D coordinates in parallel using RDKit (thread-safe)
+    std::vector<std::unique_ptr<RDKit::RWMol>> rdkit_mols(entries.size());
+
+    auto start_time = std::chrono::high_resolution_clock::now();
+
+    #pragma omp parallel for num_threads(num_threads) schedule(dynamic, 10)
+    for (size_t i = 0; i < entries.size(); i++) {
+        const SmilesEntry& entry = entries[i];
+        try {
+            rdkit_mols[i] = generate_3d_from_smiles_rdkit(entry.smiles, entry.name);
+        } catch (...) {
+            // Failed - leave as nullptr
+        }
+    }
+
+    auto embed_time = std::chrono::high_resolution_clock::now();
+    double embed_elapsed = std::chrono::duration<double>(embed_time - start_time).count();
+
+    if (verbosity >= 1) {
+        size_t success_count = 0;
+        for (const auto& mol : rdkit_mols) {
+            if (mol) success_count++;
+        }
+        double rate = entries.size() / embed_elapsed;
+        log << "RDKit 3D embedding: " << std::fixed << std::setprecision(1)
+            << embed_elapsed << "s, " << rate << " mol/s, "
+            << success_count << "/" << entries.size() << " succeeded\n";
+    }
+
+    // Step 4: Convert to gnina models serially (OpenBabel not thread-safe)
+    std::vector<std::unique_ptr<model>> models(entries.size());
+    std::vector<bool> success_flags(entries.size(), false);
+
+    for (size_t i = 0; i < entries.size(); i++) {
+        if (!rdkit_mols[i]) continue;
+
+        const SmilesEntry& entry = entries[i];
+        try {
+            // Convert RDKit mol to gnina model via GninaConverter (uses OpenBabel internally)
+            auto m = std::make_unique<model>();
+            m->set_name(entry.name);
+
+            parsing_struct p;
+            context c;
+            unsigned torsdof = GninaConverter::convertParsing(*rdkit_mols[i], p, c, true);
+
+            non_rigid_parsed nr;
+            postprocess_ligand(nr, p, c, torsdof);
+
+            pdbqt_initializer tmp;
+            tmp.initialize_from_nrp(nr, c, true);
+            tmp.initialize(nr.mobility_matrix());
+            m->append(tmp.m);
+
+            models[i] = std::move(m);
+            success_flags[i] = true;
+        } catch (...) {
+            // Failed - leave as nullptr
+        }
+    }
+
+    auto convert_time = std::chrono::high_resolution_clock::now();
+    double convert_elapsed = std::chrono::duration<double>(convert_time - embed_time).count();
+
+    if (verbosity >= 1) {
+        size_t convert_count = 0;
+        for (const auto& flag : success_flags) {
+            if (flag) convert_count++;
+        }
+        log << "Model conversion: " << std::fixed << std::setprecision(1)
+            << convert_elapsed << "s, " << convert_count << " models created\n";
+    }
+
+    // Clear RDKit mols to free memory and avoid double-free on destruction
+    // (RDKit mol destruction must complete before OpenBabel-based models are destroyed)
+    rdkit_mols.clear();
+    rdkit_mols.shrink_to_fit();
+
+    // Step 5: Collect successful results
+    unsigned int skipped = 0;
+    const unsigned int MAX_ATOMS = 150;
+    const unsigned int MAX_TORSIONS = 30;
+
+    for (size_t i = 0; i < entries.size(); i++) {
+        if (!success_flags[i] || !models[i]) {
+            skipped++;
+            continue;
+        }
+
+        LigandDescriptor desc;
+        desc.ligand_id = entries[i].original_index;
+        desc.name = entries[i].name;
+        desc.m = std::move(models[i]);
+
+        extract_size_metrics(*desc.m, desc.num_atoms, desc.num_torsions,
+                           desc.num_nodes, desc.n_conf, desc.n_change);
+
+        // Skip molecules that are too large
+        if (desc.num_atoms > MAX_ATOMS || desc.num_torsions > MAX_TORSIONS) {
+            skipped++;
+            if (verbosity >= 1) {
+                log << "Warning: Skipping molecule " << desc.name
+                    << " - too large (atoms=" << desc.num_atoms
+                    << ", torsions=" << desc.num_torsions << ")\n";
+            }
+            continue;
+        }
+
+        all_ligands.push_back(std::move(desc));
+    }
+
+    if (verbosity >= 1) {
+        double total_elapsed = embed_elapsed + convert_elapsed;
+        log << "Loaded " << all_ligands.size() << " ligands in "
+            << std::fixed << std::setprecision(1) << total_elapsed << "s";
+        if (skipped > 0) {
+            log << " (skipped " << skipped << ")";
+        }
+        log << "\n";
     }
 
     return all_ligands.size();

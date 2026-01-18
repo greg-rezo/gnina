@@ -52,7 +52,7 @@
 #include "flexinfo.h"
 #include "gpucode.h"
 #include "bfgs_parallel.h"
-#include "warp_coop_bfgs.h"
+// #include "warp_coop_bfgs.h"  // Disabled - using standard GPU BFGS instead
 #include "ligand_batch_manager.h"
 #include "grid.h"
 #include "molgetter.h"
@@ -718,23 +718,12 @@ void do_search(model &m, const boost::optional<model> &ref, const boost::optiona
       std::vector<std::vector<float>> conformations;
 
       if (settings.warp_coop) {
-          // Use warp-cooperative BFGS kernel (experimental)
-          try {
-              run_warp_coop_bfgs_docking_default(
-                  m.gdata, cacheInfo,
-                  settings.exhaustiveness,
-                  settings.bfgs_iterations,
-                  box_min, box_max,
-                  settings.seed,
-                  energies, conformations,
-                  settings.verbosity
-              );
-          } catch (const std::runtime_error& e) {
-              std::cerr << "Error: " << e.what() << std::endl;
-              throw;  // Re-throw to be caught by main()
-          }
-      } else {
-          run_parallel_bfgs_docking(
+          // Warp-cooperative kernel is disabled - use standard GPU kernel instead
+          std::cerr << "WARNING: --warp_coop is disabled, using standard GPU BFGS instead.\n";
+      }
+
+      // Use standard parallel BFGS kernel
+      run_parallel_bfgs_docking(
               m.gdata, cacheInfo,
               settings.exhaustiveness,
               settings.bfgs_iterations,
@@ -746,7 +735,6 @@ void do_search(model &m, const boost::optional<model> &ref, const boost::optiona
               settings.direct_pairwise ? &receptor_coords : nullptr,
               settings.direct_pairwise ? &receptor_types : nullptr
           );
-      }
 
       done(settings.verbosity, log);
 
@@ -1898,15 +1886,8 @@ Thank you!\n";
       minparms.type = minimization_params::BFGSAccurateLineSearch;
     }
 
-    // --warp_coop implies --gpu (both use GPU-based BFGS)
-    if (settings.warp_coop) {
-      settings.gpu = true;
-      // Fail early if GPU is not available
-      if (!torch::cuda::is_available()) {
-        std::cerr << "ERROR: --warp_coop requires GPU but no CUDA device is available.\n";
-        return 1;
-      }
-    }
+    // --warp_coop is disabled - the flag still exists but just prints a warning
+    // and uses the standard GPU BFGS kernel instead
 
      // output banner
     log << cite_message << '\n';
@@ -2174,7 +2155,23 @@ Thank you!\n";
       batch_mgr.exhaustiveness = settings.exhaustiveness;
       batch_mgr.max_gpu_memory = (size_t)(LigandBatchManager::get_available_gpu_memory() * 0.8);
 
-      size_t num_loaded = batch_mgr.load_all_ligands(mols, ligand_names, log, settings.verbosity);
+      // Check if all inputs are SMILES files - use parallel RDKit loader if so
+      bool all_smiles = true;
+      for (const auto& fname : ligand_names) {
+        std::string ext = fname.substr(fname.find_last_of(".") + 1);
+        if (ext != "smi" && ext != "smiles") {
+          all_smiles = false;
+          break;
+        }
+      }
+
+      size_t num_loaded;
+      if (all_smiles) {
+        log << "Using parallel RDKit 3D generation for SMILES input\n";
+        num_loaded = batch_mgr.load_smiles_parallel(ligand_names, log, 0, settings.verbosity);
+      } else {
+        num_loaded = batch_mgr.load_all_ligands(mols, ligand_names, log, settings.verbosity);
+      }
       if (num_loaded == 0) {
         log << "No ligands loaded. Exiting.\n";
         return 0;

@@ -21,11 +21,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 # Default values
-POD_NAME="gpu-gnina-build-x7k9m2"
+POD_NAME="gpu-gnina-build-x7k2m9"
 NAMESPACE="development"
 JOBS=16
 CLEAN=""
 COPY_FILES=true
+DEBUG=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -40,6 +41,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-copy)
             COPY_FILES=false
+            shift
+            ;;
+        --debug)
+            DEBUG="--debug"
             shift
             ;;
         -h|--help)
@@ -59,7 +64,7 @@ while [[ $# -gt 0 ]]; do
             exit 1
             ;;
         *)
-            POD_NAME="gpu-gnina-build-x7k9m2"
+            POD_NAME="$1"
             shift
             ;;
     esac
@@ -69,6 +74,7 @@ echo "=== GNINA Build on Pod ==="
 echo "Pod:   $POD_NAME"
 echo "Jobs:  $JOBS"
 echo "Clean: ${CLEAN:-no}"
+echo "Debug: ${DEBUG:-no}"
 echo ""
 
 if [ "$COPY_FILES" = true ]; then
@@ -122,7 +128,7 @@ EOF
 fi
 
 echo "=== Running build on pod ==="
-kubectl exec "$POD_NAME" -n "$NAMESPACE" -- /gnina/build_linux.sh -j "$JOBS" $CLEAN
+kubectl exec "$POD_NAME" -n "$NAMESPACE" -- /gnina/build_linux.sh -j "$JOBS" $CLEAN $DEBUG
 
 echo ""
 echo "=== Build complete ==="

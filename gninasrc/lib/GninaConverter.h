@@ -9,6 +9,7 @@
 #define GNINACONVERTER_H_
 
 #include <openbabel/mol.h>
+#include <GraphMol/GraphMol.h>
 #include <iostream>
 #include <vector>
 #include "parsing.h"
@@ -17,6 +18,13 @@
 /* Routines for converting a molecule to smina format.
  */
 namespace GninaConverter {
+
+// Convert RDKit mol to OpenBabel mol
+void convertRDKitToOBMol(const RDKit::ROMol& rdmol, OpenBabel::OBMol& obmol);
+
+// Convert RDKit mol to smina parsing struct and context; return numtors
+unsigned convertParsing(const RDKit::ROMol& rdmol, parsing_struct& p, context& c,
+    bool addH = true);
 //can optoinal specify a desired root atom and atoms to that should not have rotatable bonds
 //text output
 void convertText(OpenBabel::OBMol& mol, std::ostream& out, int rootatom,
