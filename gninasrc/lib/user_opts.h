@@ -88,7 +88,6 @@ struct user_settings {
     int bfgs_iterations; //max BFGS iterations when using --gpu
     bool verbose_grad; //output gradient values for debugging
     bool direct_pairwise; //use direct pairwise scoring with LUT instead of grid interpolation (GPU only)
-    bool warp_coop; //use warp-cooperative BFGS kernel (GPU only, experimental)
     int batch_size; //target total poses per GPU batch for multi-ligand batch docking
     bool no_batch; //disable batch docking (process one ligand at a time)
     bool fast_embed; //use fast template-based 3D coordinate generation for SMILES
@@ -104,7 +103,7 @@ struct user_settings {
             randomize_only(false), local_only(false), dominimize(false),
             include_atom_info(false), cnn_cpu(false), no_lig(false),
             gpu(false), cpu_grid(false), bfgs_iterations(50), verbose_grad(false),
-            direct_pairwise(false), warp_coop(false), batch_size(50000), no_batch(false), fast_embed(false) {
+            direct_pairwise(false), batch_size(50000), no_batch(false), fast_embed(false) {
 
     }
 };

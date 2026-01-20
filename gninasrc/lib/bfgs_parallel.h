@@ -338,7 +338,7 @@ __device__ void bfgs_hessian_update_single_thread(
 );
 
 // ============================================================================
-// Inline Device Functions (shared between bfgs_parallel.cu and warp_coop_bfgs.cu)
+// Inline Device Functions
 // ============================================================================
 
 // Helper: evaluate a single spline at distance r

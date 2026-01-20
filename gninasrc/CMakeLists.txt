@@ -43,7 +43,6 @@ set(LIB_SRCS
 ${CMAKE_CURRENT_BINARY_DIR}/version.cpp
 lib/atom_constants.cpp
 lib/bfgs_parallel.cu
-lib/warp_coop_bfgs.cu
 lib/ligand_batch_manager.cpp
 lib/box.cpp
 lib/builtinscoring.cpp
@@ -229,12 +228,12 @@ list(REMOVE_DUPLICATES CMAKE_PROPERTY_LIST)
 add_library(gninalib_static STATIC $<TARGET_OBJECTS:gninalibobj>)
 set_target_properties(gninalib_static PROPERTIES OUTPUT_NAME gnina)
 target_link_libraries(gninalib_static  ${Boost_LIBRARIES} ${OpenBabel3_LIBRARIES} ${LIBMOLGRID_LIBRARY} ${TORCH_LIBRARIES} jsoncpp_lib ZLIB::ZLIB gninalibobj
-    RDKitDistGeomHelpers RDKitForceFieldHelpers RDKitSmilesParse RDKitGraphMol RDKitRDGeneral)
+    RDKitDistGeomHelpers RDKitForceFieldHelpers RDKitSmilesParse RDKitGraphMol RDKitRDGeneral RDKitRDGeometryLib)
 
 add_library(gninalib SHARED $<TARGET_OBJECTS:gninalibobj>)
 set_target_properties(gninalib PROPERTIES OUTPUT_NAME gnina)
 target_link_libraries(gninalib  ${Boost_LIBRARIES} ${OpenBabel3_LIBRARIES} ${LIBMOLGRID_LIBRARY} ${TORCH_LIBRARIES} jsoncpp_lib ZLIB::ZLIB gninalibobj
-    RDKitDistGeomHelpers RDKitForceFieldHelpers RDKitSmilesParse RDKitGraphMol RDKitRDGeneral)
+    RDKitDistGeomHelpers RDKitForceFieldHelpers RDKitSmilesParse RDKitGraphMol RDKitRDGeneral RDKitRDGeometryLib)
 
 # MESSAGE(STATUS "variable is: " ${NVCC_FLAGS_EXTRA})
 

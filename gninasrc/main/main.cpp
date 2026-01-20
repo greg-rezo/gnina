@@ -53,7 +53,6 @@
 #include "flexinfo.h"
 #include "gpucode.h"
 #include "bfgs_parallel.h"
-// #include "warp_coop_bfgs.h"  // Disabled - using standard GPU BFGS instead
 #include "ligand_batch_manager.h"
 #include "grid.h"
 #include "molgetter.h"
@@ -717,13 +716,6 @@ void do_search(model &m, const boost::optional<model> &ref, const boost::optiona
       // Run parallel BFGS
       std::vector<float> energies;
       std::vector<std::vector<float>> conformations;
-
-      if (settings.warp_coop) {
-          // Warp-cooperative kernel is disabled - use standard GPU kernel instead
-          std::cerr << "WARNING: --warp_coop is disabled, using standard GPU BFGS instead.\n";
-      }
-
-      // Use standard parallel BFGS kernel
       run_parallel_bfgs_docking(
               m.gdata, cacheInfo,
               settings.exhaustiveness,
@@ -1677,8 +1669,6 @@ Thank you!\n";
         "use GPU for docking (parallel BFGS instead of Monte Carlo)")(
         "direct_pairwise", bool_switch(&settings.direct_pairwise)->default_value(false),
         "use direct pairwise scoring with LUT instead of grid interpolation (GPU only, reduces L2 cache pressure)")(
-        "warp_coop", bool_switch(&settings.warp_coop)->default_value(false),
-        "use warp-cooperative BFGS kernel (GPU only, experimental - uses shuffle for faster memory access)")(
         "batch_size", value<int>(&settings.batch_size)->default_value(50000),
         "target total poses per GPU batch for multi-ligand batch docking (default: 50000)")(
         "no_batch", bool_switch(&settings.no_batch)->default_value(false),
@@ -1888,9 +1878,6 @@ Thank you!\n";
     if (settings.local_only && !settings.dominimize) {
       minparms.type = minimization_params::BFGSAccurateLineSearch;
     }
-
-    // --warp_coop is disabled - the flag still exists but just prints a warning
-    // and uses the standard GPU BFGS kernel instead
 
      // output banner
     log << cite_message << '\n';
