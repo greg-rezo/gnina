@@ -33,9 +33,9 @@ RUN apt-get update && apt-get install -y \
 # Use pip-installed cmake (3.27+) and ccache
 ENV PATH="/usr/local/bin:/usr/lib/ccache:$PATH"
 
-# Download and install libtorch
+# Download and install libtorch 2.4.0 (has setBlasPreferredBackend API for cuBLAS control)
 WORKDIR /opt
-RUN wget -q https://download.pytorch.org/libtorch/cu121/libtorch-cxx11-abi-shared-with-deps-2.1.2%2Bcu121.zip -O libtorch.zip && \
+RUN wget -q https://download.pytorch.org/libtorch/cu121/libtorch-cxx11-abi-shared-with-deps-2.4.0%2Bcu121.zip -O libtorch.zip && \
     unzip -q libtorch.zip && \
     rm libtorch.zip
 

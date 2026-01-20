@@ -193,19 +193,21 @@ void DLScorer::setReceptor(const model &m) {
   }
 }
 
-// Default implementation of batch scoring - falls back to sequential scoring
+// Default implementation of multi-ligand batch scoring - falls back to per-pose scoring
 // Subclasses can override this with optimized batched implementations
-std::vector<std::tuple<float, float, float>> DLScorer::score_batch(
-    model &m, const std::vector<conf> &conformations) {
-  std::vector<std::tuple<float, float, float>> results;
-  results.reserve(conformations.size());
+std::vector<std::tuple<float, float, float>> DLScorer::score_multi_ligand_batch(
+    const std::vector<float3>& receptor_coords,
+    const std::vector<smt>& receptor_types,
+    const std::vector<LigandPoseData>& poses) {
 
-  for (const auto &c : conformations) {
-    m.set(c);
-    set_center_from_model(m);
-    float cnnscore = 0, cnnaffinity = 0, cnnvariance = 0, loss = 0;
-    cnnscore = score(m, false, cnnaffinity, loss, cnnvariance);
-    results.emplace_back(cnnscore, cnnaffinity, cnnvariance);
+  // Default implementation: cannot score without model context
+  // Subclasses with access to TorchModel should override this
+  std::vector<std::tuple<float, float, float>> results;
+  results.reserve(poses.size());
+
+  // Return zeros - this is a fallback that shouldn't normally be used
+  for (size_t i = 0; i < poses.size(); i++) {
+    results.emplace_back(0.0f, 0.0f, 0.0f);
   }
 
   return results;

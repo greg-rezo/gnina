@@ -1004,3 +1004,271 @@ The fast_embed unaccounted overhead is likely due to:
 | Pre-computed 3D available | Use SDF input (fastest) |
 
 At higher exhaustiveness or without CNN scoring, embedding becomes a larger fraction of runtime, making `--fast_embed` beneficial.
+
+---
+
+## High Exhaustiveness CNN Scoring Benchmark (2026-01-18)
+
+**Git commit**: `634c2b81`
+
+Large-scale benchmark with high exhaustiveness to stress-test both BFGS and batched CNN scoring.
+
+### Test Configuration
+- **Ligands**: 1,000 ChEMBL SMILES
+- **Receptor**: 10gs_rec.pdb
+- **Exhaustiveness**: 20,000
+- **BFGS iterations**: 50
+- **CNN model**: fast (crossdock_default2018)
+- **GPU**: NVIDIA L4
+
+### Phase Timing Breakdown
+
+| Stage | Time | % | Rate |
+|-------|------|---|------|
+| **BFGS kernel** | ~101s | 41% | ~80k-200k poses/sec (varies by mol size) |
+| **Pose validation** | 55.3s | 22% | incl. model.set(): 25.2s |
+| **CNN scoring** | 88.3s | 36% | 11.3 ligs/sec |
+| RMSD clustering | 1.1s | <1% | |
+| File writing | 0.1s | <1% | |
+| **Total** | **246.3s** | 100% | **4.1 ligs/sec** |
+
+### Key Findings
+
+1. **CNN scoring is the bottleneck** at 88ms/ligand (36% of total time)
+2. **Pose validation (model.set)** is surprisingly slow at 55s (22%)
+3. **BFGS kernel** scales well: ~101s for 20M poses across 500 batches
+4. **cuBLASLt workaround working**: MAX_CHUNK_SIZE=16 avoids the CUBLAS_STATUS_NOT_INITIALIZED error
+
+### BFGS Throughput by Molecule Size
+
+| Molecule Size | Hessian DOF | Throughput |
+|---------------|-------------|------------|
+| Small (8-10 atoms) | 10-11 | 150k-200k poses/sec |
+| Medium (14-16 torsions) | 14-16 | 80k-130k poses/sec |
+| Large (17-18 torsions) | 17-18 | 70k-90k poses/sec |
+
+### Comparison to Lower Exhaustiveness
+
+| Exhaustiveness | BFGS Time | CNN Time | Total | Throughput |
+|----------------|-----------|----------|-------|------------|
+| 1,024 | ~6s | ~85s | ~91s | 11 lig/s |
+| **20,000** | **~101s** | **88s** | **246s** | **4.1 lig/s** |
+
+At high exhaustiveness, BFGS and CNN time become comparable, with CNN still the bottleneck.
+
+---
+
+## PyTorch 2.4 Upgrade and Optimizations (2026-01-18)
+
+**Git commit**: Current (uncommitted)
+
+Upgraded from PyTorch 2.1.2 to 2.4.0 to access the `setBlasPreferredBackend` API, enabling larger CNN batch sizes without cuBLASLt errors.
+
+### Changes Made
+
+1. **PyTorch upgrade**: libtorch 2.1.2+cu121 → 2.4.0+cu121
+2. **Force cuBLAS backend**: Added `at::globalContext().setBlasPreferredBackend(at::BlasBackend::Cublas)` in torch_model.cpp
+3. **Increased batch size**: MAX_CHUNK_SIZE 16 → 128 for batched CNN inference
+4. **Disabled BFGS debug**: Commented out `#define BFGS_DEBUG` in bfgs_parallel.cu
+
+### Performance Results (1000 ligands @ exh=20000)
+
+| Metric | Before (debug, batch=16) | After (no debug, batch=128) | Improvement |
+|--------|--------------------------|------------------------------|-------------|
+| **Total time** | 246.3s | **184.77s** | **25% faster** |
+| **CNN scoring** | 88.3s | **80.12s** | **9% faster** |
+| **BFGS kernel** | ~200-500ms/batch | **~30-40ms/batch** | **10x faster** |
+| **Pose validation** | 55.3s | **5.0s** | **11x faster** |
+| **End-to-end throughput** | 4.1 lig/s | **5.4 lig/s** | **32% faster** |
+
+### Timing Breakdown (After Optimizations)
+
+| Phase | Time | % |
+|-------|------|---|
+| RDKit 3D embedding | 5.5s | 3% |
+| BFGS kernel (500 batches) | ~90s | 49% |
+| Pose validation | 5.0s | 3% |
+| CNN scoring | 80.1s | 43% |
+| Other | 4.2s | 2% |
+| **Total** | **184.77s** | 100% |
+
+### Key Findings
+
+1. **BFGS debug printf was 10x slowdown**: GPU printf statements serialize execution
+2. **Larger CNN batch improves throughput**: 128 vs 16 batch size gives ~10% CNN speedup
+3. **cuBLAS more reliable than cuBLASLt**: `setBlasPreferredBackend(Cublas)` avoids CUBLAS_STATUS_NOT_INITIALIZED errors
+4. **Pose validation optimized**: Deferred model.set() until after filtering saves 50s
+
+### Docker Image Updates
+
+Updated `Dockerfile.gnina-base-deps` and `Dockerfile.gnina-base`:
+```dockerfile
+# Before
+RUN wget -q https://download.pytorch.org/libtorch/cu121/libtorch-cxx11-abi-shared-with-deps-2.1.2%2Bcu121.zip ...
+
+# After
+RUN wget -q https://download.pytorch.org/libtorch/cu121/libtorch-cxx11-abi-shared-with-deps-2.4.0%2Bcu121.zip ...
+```
+
+### Pod Information
+
+- **Build pod**: gpu-gnina-build-pt24
+- **Image**: us-central1-docker.pkg.dev/gke-test-421317/flyte/gnina-build-base:latest
+- **PyTorch version**: 2.4.0+cu121
+
+---
+
+## Multi-Ligand CNN Batching Performance (2026-01-18)
+
+**Git commit**: Current (after removing obsolete forward_batch/score_batch)
+
+Implemented multi-ligand CNN batching that scores poses from ALL ligands in a single batched call instead of per-ligand calls.
+
+### Test Configuration
+- **Ligands**: 1,000 ChEMBL SMILES
+- **Receptor**: 3rod_rec.pdb
+- **Exhaustiveness**: 1024
+- **CNN model**: fast (single model)
+- **GPU**: NVIDIA L4
+- **Chunk size**: 128 poses per NN forward pass
+
+### CNN Scoring Breakdown
+
+| Component | Time (s) | % of CNN | Poses/sec | Ligands/sec |
+|-----------|----------|----------|-----------|-------------|
+| **Voxelization** | 28.32 | 36.4% | 6,356 | 35.3 |
+| **NN Inference** | 42.17 | 54.2% | 4,268 | 23.7 |
+| **Result Extract** | 0.53 | 0.7% | — | — |
+| **CNN Total** | **77.76** | 100% | **2,315** | **12.9** |
+
+### End-to-End Timing
+
+| Stage | Time (s) | % of Total | Ligands/sec |
+|-------|----------|------------|-------------|
+| RDKit 3D Embedding | 5.4 | 5.9% | 185.2 |
+| BFGS Optimization | 4.77 | 5.2% | 209.6 |
+| **CNN Scoring** | **77.76** | **85.4%** | **12.9** |
+| RMSD Clustering | 0.95 | 1.0% | 1,053 |
+| Other | 2.12 | 2.3% | — |
+| **Total** | **91.14** | 100% | **11.0** |
+
+### Key Findings
+
+1. **CNN scoring dominates** at 85% of total time
+2. **Within CNN scoring**:
+   - NN inference: 54% (batched GPU inference across 128-pose chunks)
+   - Voxelization: 36% (per-pose gmaker.forward calls, GPU-accelerated)
+3. **Consistent throughput**: ~2,315 poses/sec regardless of batch size
+4. **BFGS is fast**: Only 5% of total time at 209 ligands/sec
+
+### Throughput Consistency Check
+
+| Run | Total Poses | CNN Time | Poses/sec |
+|-----|-------------|----------|-----------|
+| num_modes=9 (default) | 180,000 | 77.76s | 2,315 |
+| num_modes=20 | 400,000 | 172.21s | 2,323 |
+
+Per-pose throughput is **identical** (~2,320 poses/sec), confirming linear scaling.
+
+### Comparison: CNN Fast vs CNN None
+
+| Metric | CNN fast | CNN none | Speedup |
+|--------|----------|----------|---------|
+| **Total time** | 91.14s | **13.77s** | **6.6x** |
+| **Ligands/sec** | 11 | **72.6** | **6.6x** |
+| **Time per ligand** | 91.1ms | **13.8ms** | **6.6x** |
+| CNN scoring | 77.76s | 0.00s | — |
+| Post-processing | 79.14s | 1.57s | 50x |
+
+Without CNN scoring, the pipeline is **GPU BFGS-bound** and achieves 72.6 ligands/sec.
+
+### Implementation Notes
+
+- **Receptor CoordinateSet reuse**: Created once, reused for all poses
+- **Chunked processing**: 128 poses per NN forward to manage GPU memory
+- **cuBLAS backend**: Forced cuBLAS instead of cuBLASLt to avoid initialization errors
+- **Single GPU sync**: Results extracted once per chunk instead of per-ligand
+
+---
+
+## GPU vs CPU Mode Comparison (2026-01-18)
+
+**Git commit**: Current
+
+Comparison of GNINA's GPU batch docking vs CPU Monte Carlo mode.
+
+### Test Configuration
+- **Receptor**: 3rod_rec.pdb
+- **Exhaustiveness**: 1024
+- **Seed**: 42
+
+### Benchmark Results
+
+| Method | Ligands | Exhaustiveness | Total Time | Ligands/sec | Poses/sec | Notes |
+|--------|---------|----------------|------------|-------------|-----------|-------|
+| **GPU --cnn none** | 1,000 | 1,024 | **13.77s** | **72.6** | ~74k | GPU BFGS optimization only |
+| **GPU --cnn none** | 1,000 | 10,240 | 58.38s | 17.1 | **151k** | Higher exh = better GPU util |
+| **GPU --cnn fast** | 1,000 | 1,024 | 91.14s | 11.0 | ~11k | + CNN scoring (85% of time) |
+| **CPU --num_mc_steps=1** (16 CPUs) | 100 | 1,024 | 110.9s | 0.90 | — | 16-core threaded Monte Carlo |
+| **CPU --num_mc_steps=0** (16 CPUs) | 5 | 1,024 | 210s | 0.024 | — | No BFGS refinement (slower!) |
+| **CPU --num_mc_steps=1** (1 CPU) | 100 | 1,024 | 177.6s | 0.56 | — | Single-threaded |
+
+*Note: CPU tests used fewer molecules due to slow runtime.*
+
+### Speedup Summary
+
+| Comparison | Speedup Factor |
+|------------|----------------|
+| GPU (no CNN) vs CPU (16 cores, mc=1) | **80x faster** |
+| GPU (with CNN) vs CPU (16 cores, mc=1) | **12x faster** |
+| CPU 16 cores vs 1 core | **1.6x** (poor scaling) |
+
+### Analysis
+
+1. **GPU without CNN** is the fastest mode at 72.6 ligands/sec
+2. **CNN scoring** adds ~77s overhead for 1000 ligands (6.6x slowdown)
+3. **CPU Monte Carlo** (16 threads) achieves only 0.9 ligands/sec
+4. **Bottlenecks**:
+   - GPU mode: CNN scoring (85% of time with --cnn fast)
+   - CPU mode: Monte Carlo + BFGS optimization (inherently serial per pose)
+
+### Recommendations
+
+| Use Case | Mode | Expected Throughput |
+|----------|------|---------------------|
+| High-throughput screening | `--gpu --cnn_scoring none` | ~70-100 lig/s |
+| Production with CNN rescoring | `--gpu --cnn fast` | ~10-15 lig/s |
+| CPU-only systems | `--num_mc_steps 1` | ~0.9 lig/s (16 threads)
+
+---
+
+## High Exhaustiveness Timing Breakdown (2026-01-18)
+
+**Test**: 1000 ChEMBL SMILES, 3rod_rec.pdb, exhaustiveness=10,240, --cnn_scoring none
+
+### Phase Timing
+
+| Phase | Time | % of Total | Rate |
+|-------|------|------------|------|
+| **RDKit 3D Embedding** | 5.4s | 9.3% | 186 mol/s |
+| **Model Conversion** | 1.0s | 1.7% | 1000 mol/s |
+| **GPU Batch Processing** | 48.1s | 82.4% | 151k poses/s |
+| **Post-Processing** | 3.9s | 6.7% | — |
+| └ Pose validation | 2.62s | | incl. model.set: 0.77s |
+| └ RMSD clustering | 0.92s | | |
+| └ Result creation | 0.33s | | |
+| └ File writing | 0.02s | | |
+| **Total** | **58.38s** | 100% | **17.1 lig/s** |
+
+### GPU Batch Details
+
+- **250 batches**, 4 ligands each, 40,960 poses per batch
+- **Total poses**: 10,240,000
+
+| Molecule Size | DOF | Batch Time | Throughput |
+|---------------|-----|------------|------------|
+| Small (7-8 DOF) | 7-8 | 10-22ms | 1.9-3.9M poses/s |
+| Medium (9-10 DOF) | 9-10 | 10-40ms | 1.0-4.0M poses/s |
+| Large (14-16 DOF) | 14-16 | 260-270ms | 151k poses/s |
+
+**Key insight**: Large molecules (14-16 DOF) dominate runtime at ~260ms/batch vs ~10ms for small molecules

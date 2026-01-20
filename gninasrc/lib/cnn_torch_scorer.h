@@ -47,10 +47,12 @@ public:
   float score(model &m, float &variance); // score only - no gradient
   float score(model &m, bool compute_gradient, float &affinity, float &loss, float &variance);
 
-  // Batched scoring - scores multiple poses efficiently in a single GPU pass
-  // Returns vector of (cnnscore, cnnaffinity, cnnvariance) for each pose
-  std::vector<std::tuple<float, float, float>> score_batch(
-      model &m, const std::vector<conf> &conformations) override;
+  // Multi-ligand batch scoring - batches CNN scoring across multiple ligands
+  // Uses batched voxelization for efficiency
+  std::vector<std::tuple<float, float, float>> score_multi_ligand_batch(
+      const std::vector<float3>& receptor_coords,
+      const std::vector<smt>& receptor_types,
+      const std::vector<LigandPoseData>& poses) override;
 
   fl get_grid_dim() const;
   fl get_grid_res() const;

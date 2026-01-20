@@ -251,57 +251,34 @@ template <bool isCUDA> fl CNNTorchScorer<isCUDA>::get_grid_res() const {
   return models[0]->get_grid_res();
 }
 
-// Batched scoring - scores multiple poses efficiently in a single GPU pass
-// This is optimized for the GPU batch docking path where we have many poses to score
-//
-// NOTE: The CNN model must be initialized and warmed up with batched scoring BEFORE
-// running GPU BFGS kernels. This ensures cuBLAS batched matmul handles are created
-// before custom CUDA kernels potentially invalidate them.
+// Multi-ligand batch scoring - scores poses from MULTIPLE ligands in a single pass
+// This is more efficient than calling score_batch() once per ligand because:
+// 1. Receptor CoordinateSet is created once and reused for all poses
+// 2. Single GPU sync at the end instead of per-ligand
+// 3. Fewer memory allocations
 template <bool isCUDA>
-std::vector<std::tuple<float, float, float>> CNNTorchScorer<isCUDA>::score_batch(
-    model &m, const std::vector<conf> &conformations) {
+std::vector<std::tuple<float, float, float>> CNNTorchScorer<isCUDA>::score_multi_ligand_batch(
+    const std::vector<float3>& receptor_coords,
+    const std::vector<smt>& receptor_types,
+    const std::vector<LigandPoseData>& poses) {
+
   boost::lock_guard<boost::recursive_mutex> guard(*mtx);
 
-  if (!initialized() || conformations.empty()) {
+  if (!initialized() || poses.empty()) {
     return {};
   }
 
-  size_t batch_size = conformations.size();
+  size_t batch_size = poses.size();
 
-  // Get receptor data once (same for all poses)
-  // We need to set up the model first to extract receptor coords
-  m.set(conformations[0]);
-  setReceptor(m);
-
-  // Extract ligand data for each pose
+  // Convert LigandPoseData to the format expected by forward_multi_ligand_batch
   std::vector<std::vector<float3>> lig_coords_batch(batch_size);
   std::vector<std::vector<smt>> lig_types_batch(batch_size);
   std::vector<vec> centers_batch(batch_size);
 
   for (size_t i = 0; i < batch_size; i++) {
-    m.set(conformations[i]);
-    setLigand(m);
-
-    // Copy ligand coords and types
-    lig_coords_batch[i] = ligand_coords;
-    lig_types_batch[i] = ligand_smtypes;
-
-    // Calculate center for this pose (using NAN triggers auto-center from ligand)
-    if (!isnan(cnnopts.cnn_center[0])) {
-      centers_batch[i] = cnnopts.cnn_center;
-    } else {
-      // Use ligand center
-      vec center(0, 0, 0);
-      for (const auto& coord : ligand_coords) {
-        center[0] += coord.x;
-        center[1] += coord.y;
-        center[2] += coord.z;
-      }
-      if (!ligand_coords.empty()) {
-        center /= (float)ligand_coords.size();
-      }
-      centers_batch[i] = center;
-    }
+    lig_coords_batch[i] = poses[i].coords;
+    lig_types_batch[i] = poses[i].types;
+    centers_batch[i] = poses[i].center;
   }
 
   // Accumulate results across models (for ensemble)
@@ -323,9 +300,9 @@ std::vector<std::tuple<float, float, float>> CNNTorchScorer<isCUDA>::score_batch
 
     // Loop over rotations (if requested)
     for (unsigned r = 0, n = max(cnnopts.cnn_rotations, 1U); r < n; r++) {
-      // Call batched forward pass
-      auto batch_results = model->forward_batch(
-          receptor_coords, receptor_smtypes,
+      // Call multi-ligand batched forward pass
+      auto batch_results = model->forward_multi_ligand_batch(
+          receptor_coords, receptor_types,
           lig_coords_batch, lig_types_batch,
           centers_batch, r > 0);
 

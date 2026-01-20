@@ -21,6 +21,15 @@
 // this must be called in every thread that uses CNNScorer
 extern int initializeCUDA(int device);
 
+// Structure to hold pose data for multi-ligand batch scoring
+// This allows batching CNN scoring across multiple ligands with different atom counts
+struct LigandPoseData {
+  size_t ligand_id;                 // ID to map results back to original ligand
+  std::vector<float3> coords;       // Ligand atom coordinates for this pose
+  std::vector<smt> types;           // Ligand atom types
+  vec center;                       // Center for voxelization (NAN = compute from coords)
+};
+
 class DLScorer {
 
 protected:
@@ -55,11 +64,17 @@ public:
   virtual float score(model &m, float &variance) = 0; // score only - no gradient
   virtual float score(model &m, bool compute_gradient, float &affinity, float &loss, float &variance) = 0;
 
-  // Batched scoring - scores multiple poses efficiently in a single pass
+  // Multi-ligand batch scoring - scores poses from MULTIPLE ligands in a single pass
+  // This is more efficient than calling score_batch() once per ligand because:
+  // 1. Receptor voxelization is done once (not repeated per ligand)
+  // 2. GPU sync (.cpu()) happens once (not per ligand)
+  // 3. Batched voxelization across all poses
   // Returns vector of (cnnscore, cnnaffinity, cnnvariance) for each pose
-  // Default implementation falls back to sequential scoring
-  virtual std::vector<std::tuple<float, float, float>> score_batch(
-      model &m, const std::vector<conf> &conformations);
+  // Order matches input poses vector
+  virtual std::vector<std::tuple<float, float, float>> score_multi_ligand_batch(
+      const std::vector<float3>& receptor_coords,
+      const std::vector<smt>& receptor_types,
+      const std::vector<LigandPoseData>& poses);
 
   // readjust center
   virtual void set_center_from_model(model &m);

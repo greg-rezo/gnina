@@ -35,9 +35,14 @@ public:
                const std::vector<float3> &lig_coords, const std::vector<smt> &lig_types, const vec& center,
                bool rotate, bool compute_gradient);
 
-  // Batched forward pass - scores multiple poses in a single inference call
+  // Multi-ligand batched forward pass - batches NN inference
+  // across multiple ligands with variable sizes (uses padding for batched voxelization)
+  // This is more efficient than forward_batch when processing many ligands because:
+  // 1. Receptor grid is generated once (not repeated per ligand)
+  // 2. Voxelization is batched via gmaker.forward() with padded tensors
+  // 3. Single GPU sync at the end instead of per-ligand
   // Returns vector of {pose_score, affinity, loss} for each pose
-  std::vector<std::vector<float>> forward_batch(
+  std::vector<std::vector<float>> forward_multi_ligand_batch(
       const std::vector<float3> &rec_coords, const std::vector<smt> &rec_types,
       const std::vector<std::vector<float3>> &lig_coords_batch,
       const std::vector<std::vector<smt>> &lig_types_batch,

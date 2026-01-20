@@ -81,7 +81,7 @@ struct user_settings {
     bool local_only;
     bool dominimize;
     bool include_atom_info;
-    bool no_gpu;
+    bool cnn_cpu; // force CNN scoring to run on CPU instead of GPU
     bool no_lig;
     bool gpu; //use GPU for docking (parallel BFGS instead of MC)
     bool cpu_grid; //use grid-based scoring for CPU local_only (to match GPU behavior)
@@ -102,7 +102,7 @@ struct user_settings {
             exhaustiveness(10), num_mc_steps(0), max_mc_steps(0), num_mc_saved(50), temperature(0),
             sort_order(CNNscore), score_only(false),
             randomize_only(false), local_only(false), dominimize(false),
-            include_atom_info(false), no_gpu(false), no_lig(false),
+            include_atom_info(false), cnn_cpu(false), no_lig(false),
             gpu(false), cpu_grid(false), bfgs_iterations(50), verbose_grad(false),
             direct_pairwise(false), warp_coop(false), batch_size(50000), no_batch(false), fast_embed(false) {
 

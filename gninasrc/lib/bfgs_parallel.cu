@@ -23,7 +23,7 @@
 #include <thrust/sort.h>
 
 // Debug mode - uncomment to enable verbose kernel debug output
-#define BFGS_DEBUG
+// #define BFGS_DEBUG
 
 // ============================================================================
 // Device Helper Functions

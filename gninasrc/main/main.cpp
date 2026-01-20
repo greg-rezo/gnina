@@ -1450,7 +1450,7 @@ struct global_state {
 void threads_at_work(job_queue<worker_job> *wrkq, job_queue<writer_job> *writerq, global_state *gs, MolGetter *mols,
                      int *nligs, std::shared_ptr<DLScorer> dl_scorer) // copy dl_scorer so it can maintain state
 {
-  if (!gs->settings->no_gpu)
+  if (!gs->settings->cnn_cpu)
     initializeCUDA(gs->settings->device);
 
   if (gs->settings->gpu)
@@ -1766,7 +1766,7 @@ Thank you!\n";
         "stripH", value<bool>(&strip_hydrogens),
         "remove polar hydrogens from molecule _after_ performing atom typing for efficiency (off by default - nonpolar are always removed)")(
         "device", value<int>(&settings.device)->default_value(0),
-        "GPU device to use")("no_gpu", bool_switch(&settings.no_gpu), "Disable GPU acceleration, even if available.");
+        "GPU device to use")("cnn_cpu", bool_switch(&settings.cnn_cpu), "Run CNN scoring on CPU instead of GPU");
 
     options_description config("Configuration file (optional)");
     config.add_options()("config", value<std::string>(&config_name), "the above options can be put here");
@@ -1897,13 +1897,13 @@ Thank you!\n";
     
    // check for GPU
     bool torchgpu = false;
-    if (torch::cuda::is_available() && !settings.no_gpu) {
+    if (torch::cuda::is_available() && !settings.cnn_cpu) {
       torchgpu = true;
       if (settings.device > 0) {
         log << "WARNING: Torch backend ignores device argument.  Use CUDA_VISIBLE_DEVICES environment to control CUDA "
                "device used.\n";
       }
-    } else if (!settings.no_gpu) {
+    } else if (!settings.cnn_cpu) {
       log << "WARNING: No GPU detected. CNN scoring will be slow.\n"
              "Recommend running with single model (--cnn fast)\n"
              "or without cnn scoring (--cnn_scoring=none).\n\n";    
@@ -2267,8 +2267,18 @@ Thank you!\n";
                   return a.ligand_id < b.ligand_id;
                 });
 
-      // Process each ligand's results
-      for (LigandDescriptor& lig : batch_mgr.all_ligands) {
+      // ========================================================================
+      // Phase 1: Validate poses and compute coordinates for all ligands
+      // ========================================================================
+      struct LigandData {
+        output_container out_cont;
+        size_t ligand_idx;
+      };
+      std::vector<LigandData> all_ligand_data;
+      all_ligand_data.reserve(batch_mgr.all_ligands.size());
+
+      for (size_t lig_idx = 0; lig_idx < batch_mgr.all_ligands.size(); lig_idx++) {
+        LigandDescriptor& lig = batch_mgr.all_ligands[lig_idx];
         model& m = *lig.m;
 
         // Skip if no results
@@ -2314,48 +2324,156 @@ Thank you!\n";
           }
 
           output_type out(c, e);
-
-          // Time model.set() separately as it can be expensive
-          boost::timer::cpu_timer set_timer;
-          m.set(out.c);
-          time_model_set += set_timer.elapsed().wall / 1e9;
-
-          out.coords = m.get_heavy_atom_movable_coords();
           out_cont.push_back(new output_type(out));
         }
         time_pose_validation += phase_timer.elapsed().wall / 1e9;
 
-        // Sort by energy and limit
+        // Sort by energy and limit to top poses BEFORE expensive model.set() calls
         out_cont.sort();
         sz max_to_refine = settings.num_modes * 20;
         while (out_cont.size() > max_to_refine) {
           out_cont.pop_back();
         }
 
-        // Score results with CNN if enabled (skip CPU refinement - GPU already optimized)
+        // Now compute coordinates only for the top poses (needed for RMSD clustering)
         phase_timer.start();
-        if (use_cnn && dl_scorer && !out_cont.empty()) {
-          // Collect all conformations for batch scoring
-          std::vector<conf> batch_confs;
-          batch_confs.reserve(out_cont.size());
-          VINA_FOR_IN(i, out_cont) {
-            batch_confs.push_back(out_cont[i].c);
-          }
-
-          // Score all poses in a single batched call
-          auto batch_results = dl_scorer->score_batch(m, batch_confs);
-
-          // Store results back
-          VINA_FOR_IN(i, out_cont) {
-            out_cont[i].cnnscore = std::get<0>(batch_results[i]);
-            out_cont[i].cnnaffinity = std::get<1>(batch_results[i]);
-            out_cont[i].cnnvariance = std::get<2>(batch_results[i]);
-          }
-
-          // Clear GPU cache after each ligand to prevent memory accumulation
-          c10::cuda::CUDACachingAllocator::emptyCache();
+        VINA_FOR_IN(i, out_cont) {
+          m.set(out_cont[i].c);
+          out_cont[i].coords = m.get_heavy_atom_movable_coords();
         }
-        time_cnn_scoring += phase_timer.elapsed().wall / 1e9;
+        time_model_set += phase_timer.elapsed().wall / 1e9;
+
+        if (!out_cont.empty()) {
+          all_ligand_data.push_back({std::move(out_cont), lig_idx});
+        }
+      }
+
+      // ========================================================================
+      // Phase 2: Multi-ligand batched CNN scoring
+      // ========================================================================
+      phase_timer.start();
+      if (use_cnn && dl_scorer && !all_ligand_data.empty()) {
+        // Extract receptor coords once (same for all ligands)
+        std::vector<float3> receptor_coords;
+        std::vector<smt> receptor_types;
+
+        // Get receptor from first ligand
+        {
+          model& m = *batch_mgr.all_ligands[all_ligand_data[0].ligand_idx].m;
+          const atomv& atoms = m.get_movable_atoms();
+          const vecv& coords = m.coordinates();
+
+          // Get flex/inflex boundary
+          sz num_flex_atoms = m.m_num_movable_atoms;
+          if (m.ligands.size() > 0) {
+            num_flex_atoms = m.ligands[0].node.begin;
+          }
+
+          // Add flex atoms (excluding covalent)
+          for (sz i = 0; i < num_flex_atoms; i++) {
+            if (!atoms[i].iscov) {
+              const vec& c = coords[i];
+              receptor_coords.push_back(float3({c[0], c[1], c[2]}));
+              receptor_types.push_back(atoms[i].sm);
+            }
+          }
+
+          // Add inflex atoms (excluding covalent)
+          for (sz i = m.m_num_movable_atoms, n = coords.size(); i < n; i++) {
+            if (!atoms[i].iscov) {
+              const vec& c = coords[i];
+              receptor_coords.push_back(float3({c[0], c[1], c[2]}));
+              receptor_types.push_back(atoms[i].sm);
+            }
+          }
+
+          // Add fixed receptor atoms
+          for (const auto& a : m.get_fixed_atoms()) {
+            receptor_coords.push_back(float3({a.coords[0], a.coords[1], a.coords[2]}));
+            receptor_types.push_back(a.sm);
+          }
+        }
+
+        // Collect ALL poses from ALL ligands
+        std::vector<LigandPoseData> all_poses;
+        std::vector<std::pair<size_t, size_t>> pose_to_ligand;  // Maps pose index to (ligand_data_idx, pose_idx)
+
+        for (size_t ld_idx = 0; ld_idx < all_ligand_data.size(); ld_idx++) {
+          LigandData& ld = all_ligand_data[ld_idx];
+          model& m = *batch_mgr.all_ligands[ld.ligand_idx].m;
+          const atomv& atoms = m.get_movable_atoms();
+
+          // Get ligand atom offset
+          sz lig_offset = 0;
+          if (m.ligands.size() > 0) {
+            lig_offset = m.ligands[0].node.begin;
+          }
+          sz num_lig_atoms = m.m_num_movable_atoms - lig_offset;
+
+          VINA_FOR_IN(pose_idx, ld.out_cont) {
+            // Set model to this conformation to get ligand coords
+            m.set(ld.out_cont[pose_idx].c);
+            const vecv& coords = m.coordinates();
+
+            LigandPoseData pose_data;
+            pose_data.ligand_id = ld.ligand_idx;
+            pose_data.coords.reserve(num_lig_atoms);
+            pose_data.types.reserve(num_lig_atoms);
+
+            for (sz i = 0; i < num_lig_atoms; i++) {
+              const vec& c = coords[i + lig_offset];
+              pose_data.coords.push_back(float3({c[0], c[1], c[2]}));
+              pose_data.types.push_back(atoms[i + lig_offset].sm);
+            }
+
+            // Compute center from ligand coords
+            float cx = 0, cy = 0, cz = 0;
+            for (const auto& coord : pose_data.coords) {
+              cx += coord.x;
+              cy += coord.y;
+              cz += coord.z;
+            }
+            if (!pose_data.coords.empty()) {
+              cx /= pose_data.coords.size();
+              cy /= pose_data.coords.size();
+              cz /= pose_data.coords.size();
+            }
+            pose_data.center = vec(cx, cy, cz);
+
+            all_poses.push_back(std::move(pose_data));
+            pose_to_ligand.push_back({ld_idx, pose_idx});
+          }
+        }
+
+        std::cerr << "Multi-ligand CNN scoring: " << all_poses.size() << " poses from "
+                  << all_ligand_data.size() << " ligands\n" << std::flush;
+
+        // Single batched CNN scoring call for ALL poses from ALL ligands
+        auto all_results = dl_scorer->score_multi_ligand_batch(
+            receptor_coords, receptor_types, all_poses);
+
+        // Distribute results back to ligands
+        for (size_t i = 0; i < all_results.size(); i++) {
+          size_t ld_idx = pose_to_ligand[i].first;
+          size_t pose_idx = pose_to_ligand[i].second;
+
+          all_ligand_data[ld_idx].out_cont[pose_idx].cnnscore = std::get<0>(all_results[i]);
+          all_ligand_data[ld_idx].out_cont[pose_idx].cnnaffinity = std::get<1>(all_results[i]);
+          all_ligand_data[ld_idx].out_cont[pose_idx].cnnvariance = std::get<2>(all_results[i]);
+        }
+
+        // Clear GPU cache after multi-ligand scoring
+        c10::cuda::CUDACachingAllocator::emptyCache();
+      }
+      time_cnn_scoring = phase_timer.elapsed().wall / 1e9;
+
+      // ========================================================================
+      // Phase 3: Sort, cluster, and write results for each ligand
+      // ========================================================================
+      for (LigandData& ld : all_ligand_data) {
+        LigandDescriptor& lig = batch_mgr.all_ligands[ld.ligand_idx];
+        model& m = *lig.m;
+        output_container& out_cont = ld.out_cont;
 
         // Sort by user's preferred metric
         auto sorter = [&settings](const output_type& lhs, const output_type& rhs) {
