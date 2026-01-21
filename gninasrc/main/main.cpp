@@ -2182,6 +2182,48 @@ Thank you!\n";
       // Sort and group into batches
       batch_mgr.sort_and_group_ligands(settings.verbosity);
 
+      // Create reference data for each ligand (for computing referenceRMSD in output)
+      // Must be done before any processing modifies the coordinates
+      std::map<unsigned int, reference_data> ligand_ref_data;
+      for (const auto& lig : batch_mgr.all_ligands) {
+        const model& m = *lig.m;
+        const atomv& atoms = m.get_movable_atoms();
+        const vecv& coords = m.coordinates();
+        reference_data data;
+        for (size_t i = 0; i < m.num_movable_atoms(); i++) {
+          if (!atoms[i].is_hydrogen()) {
+            data.coords.push_back(coords[i]);
+          }
+        }
+        if (!data.coords.empty()) {
+          // Create RDKit molecule from model for symmetry-aware RMSD
+          try {
+            std::stringstream sdf_ss;
+            bool sdfvalid = false;
+            m.write_ligand(sdf_ss, sdfvalid);
+            std::string sdf_str = sdf_ss.str();
+            if (sdf_str.find("$$$$") == std::string::npos) {
+              sdf_str += "$$$$\n";
+            }
+            RDKit::SDMolSupplier supplier;
+            supplier.setData(sdf_str);
+            if (!supplier.atEnd()) {
+              RDKit::ROMol *mol = supplier.next();
+              if (mol) {
+                data.rdkit_mol = std::shared_ptr<RDKit::ROMol>(
+                    RDKit::MolOps::removeHs(*mol));
+                delete mol;
+              }
+            }
+          } catch (...) {
+            // Failed to create RDKit mol, referenceRMSD will be -1
+          }
+          if (data.rdkit_mol) {
+            ligand_ref_data[lig.ligand_id] = data;
+          }
+        }
+      }
+
       // Setup precalculate for GPU
       precalculate_gpu* prec_gpu = dynamic_cast<precalculate_gpu*>(prec.get());
       if (!prec_gpu) {
@@ -2497,6 +2539,7 @@ Thank you!\n";
           output_type* pose;
           model* source_model;
           std::string parent_name;
+          unsigned int ligand_id;  // For ref_data lookup
         };
         std::map<int, std::vector<PoseWithModel>> parent_poses;
 
@@ -2513,7 +2556,7 @@ Thank you!\n";
           }
 
           for (sz i = 0; i < ld.out_cont.size(); i++) {
-            parent_poses[parent_id].push_back({&ld.out_cont[i], lig.m.get(), parent_name});
+            parent_poses[parent_id].push_back({&ld.out_cont[i], lig.m.get(), parent_name, lig.ligand_id});
           }
         }
 
@@ -2563,9 +2606,16 @@ Thank you!\n";
             if (how_many >= settings.num_modes) break;
 
             p.source_model->set(p.pose->c);
+            // Look up reference data for this ligand to compute referenceRMSD
+            fl refrmsd = -1;
+            auto ref_it = ligand_ref_data.find(p.ligand_id);
+            if (ref_it != ligand_ref_data.end()) {
+              boost::optional<reference_data> ref_opt(ref_it->second);
+              refrmsd = compute_reference_rmsd(*p.source_model, ref_opt);
+            }
             results.push_back(result_info(p.pose->e, p.pose->cnnscore,
                                           p.pose->cnnaffinity, p.pose->cnnvariance,
-                                          -1, -1, *p.source_model));
+                                          -1, refrmsd, *p.source_model));
             // Override name with parent name (strip _confN suffix)
             results.back().setName(p.parent_name);
             if (atomoutfile.is_open() || settings.include_atom_info) {
@@ -2611,15 +2661,22 @@ Thank you!\n";
           // Convert to result_info and write
           phase_timer.start();
           std::vector<result_info> results;
+          // Look up reference data for this ligand once
+          boost::optional<reference_data> ref_opt;
+          auto ref_it = ligand_ref_data.find(lig.ligand_id);
+          if (ref_it != ligand_ref_data.end()) {
+            ref_opt = ref_it->second;
+          }
           sz how_many = 0;
           VINA_FOR_IN(i, out_cont) {
             if (!not_max(out_cont[i].e)) continue;
             if (how_many >= settings.num_modes) break;
 
             m.set(out_cont[i].c);
+            fl refrmsd = compute_reference_rmsd(m, ref_opt);
             results.push_back(result_info(out_cont[i].e, out_cont[i].cnnscore,
                                           out_cont[i].cnnaffinity, out_cont[i].cnnvariance,
-                                          -1, -1, m));
+                                          -1, refrmsd, m));
             if (atomoutfile.is_open() || settings.include_atom_info) {
               results.back().setAtomValues(m, &wt);
             }
