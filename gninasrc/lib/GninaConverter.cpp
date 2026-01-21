@@ -17,6 +17,7 @@
 #include <map>
 #include <openbabel/obconversion.h>
 #include <openbabel/bond.h>
+#include <openbabel/oberror.h>
 
 // RDKit includes for RDKit->OpenBabel conversion
 #include <GraphMol/GraphMol.h>
@@ -24,6 +25,8 @@
 #include <GraphMol/Bond.h>
 #include <GraphMol/MolOps.h>
 #include <GraphMol/PeriodicTable.h>
+
+#include <sstream>
 
 namespace GninaConverter {
 
@@ -83,6 +86,27 @@ void MCMolConverter::convertConformer(unsigned conf, std::ostream& out) {
   serialout << c;
 }
 
+// Helper function to perceive bond orders with kekulization error checking
+static void perceiveBondOrdersChecked(OBMol& mol, const std::string& mol_name) {
+  // Redirect stderr to capture OpenBabel warnings
+  std::stringstream captured;
+  std::streambuf* old_cerr = std::cerr.rdbuf(captured.rdbuf());
+
+  mol.PerceiveBondOrders();
+
+  // Restore stderr
+  std::cerr.rdbuf(old_cerr);
+
+  // Check for kekulization warnings
+  std::string output = captured.str();
+  if (output.find("kekulize") != std::string::npos ||
+      output.find("Kekulize") != std::string::npos) {
+    throw std::runtime_error("Kekulization failed for molecule '" + mol_name +
+        "': " + output +
+        "\nPlease check the input molecule has valid aromatic bond assignments.");
+  }
+}
+
 //sets up data structures used by both text and binary
 //we link with gnina to ensure compatibility
 //rootatom, an obatom index (starting at 1) can be specified, if not
@@ -91,7 +115,7 @@ unsigned convertParsing(OBMol& mol, parsing_struct& p, context& c, int rootatom,
     const vector<int>& norot, bool addH) {
   if (addH) mol.AddHydrogens();
 
-  mol.PerceiveBondOrders();
+  perceiveBondOrdersChecked(mol, mol.GetTitle());
   mol.SetAromaticPerceived();
   mol.SetAutomaticFormalCharge(false);
 
@@ -256,7 +280,7 @@ void convertRDKitToOBMol(const RDKit::ROMol& rdmol, OpenBabel::OBMol& obmol) {
   }
 
   // Perceive properties needed for atom typing
-  obmol.PerceiveBondOrders();
+  perceiveBondOrdersChecked(obmol, obmol.GetTitle());
   obmol.SetAromaticPerceived();
 }
 

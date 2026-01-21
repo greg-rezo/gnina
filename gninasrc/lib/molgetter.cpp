@@ -490,44 +490,17 @@ bool MolGetter::readMoleculeIntoModel(model &m) {
           continue;
         }
 
-        // Generate 3D coordinates if molecule is 2D or 0D (e.g., from SMILES)
+        // Reject 2D/0D molecules (e.g., raw SMILES strings) - require 3D input or .smi files
+        // The batch manager (ligand_batch_manager.cpp) uses RDKit with proper MMFF minimization
+        // for .smi files, which produces much better geometry than OpenBabel's UFF
         if (mol.GetDimension() < 3) {
-          mol.AddHydrogens();  // Add hydrogens first for better 3D generation
-
-          OBBuilder builder;
-          bool success = builder.Build(mol);
-
-          if (success) {
-            // Force field cleanup to fix any geometry issues
-            OBForceField* ff = OBForceField::FindForceField("UFF");
-            if (ff && ff->Setup(mol)) {
-              ff->SteepestDescent(50);
-              ff->GetCoordinates(mol);
-            }
-          } else {
-            // If builder fails, try force field from scratch with random coords
-            OBForceField* ff = OBForceField::FindForceField("UFF");
-            if (ff) {
-              // Set random initial coordinates
-              FOR_ATOMS_OF_MOL(atom, mol) {
-                atom->SetVector(
-                  (double)rand() / RAND_MAX * 10.0,
-                  (double)rand() / RAND_MAX * 10.0,
-                  (double)rand() / RAND_MAX * 10.0
-                );
-              }
-              if (ff->Setup(mol)) {
-                ff->SteepestDescent(500);  // More iterations for random start
-                ff->GetCoordinates(mol);
-                success = true;
-              }
-            }
-          }
-
-          if (!success) {
-            std::cerr << "\nFailed to generate 3D coordinates for " << mol.GetTitle() << ". Skipping.\n";
-            continue;
-          }
+          std::cerr << "\nError: Molecule '" << mol.GetTitle() << "' has no 3D coordinates.\n"
+                    << "Raw SMILES input is no longer supported due to poor geometry quality.\n"
+                    << "Please use one of these alternatives:\n"
+                    << "  1. Save SMILES to a .smi file and use: -l ligands.smi\n"
+                    << "  2. Use a 3D structure file (SDF, MOL2, PDB)\n"
+                    << "The .smi file path uses RDKit with MMFF minimization for better geometry.\n";
+          continue;
         }
 
         if (convertOBMolToModel(mol, m, add_hydrogens, strip_hydrogens)) {
