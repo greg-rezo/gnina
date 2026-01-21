@@ -29,6 +29,8 @@
 #include <GraphMol/MolOps.h>
 #include <GraphMol/DistGeomHelpers/Embedder.h>
 #include <GraphMol/FileParsers/FileParsers.h>
+#include <GraphMol/ForceFieldHelpers/MMFF/MMFF.h>
+#include <ForceField/ForceField.h>
 #include <Geometry/point.h>
 
 // OpenBabel includes for SDF parsing
@@ -519,6 +521,21 @@ static std::unique_ptr<RDKit::RWMol> generate_3d_from_smiles_rdkit(
         }
     }
 
+    // MMFF minimization to clean up geometry
+    // This is critical for proper bond lengths and angles
+    try {
+        RDKit::MMFF::MMFFMolProperties mmffProps(*mol);
+        if (mmffProps.isValid()) {
+            auto ff = RDKit::MMFF::constructForceField(*mol, &mmffProps);
+            if (ff) {
+                ff->initialize();
+                ff->minimize(200);  // 200 iterations usually sufficient
+            }
+        }
+    } catch (...) {
+        // MMFF failed, continue with unminimized coords
+    }
+
     // Set molecule name
     mol->setProp("_Name", name);
 
@@ -683,36 +700,11 @@ size_t LigandBatchManager::load_smiles_parallel(
                     conf_name += "_conf" + std::to_string(cid);
                 }
 
-                // Write RDKit mol to SDF string (with hydrogens)
-                std::string sdf_block = RDKit::MolToMolBlock(mol_copy);
-                sdf_block += "$$$$\n";
-
-                // DEBUG: Save first molecule's intermediate SDF for debugging
-                static bool saved_intermediate = false;
-                if (!saved_intermediate) {
-                    std::ofstream debug_sdf("intermediate_smi_pose.sdf");
-                    if (debug_sdf) {
-                        debug_sdf << sdf_block;
-                        std::cerr << "DEBUG: Saved intermediate SDF to intermediate_smi_pose.sdf" << std::endl;
-                    }
-                    saved_intermediate = true;
-                }
-
-                // Parse with OpenBabel - replicate EXACT code from molgetter.cpp OB case
-                std::istringstream sdf_stream(sdf_block);
-                OpenBabel::OBConversion conv;
-                conv.SetInFormat("sdf");
-                conv.SetInStream(&sdf_stream);
-
+                // Convert RDKit mol directly to OpenBabel mol (preserves atom ordering)
+                // Using direct conversion instead of SDF round-trip to avoid atom reordering
                 OpenBabel::OBMol obmol;
-                if (!conv.Read(&obmol)) {
-                    std::cerr << "Warning: OpenBabel failed to parse SDF for " << conf_name << std::endl;
-                    continue;
-                }
-
-                // Match molgetter.cpp OB case exactly
+                GninaConverter::convertRDKitToOBMol(mol_copy, obmol);
                 obmol.SetTitle(conf_name.c_str());
-                obmol.StripSalts();
 
                 if (obmol.NumAtoms() == 0) {
                     std::cerr << "Warning: Empty molecule " << conf_name << std::endl;

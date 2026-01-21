@@ -280,6 +280,7 @@ target_link_libraries(gnina
     RDKitSmilesParse
     RDKitDistGeomHelpers
     RDKitForceFieldHelpers
+    RDKitForceField
     RDKitRDGeneral
     RDKitRDGeometryLib
 )

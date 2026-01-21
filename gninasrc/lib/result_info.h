@@ -53,6 +53,9 @@ class result_info {
     fl getEnergy() const { return energy;}
     fl getCNNScore() const { return cnnscore; }
     fl getCNNAffinity() const { return cnnaffinity;}
+
+    void setName(const std::string& n) { name = n; }
+    const std::string& getName() const { return name; }
 };
 
 #endif /* RESULT_INFO_H_ */

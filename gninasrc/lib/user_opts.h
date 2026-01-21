@@ -91,6 +91,9 @@ struct user_settings {
     int batch_size; //target total poses per GPU batch for multi-ligand batch docking
     bool no_batch; //disable batch docking (process one ligand at a time)
     bool fast_embed; //use fast template-based 3D coordinate generation for SMILES
+    bool no_rdkit_smiles; //use OpenBabel instead of RDKit for SMILES 3D generation
+    int parallel_embed; //number of conformers to generate in parallel for SMILES
+    bool skip_torsion_randomize; //skip torsion randomization (for debugging)
 
     cnn_options cnnopts;
 
@@ -103,7 +106,8 @@ struct user_settings {
             randomize_only(false), local_only(false), dominimize(false),
             include_atom_info(false), cnn_cpu(false), no_lig(false),
             gpu(false), cpu_grid(false), bfgs_iterations(50), verbose_grad(false),
-            direct_pairwise(false), batch_size(50000), no_batch(false), fast_embed(false) {
+            direct_pairwise(false), batch_size(50000), no_batch(false), fast_embed(false),
+            no_rdkit_smiles(false), parallel_embed(0), skip_torsion_randomize(false) {
 
     }
 };
