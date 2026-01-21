@@ -1272,3 +1272,69 @@ Comparison of GNINA's GPU batch docking vs CPU Monte Carlo mode.
 | Large (14-16 DOF) | 14-16 | 260-270ms | 151k poses/s |
 
 **Key insight**: Large molecules (14-16 DOF) dominate runtime at ~260ms/batch vs ~10ms for small molecules
+
+---
+
+## SMILES Docking with Parallel Conformer Embedding (2026-01-21)
+
+**Git commit**: `6a1d6e69`
+
+Benchmarking `--parallel_embed` option which generates multiple RDKit conformers per SMILES molecule to improve docking quality from SMILES input.
+
+### Test Configuration
+- **Exhaustiveness**: 10,000
+- **num_modes**: 32
+- **GPU**: NVIDIA L4
+- **CNN scoring**: enabled (default)
+
+### 1DMP Results (DMQ ligand)
+
+| Input | Best RMSD | CNN of Best RMSD | Best CNN | RMSD of Best CNN |
+|-------|-----------|------------------|----------|------------------|
+| SDF | 0.75 Å | 0.665 | 0.732 | 1.08 Å |
+| SMILES (1 conf) | 1.37 Å | 0.539 | 0.539 | 1.37 Å |
+| SMILES (10 confs) | 1.48 Å | 0.621 | 0.688 | 2.59 Å |
+| **SMILES (100 confs)** | 1.51 Å | 0.690 | **0.771** | 2.83 Å |
+
+**Key findings (1DMP)**:
+- 100 conformers achieved highest CNN score (0.771) - better than SDF (0.732)
+- But RMSD of best CNN pose is worse (2.83 Å vs 1.08 Å for SDF)
+- Best RMSD didn't improve much with more conformers (1.37→1.48→1.51 Å)
+- The CNN finds high-scoring poses that aren't the native binding mode
+
+**Timing (parallel_embed 100)**: 960s total (16 min)
+- RMSD clustering: 449s (47%)
+- CNN scoring: 246s (26%)
+- BFGS docking: ~32s per batch × 19 batches
+
+### 7R7R Results (complex macrocycle)
+
+| Input | Best RMSD | CNN of Best RMSD | Best CNN | RMSD of Best CNN |
+|-------|-----------|------------------|----------|------------------|
+| **SDF** | **0.75 Å** | 0.665 | **0.732** | 1.08 Å |
+| SMILES (1 conf) | 1.70 Å | 0.612 | 0.650 | 2.78 Å |
+| **SMILES (10 confs)** | **1.00 Å** | 0.675 | 0.698 | 2.64 Å |
+
+**Key findings (7R7R)**:
+- `--parallel_embed 10` significantly improves SMILES docking:
+  - RMSD: 1.70 → **1.00 Å** (41% better)
+  - CNN: 0.650 → **0.698** (7% better)
+- Gap between SDF and SMILES narrows with multiple conformers:
+  - Without parallel_embed: SDF 2.3x better RMSD
+  - With parallel_embed 10: SDF only 1.3x better RMSD
+
+### Recommendations
+
+| Use Case | Recommended Setting |
+|----------|---------------------|
+| High-throughput screening (speed) | `--parallel_embed 1` (default) |
+| Better quality from SMILES | `--parallel_embed 10` |
+| Best quality possible | Use pre-computed SDF with native pose |
+
+### Usage
+
+```bash
+# Generate 10 conformers per SMILES for better sampling
+gnina --gpu --parallel_embed 10 -r receptor.pdb -l ligands.smi \
+    --autobox_ligand ref.sdf --exhaustiveness 10000 -o output.sdf
+```
