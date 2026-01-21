@@ -20,6 +20,33 @@
 
 using namespace OpenBabel;
 
+// Convert an OpenBabel OBMol (with 3D coordinates) to a gnina model
+// This is the shared code path for both SDF file loading and RDKit SMILES conversion
+// Returns true on success, false on failure
+bool convertOBMolToModel(OpenBabel::OBMol& mol, model& m, bool add_hydrogens, bool strip_hydrogens) {
+    try {
+        parsing_struct p;
+        context c;
+        unsigned torsdof = GninaConverter::convertParsing(mol, p, c, add_hydrogens);
+        non_rigid_parsed nr;
+        postprocess_ligand(nr, p, c, torsdof);
+        VINA_CHECK(nr.atoms_atoms_bonds.dim() == nr.atoms.size());
+
+        pdbqt_initializer tmp;
+        tmp.initialize_from_nrp(nr, c, true);
+        tmp.initialize(nr.mobility_matrix());
+        if (strip_hydrogens)
+            tmp.m.strip_hydrogens();
+
+        m.append(tmp.m);
+        return true;
+    } catch (parse_error &e) {
+        std::cerr << "\n\nParse error with molecule " << mol.GetTitle() << " in file \"" << e.file.string()
+                  << "\": " << e.reason << '\n';
+        return false;
+    }
+}
+
 // remove a hydrogen from a
 static void decrement_hydrogen(OBMol &mol, OBAtom *a) {
 
@@ -503,27 +530,10 @@ bool MolGetter::readMoleculeIntoModel(model &m) {
           }
         }
 
-        try {
-          parsing_struct p;
-          context c;
-          unsigned torsdof = GninaConverter::convertParsing(mol, p, c, add_hydrogens);
-          non_rigid_parsed nr;
-          postprocess_ligand(nr, p, c, torsdof);
-          VINA_CHECK(nr.atoms_atoms_bonds.dim() == nr.atoms.size());
-
-          pdbqt_initializer tmp;
-          tmp.initialize_from_nrp(nr, c, true);
-          tmp.initialize(nr.mobility_matrix());
-          if (strip_hydrogens)
-            tmp.m.strip_hydrogens();
-
-          m.append(tmp.m);
+        if (convertOBMolToModel(mol, m, add_hydrogens, strip_hydrogens)) {
           return true;
-        } catch (parse_error &e) {
-          std::cerr << "\n\nParse error with molecule " << mol.GetTitle() << " in file \"" << e.file.string()
-                    << "\": " << e.reason << '\n';
-          continue;
         }
+        // On failure, continue to next molecule
       }
     }
 

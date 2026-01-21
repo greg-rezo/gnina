@@ -22,6 +22,7 @@
 #include <exception>
 #include <iostream>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <openbabel/babelconfig.h>
 #include <openbabel/mol.h>
@@ -1675,6 +1676,12 @@ Thank you!\n";
         "disable batch docking (process one ligand at a time, for debugging)")(
         "fast_embed", bool_switch(&settings.fast_embed)->default_value(false),
         "use fast template-based 3D coordinate generation for SMILES (skips distance geometry)")(
+        "parallel_embed", value<int>(&settings.parallel_embed)->default_value(1),
+        "generate N conformers per SMILES with different ring puckerings, each processed as separate ligand (default: 1)")(
+        "skip_torsion_randomize", bool_switch(&settings.skip_torsion_randomize)->default_value(false),
+        "skip torsion randomization (for debugging, not recommended for production)")(
+        "no_rdkit_smiles", bool_switch(&settings.no_rdkit_smiles)->default_value(false),
+        "use OpenBabel instead of RDKit for SMILES 3D generation (slower but may be more reliable)")(
         "cpu_grid", bool_switch(&settings.cpu_grid)->default_value(false),
         "use grid-based scoring for CPU local_only (to match GPU behavior)")(
         "bfgs_iterations", value<int>(&settings.bfgs_iterations)->default_value(50),
@@ -2145,6 +2152,8 @@ Thank you!\n";
       batch_mgr.exhaustiveness = settings.exhaustiveness;
       batch_mgr.max_gpu_memory = (size_t)(LigandBatchManager::get_available_gpu_memory() * 0.8);
       batch_mgr.fast_embed = settings.fast_embed;
+      batch_mgr.parallel_embed = settings.parallel_embed;
+      batch_mgr.skip_torsion_randomize = settings.skip_torsion_randomize;
 
       // Check if all inputs are SMILES files - use parallel RDKit loader if so
       bool all_smiles = true;
@@ -2157,9 +2166,11 @@ Thank you!\n";
       }
 
       size_t num_loaded;
-      if (all_smiles) {
+      // Use parallel RDKit 3D generation for SMILES-only input (faster)
+      // unless --no_rdkit_smiles is set (for debugging)
+      if (all_smiles && !settings.no_rdkit_smiles) {
         log << "Using parallel RDKit 3D generation for SMILES input\n";
-        num_loaded = batch_mgr.load_smiles_parallel(ligand_names, log, 0, settings.verbosity);
+        num_loaded = batch_mgr.load_smiles_parallel(mols, ligand_names, log, 0, settings.verbosity);
       } else {
         num_loaded = batch_mgr.load_all_ligands(mols, ligand_names, log, settings.verbosity);
       }
@@ -2457,67 +2468,184 @@ Thank you!\n";
       // ========================================================================
       // Phase 3: Sort, cluster, and write results for each ligand
       // ========================================================================
-      for (LigandData& ld : all_ligand_data) {
-        LigandDescriptor& lig = batch_mgr.all_ligands[ld.ligand_idx];
-        model& m = *lig.m;
-        output_container& out_cont = ld.out_cont;
+      // For multi-conformer mode: group poses by parent_ligand_id and aggregate
+      auto sorter = [&settings](const output_type& lhs, const output_type& rhs) {
+        switch (settings.sort_order) {
+        case Energy:
+          return lhs.e < rhs.e;
+        case CNNaffinity:
+          return lhs.cnnaffinity > rhs.cnnaffinity;
+        case CNNscore:
+        default:
+          return lhs.cnnscore > rhs.cnnscore;
+        }
+      };
 
-        // Sort by user's preferred metric
-        auto sorter = [&settings](const output_type& lhs, const output_type& rhs) {
-          switch (settings.sort_order) {
-          case Energy:
-            return lhs.e < rhs.e;
-          case CNNaffinity:
-            return lhs.cnnaffinity > rhs.cnnaffinity;
-          case CNNscore:
-          default:
-            return lhs.cnnscore > rhs.cnnscore;
-          }
+      // Check if we have multi-conformer ligands to aggregate
+      bool has_multi_conformer = false;
+      for (const LigandData& ld : all_ligand_data) {
+        if (batch_mgr.all_ligands[ld.ligand_idx].parent_ligand_id >= 0) {
+          has_multi_conformer = true;
+          break;
+        }
+      }
+
+      if (has_multi_conformer) {
+        // Group poses by parent_ligand_id
+        // Pose with source model reference
+        struct PoseWithModel {
+          output_type* pose;
+          model* source_model;
+          std::string parent_name;
         };
-        out_cont.sort(sorter);
+        std::map<int, std::vector<PoseWithModel>> parent_poses;
 
-        // Cluster by RMSD
-        phase_timer.start();
-        out_cont = remove_redundant(out_cont, settings.out_min_rmsd);
-        time_rmsd_clustering += phase_timer.elapsed().wall / 1e9;
+        for (LigandData& ld : all_ligand_data) {
+          LigandDescriptor& lig = batch_mgr.all_ligands[ld.ligand_idx];
+          int parent_id = lig.parent_ligand_id;
+          if (parent_id < 0) parent_id = lig.ligand_id;  // No parent, use self
 
-        // Convert to result_info and write
-        phase_timer.start();
-        std::vector<result_info> results;
-        sz how_many = 0;
-        VINA_FOR_IN(i, out_cont) {
-          if (!not_max(out_cont[i].e)) continue;
-          if (how_many >= settings.num_modes) break;
-
-          m.set(out_cont[i].c);
-          results.push_back(result_info(out_cont[i].e, out_cont[i].cnnscore,
-                                        out_cont[i].cnnaffinity, out_cont[i].cnnvariance,
-                                        -1, -1, m));
-          if (atomoutfile.is_open() || settings.include_atom_info) {
-            results.back().setAtomValues(m, &wt);
+          // Get parent name (strip _confN suffix if present)
+          std::string parent_name = lig.name;
+          size_t conf_pos = parent_name.rfind("_conf");
+          if (conf_pos != std::string::npos) {
+            parent_name = parent_name.substr(0, conf_pos);
           }
-          how_many++;
-        }
-        time_result_creation += phase_timer.elapsed().wall / 1e9;
 
-        // Write results
-        phase_timer.start();
-        if (outfile) {
-          for (unsigned j = 0; j < results.size(); j++) {
-            results[j].write(outfile, outext, settings.include_atom_info, &wt, j + 1);
+          for (sz i = 0; i < ld.out_cont.size(); i++) {
+            parent_poses[parent_id].push_back({&ld.out_cont[i], lig.m.get(), parent_name});
           }
         }
-        if (outflex) {
-          for (unsigned j = 0; j < results.size(); j++) {
-            results[j].writeFlex(outflex, outfext, j + 1);
+
+        // Process each parent ligand
+        for (auto& [parent_id, poses] : parent_poses) {
+          if (poses.empty()) continue;
+
+          // Sort all poses from this parent by score
+          std::sort(poses.begin(), poses.end(),
+            [&sorter](const PoseWithModel& a, const PoseWithModel& b) {
+              return sorter(*a.pose, *b.pose);
+            });
+
+          // Cluster by RMSD (coords already computed in Phase 1)
+          phase_timer.start();
+          std::vector<PoseWithModel> clustered;
+          for (const PoseWithModel& p : poses) {
+            bool dominated = false;
+            for (const PoseWithModel& existing : clustered) {
+              fl this_rmsd = 0;
+              if (p.pose->coords.size() == existing.pose->coords.size()) {
+                for (sz i = 0; i < p.pose->coords.size(); i++) {
+                  fl dx = p.pose->coords[i][0] - existing.pose->coords[i][0];
+                  fl dy = p.pose->coords[i][1] - existing.pose->coords[i][1];
+                  fl dz = p.pose->coords[i][2] - existing.pose->coords[i][2];
+                  this_rmsd += dx*dx + dy*dy + dz*dz;
+                }
+                this_rmsd = std::sqrt(this_rmsd / p.pose->coords.size());
+                if (this_rmsd < settings.out_min_rmsd) {
+                  dominated = true;
+                  break;
+                }
+              }
+            }
+            if (!dominated) {
+              clustered.push_back(p);
+            }
           }
-        }
-        if (atomoutfile) {
-          for (unsigned j = 0; j < results.size(); j++) {
-            results[j].writeAtomValues(atomoutfile, &wt);
+          time_rmsd_clustering += phase_timer.elapsed().wall / 1e9;
+
+          // Convert to result_info and write
+          phase_timer.start();
+          std::vector<result_info> results;
+          sz how_many = 0;
+          for (const PoseWithModel& p : clustered) {
+            if (!not_max(p.pose->e)) continue;
+            if (how_many >= settings.num_modes) break;
+
+            p.source_model->set(p.pose->c);
+            results.push_back(result_info(p.pose->e, p.pose->cnnscore,
+                                          p.pose->cnnaffinity, p.pose->cnnvariance,
+                                          -1, -1, *p.source_model));
+            // Override name with parent name (strip _confN suffix)
+            results.back().setName(p.parent_name);
+            if (atomoutfile.is_open() || settings.include_atom_info) {
+              results.back().setAtomValues(*p.source_model, &wt);
+            }
+            how_many++;
           }
+          time_result_creation += phase_timer.elapsed().wall / 1e9;
+
+          // Write results
+          phase_timer.start();
+          if (outfile) {
+            for (unsigned j = 0; j < results.size(); j++) {
+              results[j].write(outfile, outext, settings.include_atom_info, &wt, j + 1);
+            }
+          }
+          if (outflex) {
+            for (unsigned j = 0; j < results.size(); j++) {
+              results[j].writeFlex(outflex, outfext, j + 1);
+            }
+          }
+          if (atomoutfile) {
+            for (unsigned j = 0; j < results.size(); j++) {
+              results[j].writeAtomValues(atomoutfile, &wt);
+            }
+          }
+          time_file_writing += phase_timer.elapsed().wall / 1e9;
         }
-        time_file_writing += phase_timer.elapsed().wall / 1e9;
+      } else {
+        // Original behavior for non-multi-conformer mode
+        for (LigandData& ld : all_ligand_data) {
+          LigandDescriptor& lig = batch_mgr.all_ligands[ld.ligand_idx];
+          model& m = *lig.m;
+          output_container& out_cont = ld.out_cont;
+
+          out_cont.sort(sorter);
+
+          // Cluster by RMSD
+          phase_timer.start();
+          out_cont = remove_redundant(out_cont, settings.out_min_rmsd);
+          time_rmsd_clustering += phase_timer.elapsed().wall / 1e9;
+
+          // Convert to result_info and write
+          phase_timer.start();
+          std::vector<result_info> results;
+          sz how_many = 0;
+          VINA_FOR_IN(i, out_cont) {
+            if (!not_max(out_cont[i].e)) continue;
+            if (how_many >= settings.num_modes) break;
+
+            m.set(out_cont[i].c);
+            results.push_back(result_info(out_cont[i].e, out_cont[i].cnnscore,
+                                          out_cont[i].cnnaffinity, out_cont[i].cnnvariance,
+                                          -1, -1, m));
+            if (atomoutfile.is_open() || settings.include_atom_info) {
+              results.back().setAtomValues(m, &wt);
+            }
+            how_many++;
+          }
+          time_result_creation += phase_timer.elapsed().wall / 1e9;
+
+          // Write results
+          phase_timer.start();
+          if (outfile) {
+            for (unsigned j = 0; j < results.size(); j++) {
+              results[j].write(outfile, outext, settings.include_atom_info, &wt, j + 1);
+            }
+          }
+          if (outflex) {
+            for (unsigned j = 0; j < results.size(); j++) {
+              results[j].writeFlex(outflex, outfext, j + 1);
+            }
+          }
+          if (atomoutfile) {
+            for (unsigned j = 0; j < results.size(); j++) {
+              results[j].writeAtomValues(atomoutfile, &wt);
+            }
+          }
+          time_file_writing += phase_timer.elapsed().wall / 1e9;
+        }
       }
 
       // Print post-processing timing breakdown

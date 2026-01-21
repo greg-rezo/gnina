@@ -8,6 +8,7 @@
 #ifndef MOLGETTER_H_
 #define MOLGETTER_H_
 
+#include "model.h"
 #include "covinfo.h"
 #include "flexinfo.h"
 #include "model.h"
@@ -75,5 +76,8 @@ public:
 private:
   bool createCovalentMoleculeInModel(model &m);
 };
+
+// Standalone function to convert OBMol to model (shared by SDF loading and RDKit SMILES paths)
+bool convertOBMolToModel(OpenBabel::OBMol& mol, model& m, bool add_hydrogens, bool strip_hydrogens);
 
 #endif /* MOLGETTER_H_ */

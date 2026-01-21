@@ -39,13 +39,26 @@ struct LigandDescriptor {
     // GPU state
     bool gpu_initialized;
 
+    // Multiple embedded conformers (for --parallel_embed)
+    // Each conformer stores full atom coordinates [num_atoms * 3]
+    // Different conformers have different ring puckerings
+    std::vector<std::vector<float>> embedded_coords;
+    int num_embedded_conformers = 1;
+
+    // Parent ligand tracking (for multi-conformer mode)
+    // When parallel_embed > 1, each conformer becomes a separate LigandDescriptor
+    // with the same parent_ligand_id, allowing results to be grouped together
+    int parent_ligand_id = -1;  // -1 means this is the original (or only) conformer
+    int conformer_index = 0;    // Which conformer this is (0-indexed)
+
     // Results per pose
     std::vector<float> energies;
     std::vector<std::vector<float>> conformations;
 
     LigandDescriptor()
         : ligand_id(0), num_atoms(0), num_torsions(0), num_nodes(0),
-          n_conf(0), n_change(0), gpu_initialized(false) {}
+          n_conf(0), n_change(0), gpu_initialized(false), num_embedded_conformers(1),
+          parent_ligand_id(-1), conformer_index(0) {}
 
     // Move constructor (models are non-copyable)
     LigandDescriptor(LigandDescriptor&& other) = default;
@@ -94,6 +107,8 @@ public:
     int exhaustiveness;        // Poses per ligand (uniform across all ligands)
     size_t max_gpu_memory;     // Maximum GPU memory to use (bytes)
     bool fast_embed;           // Use fast template-based 3D generation (skips distance geometry)
+    int parallel_embed;        // Number of conformers per SMILES (for --parallel_embed)
+    bool skip_torsion_randomize; // Use embedded coords directly (preserve ring geometry)
 
     // Loaded ligands
     std::vector<LigandDescriptor> all_ligands;
@@ -103,7 +118,8 @@ public:
 
     LigandBatchManager()
         : target_total_poses(50000), exhaustiveness(1024),
-          max_gpu_memory(0), fast_embed(false) {}
+          max_gpu_memory(0), fast_embed(false), parallel_embed(1),
+          skip_torsion_randomize(false) {}
 
     // Phase 1: Load all ligands from input files into CPU memory
     // Returns number of ligands loaded
@@ -116,7 +132,9 @@ public:
 
     // Phase 1 (parallel): Load SMILES files with parallel 3D generation
     // Much faster than serial OpenBabel for SMILES input
+    // mols provides the receptor model (with grid_atoms) for proper scoring
     size_t load_smiles_parallel(
+        MolGetter& mols,
         const std::vector<std::string>& ligand_names,
         tee& log,
         int num_threads = 0,  // 0 = auto-detect

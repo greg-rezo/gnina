@@ -21,13 +21,19 @@
 #include "parsing.h"
 #include "parse_pdbqt.h"
 #include "GninaConverter.h"
+#include "molgetter.h"
 
 // RDKit includes for parallel 3D generation (thread-safe)
 #include <GraphMol/GraphMol.h>
 #include <GraphMol/SmilesParse/SmilesParse.h>
 #include <GraphMol/MolOps.h>
 #include <GraphMol/DistGeomHelpers/Embedder.h>
+#include <GraphMol/FileParsers/FileParsers.h>
 #include <Geometry/point.h>
+
+// OpenBabel includes for SDF parsing
+#include <openbabel/obconversion.h>
+#include <openbabel/mol.h>
 
 // ============================================================================
 // LigandBatchGroup Methods
@@ -181,6 +187,40 @@ size_t LigandBatchManager::load_all_ligands(
                     log << "Loaded ligand " << desc.ligand_id << ": " << desc.name
                         << " (atoms=" << desc.num_atoms
                         << ", torsions=" << desc.num_torsions << ")\n";
+                }
+
+                // Log atom smina types for first ligand
+                if (all_ligands.empty() && verbosity >= 1) {
+                    const auto& atoms = desc.m->get_movable_atoms();
+                    std::cout << "SDF path - All atom smina types: [";
+                    for (size_t i = 0; i < atoms.size(); i++) {
+                        if (i > 0) std::cout << ",";
+                        std::cout << atoms[i].sm;
+                    }
+                    std::cout << "]\n";
+
+                    // Log ALL atom charges for debugging
+                    std::cout << std::fixed << std::setprecision(4);
+                    std::cout << "SDF path - All atom charges: [";
+                    for (size_t i = 0; i < atoms.size(); i++) {
+                        if (i > 0) std::cout << ",";
+                        std::cout << atoms[i].charge;
+                    }
+                    std::cout << "]\n";
+                    std::cout << std::defaultfloat;
+
+                    // Log number of intramolecular pairs
+                    if (!desc.m->ligands.empty()) {
+                        std::cout << "SDF path - Intramolecular pairs: " << desc.m->ligands[0].pairs.size() << "\n";
+                        // Log first 5 pairs
+                        const auto& pairs = desc.m->ligands[0].pairs;
+                        std::cout << "SDF path - First 5 pairs (a,b,t1,t2): ";
+                        for (size_t i = 0; i < std::min((size_t)5, pairs.size()); i++) {
+                            if (i > 0) std::cout << " | ";
+                            std::cout << "(" << pairs[i].a << "," << pairs[i].b << "," << pairs[i].t1 << "," << pairs[i].t2 << ")";
+                        }
+                        std::cout << "\n";
+                    }
                 }
 
                 all_ligands.push_back(std::move(desc));
@@ -423,10 +463,12 @@ static std::unique_ptr<RDKit::RWMol> generate_3d_fast(
 
 // Process a single SMILES to RDKit RWMol with 3D coords (thread-safe)
 // Uses RDKit EmbedMolecule with ETKDGv3 - no force field optimization
+// num_conformers: if > 1, generates multiple conformers with different ring puckerings
 static std::unique_ptr<RDKit::RWMol> generate_3d_from_smiles_rdkit(
-    const std::string& smiles, const std::string& name, bool fast_embed = false) {
+    const std::string& smiles, const std::string& name, bool fast_embed = false,
+    int num_conformers = 1) {
 
-    // Use fast template-based generation if requested
+    // Use fast template-based generation if requested (doesn't support multi-conformer)
     if (fast_embed) {
         return generate_3d_fast(smiles, name);
     }
@@ -442,33 +484,60 @@ static std::unique_ptr<RDKit::RWMol> generate_3d_from_smiles_rdkit(
 
     // Generate 3D coordinates with ETKDGv3 (fast, good quality)
     RDKit::DGeomHelpers::EmbedParameters params = RDKit::DGeomHelpers::ETKDGv3;
-    params.randomSeed = -1;  // Use random seed for variety
-    int result = RDKit::DGeomHelpers::EmbedMolecule(*mol, params);
+    params.randomSeed = 42;  // Fixed seed for reproducibility
+    params.useSmallRingTorsions = true;  // Important for ring puckering diversity
 
-    // Fallback to random coordinates if embedding fails
-    if (result == -1) {
-        RDKit::DGeomHelpers::EmbedParameters fallback;
-        fallback.useRandomCoords = true;
-        fallback.randomSeed = -1;
-        result = RDKit::DGeomHelpers::EmbedMolecule(*mol, fallback);
-    }
+    if (num_conformers > 1) {
+        // Generate multiple conformers in same mol
+        // RDKit will generate diverse conformers with different ring puckerings
+        std::vector<int> cids;
+        RDKit::DGeomHelpers::EmbedMultipleConfs(*mol, cids, num_conformers, params);
 
-    if (result == -1) {
-        return nullptr;
+        // If we didn't get any conformers, try fallback
+        if (cids.empty()) {
+            RDKit::DGeomHelpers::EmbedParameters fallback;
+            fallback.useRandomCoords = true;
+            fallback.randomSeed = 42;
+            int result = RDKit::DGeomHelpers::EmbedMolecule(*mol, fallback);
+            if (result == -1) {
+                return nullptr;
+            }
+        }
+    } else {
+        int result = RDKit::DGeomHelpers::EmbedMolecule(*mol, params);
+
+        // Fallback to random coordinates if embedding fails
+        if (result == -1) {
+            RDKit::DGeomHelpers::EmbedParameters fallback;
+            fallback.useRandomCoords = true;
+            fallback.randomSeed = 42;
+            result = RDKit::DGeomHelpers::EmbedMolecule(*mol, fallback);
+        }
+
+        if (result == -1) {
+            return nullptr;
+        }
     }
 
     // Set molecule name
     mol->setProp("_Name", name);
 
+    // Keep hydrogens from RDKit embedding - don't remove them
+    // This makes the SDF we write identical to loading an SDF file with Hs
+    // (Previously we removed Hs and let OpenBabel re-add them, which changes atom ordering)
+
     return mol;
 }
 
 size_t LigandBatchManager::load_smiles_parallel(
+    MolGetter& mols,
     const std::vector<std::string>& ligand_names,
     tee& log,
     int num_threads,
     int verbosity
 ) {
+    // Get receptor model for grid_atoms (critical for correct scoring!)
+    const model& receptor_model = mols.getInitModel();
     all_ligands.clear();
 
     // Step 1: Read all SMILES entries (serial, fast)
@@ -528,6 +597,9 @@ size_t LigandBatchManager::load_smiles_parallel(
         if (fast_embed) {
             log << " (fast template-based)";
         }
+        if (parallel_embed > 1) {
+            log << " (" << parallel_embed << " conformers/mol)";
+        }
         log << "...\n";
     }
 
@@ -537,11 +609,12 @@ size_t LigandBatchManager::load_smiles_parallel(
     auto start_time = std::chrono::high_resolution_clock::now();
 
     bool use_fast = fast_embed;  // Capture for OpenMP
+    int n_conformers = parallel_embed;  // Capture for OpenMP
     #pragma omp parallel for num_threads(num_threads) schedule(dynamic, 10)
     for (size_t i = 0; i < entries.size(); i++) {
         const SmilesEntry& entry = entries[i];
         try {
-            rdkit_mols[i] = generate_3d_from_smiles_rdkit(entry.smiles, entry.name, use_fast);
+            rdkit_mols[i] = generate_3d_from_smiles_rdkit(entry.smiles, entry.name, use_fast, n_conformers);
         } catch (...) {
             // Failed - leave as nullptr
         }
@@ -563,34 +636,116 @@ size_t LigandBatchManager::load_smiles_parallel(
     }
 
     // Step 4: Convert to gnina models serially (OpenBabel not thread-safe)
-    std::vector<std::unique_ptr<model>> models(entries.size());
-    std::vector<bool> success_flags(entries.size(), false);
+    // For multi-conformer mode: create separate model for each conformer
+    // Each model captures the ring puckering of that conformer in its reference coords
+    struct ModelInfo {
+        std::unique_ptr<model> m;
+        unsigned int original_index;  // Which SMILES entry
+        int conformer_index;          // Which conformer (0 for single-conformer mode)
+        std::string name;
+    };
+    std::vector<ModelInfo> all_models;
+    all_models.reserve(entries.size() * parallel_embed);
 
+    int models_created = 0;
     for (size_t i = 0; i < entries.size(); i++) {
         if (!rdkit_mols[i]) continue;
 
         const SmilesEntry& entry = entries[i];
-        try {
-            // Convert RDKit mol to gnina model via GninaConverter (uses OpenBabel internally)
-            auto m = std::make_unique<model>();
-            m->set_name(entry.name);
+        RDKit::RWMol* rdmol = rdkit_mols[i].get();
+        int num_confs = rdmol->getNumConformers();
 
-            parsing_struct p;
-            context c;
-            unsigned torsdof = GninaConverter::convertParsing(*rdkit_mols[i], p, c, true);
+        // For multi-conformer mode: create model for each conformer
+        // For single-conformer mode: just use the first (only) conformer
+        int confs_to_process = (parallel_embed > 1) ? num_confs : 1;
 
-            non_rigid_parsed nr;
-            postprocess_ligand(nr, p, c, torsdof);
+        for (int cid = 0; cid < confs_to_process; cid++) {
+            try {
+                // Create a copy of the mol with only this conformer
+                // This ensures we use the correct ring puckering
+                RDKit::RWMol mol_copy(*rdmol);
 
-            pdbqt_initializer tmp;
-            tmp.initialize_from_nrp(nr, c, true);
-            tmp.initialize(nr.mobility_matrix());
-            m->append(tmp.m);
+                // Get conformer IDs and remove all except the one we want
+                std::vector<unsigned int> conf_ids;
+                for (auto it = mol_copy.beginConformers(); it != mol_copy.endConformers(); ++it) {
+                    conf_ids.push_back((*it)->getId());
+                }
 
-            models[i] = std::move(m);
-            success_flags[i] = true;
-        } catch (...) {
-            // Failed - leave as nullptr
+                // Remove all conformers except cid
+                for (unsigned int conf_id : conf_ids) {
+                    if ((int)conf_id != cid) {
+                        mol_copy.removeConformer(conf_id);
+                    }
+                }
+
+                std::string conf_name = entry.name;
+                if (parallel_embed > 1 && num_confs > 1) {
+                    conf_name += "_conf" + std::to_string(cid);
+                }
+
+                // Write RDKit mol to SDF string (with hydrogens)
+                std::string sdf_block = RDKit::MolToMolBlock(mol_copy);
+                sdf_block += "$$$$\n";
+
+                // DEBUG: Save first molecule's intermediate SDF for debugging
+                static bool saved_intermediate = false;
+                if (!saved_intermediate) {
+                    std::ofstream debug_sdf("intermediate_smi_pose.sdf");
+                    if (debug_sdf) {
+                        debug_sdf << sdf_block;
+                        std::cerr << "DEBUG: Saved intermediate SDF to intermediate_smi_pose.sdf" << std::endl;
+                    }
+                    saved_intermediate = true;
+                }
+
+                // Parse with OpenBabel - replicate EXACT code from molgetter.cpp OB case
+                std::istringstream sdf_stream(sdf_block);
+                OpenBabel::OBConversion conv;
+                conv.SetInFormat("sdf");
+                conv.SetInStream(&sdf_stream);
+
+                OpenBabel::OBMol obmol;
+                if (!conv.Read(&obmol)) {
+                    std::cerr << "Warning: OpenBabel failed to parse SDF for " << conf_name << std::endl;
+                    continue;
+                }
+
+                // Match molgetter.cpp OB case exactly
+                obmol.SetTitle(conf_name.c_str());
+                obmol.StripSalts();
+
+                if (obmol.NumAtoms() == 0) {
+                    std::cerr << "Warning: Empty molecule " << conf_name << std::endl;
+                    continue;
+                }
+
+                // Convert using same function as molgetter
+                auto m = std::make_unique<model>();
+                m->set_name(conf_name);
+
+                if (!convertOBMolToModel(obmol, *m, true, false)) {
+                    std::cerr << "Warning: Failed to convert " << conf_name << " to model" << std::endl;
+                    continue;
+                }
+
+                // Copy receptor's grid_atoms for proper grid-based scoring
+                // This is CRITICAL - without this, the scoring grid is empty!
+                m->grid_atoms = receptor_model.grid_atoms;
+
+                ModelInfo info;
+                info.m = std::move(m);
+                info.original_index = entry.original_index;
+                info.conformer_index = cid;
+                info.name = conf_name;
+                all_models.push_back(std::move(info));
+                models_created++;
+            } catch (const std::exception& e) {
+                // Failed - skip this conformer and log reason
+                std::cerr << "Warning: Skipping " << entry.name << ": " << e.what() << std::endl;
+            } catch (...) {
+                // Unknown error - skip this conformer
+                std::cerr << "Warning: Skipping " << entry.name << ": unknown error" << std::endl;
+            }
         }
     }
 
@@ -598,12 +753,12 @@ size_t LigandBatchManager::load_smiles_parallel(
     double convert_elapsed = std::chrono::duration<double>(convert_time - embed_time).count();
 
     if (verbosity >= 1) {
-        size_t convert_count = 0;
-        for (const auto& flag : success_flags) {
-            if (flag) convert_count++;
-        }
         log << "Model conversion: " << std::fixed << std::setprecision(1)
-            << convert_elapsed << "s, " << convert_count << " models created\n";
+            << convert_elapsed << "s, " << models_created << " models created";
+        if (parallel_embed > 1) {
+            log << " (" << parallel_embed << " conformers/mol)";
+        }
+        log << "\n";
     }
 
     // Clear RDKit mols to free memory and avoid double-free on destruction
@@ -612,20 +767,22 @@ size_t LigandBatchManager::load_smiles_parallel(
     rdkit_mols.shrink_to_fit();
 
     // Step 5: Collect successful results
+    // For multi-conformer mode: each conformer is a separate ligand with parent tracking
     unsigned int skipped = 0;
     const unsigned int MAX_ATOMS = 150;
     const unsigned int MAX_TORSIONS = 30;
 
-    for (size_t i = 0; i < entries.size(); i++) {
-        if (!success_flags[i] || !models[i]) {
+    for (size_t i = 0; i < all_models.size(); i++) {
+        ModelInfo& info = all_models[i];
+        if (!info.m) {
             skipped++;
             continue;
         }
 
         LigandDescriptor desc;
-        desc.ligand_id = entries[i].original_index;
-        desc.name = entries[i].name;
-        desc.m = std::move(models[i]);
+        desc.ligand_id = all_ligands.size();  // Sequential ID for batch processing
+        desc.name = info.name;
+        desc.m = std::move(info.m);
 
         extract_size_metrics(*desc.m, desc.num_atoms, desc.num_torsions,
                            desc.num_nodes, desc.n_conf, desc.n_change);
@@ -640,6 +797,17 @@ size_t LigandBatchManager::load_smiles_parallel(
             }
             continue;
         }
+
+        // Track parent ligand for multi-conformer mode
+        if (parallel_embed > 1) {
+            desc.parent_ligand_id = info.original_index;
+            desc.conformer_index = info.conformer_index;
+        } else {
+            desc.parent_ligand_id = -1;  // Not using multi-conformer
+            desc.conformer_index = 0;
+        }
+
+        desc.num_embedded_conformers = 1;  // Each LigandDescriptor is now one conformer
 
         all_ligands.push_back(std::move(desc));
     }
@@ -804,6 +972,124 @@ void LigandBatchManager::process_batch(
                          group.max_atoms, group.max_nodes);
 
     CUDA_CHECK_GNINA(cudaEventRecord(end_setup));
+
+    // Log box and initial ligand centroid for debugging
+    if (verbosity >= 1) {
+        std::cout << "Docking box: min=(" << box_min.x << "," << box_min.y << "," << box_min.z
+                  << ") max=(" << box_max.x << "," << box_max.y << "," << box_max.z << ")\n";
+
+        // Compute and log center of mass for first ligand's reference coordinates
+        if (!group.ligands.empty()) {
+            LigandDescriptor* lig = group.ligands[0];
+            const atomv& atoms = lig->m->atoms;
+            double cx = 0, cy = 0, cz = 0;
+            int n_heavy = 0;
+            for (size_t i = 0; i < atoms.size(); i++) {
+                if (!atoms[i].is_hydrogen()) {
+                    // atoms[i].coords are the LOCAL/RELATIVE coordinates stored in the model
+                    cx += atoms[i].coords[0];
+                    cy += atoms[i].coords[1];
+                    cz += atoms[i].coords[2];
+                    n_heavy++;
+                }
+            }
+            if (n_heavy > 0) {
+                cx /= n_heavy;
+                cy /= n_heavy;
+                cz /= n_heavy;
+            }
+            std::cout << "First ligand '" << lig->name << "' stored (local) coords centroid: ("
+                      << cx << "," << cy << "," << cz << ") [" << n_heavy << " heavy atoms]\n";
+
+            // Log first 5 atom local coords for debugging
+            std::cout << std::fixed << std::setprecision(6);
+            std::cout << "First 5 atom local coords (heavy atoms only):\n";
+            int count = 0;
+            for (size_t i = 0; i < atoms.size() && count < 5; i++) {
+                if (!atoms[i].is_hydrogen()) {
+                    std::cout << "  atom " << i << " (sm=" << atoms[i].sm
+                              << " Z=" << smina_atom_type::data[atoms[i].sm].anum
+                              << "): (" << atoms[i].coords[0] << ", " << atoms[i].coords[1]
+                              << ", " << atoms[i].coords[2] << ")\n";
+                    count++;
+                }
+            }
+            std::cout << std::defaultfloat;
+
+            // Log ALL atom smina types for debugging
+            std::cout << "All atom smina types: [";
+            for (size_t i = 0; i < atoms.size(); i++) {
+                if (i > 0) std::cout << ",";
+                std::cout << atoms[i].sm;
+            }
+            std::cout << "]\n";
+
+            // Log ALL atom charges for debugging
+            std::cout << std::fixed << std::setprecision(4);
+            std::cout << "All atom charges: [";
+            for (size_t i = 0; i < atoms.size(); i++) {
+                if (i > 0) std::cout << ",";
+                std::cout << atoms[i].charge;
+            }
+            std::cout << "]\n";
+            std::cout << std::defaultfloat;
+
+            // Log number of intramolecular pairs
+            if (!lig->m->ligands.empty()) {
+                std::cout << "Intramolecular pairs: " << lig->m->ligands[0].pairs.size() << "\n";
+                // Log first 5 pairs
+                const auto& pairs = lig->m->ligands[0].pairs;
+                std::cout << "First 5 pairs (a,b,t1,t2): ";
+                for (size_t i = 0; i < std::min((size_t)5, pairs.size()); i++) {
+                    if (i > 0) std::cout << " | ";
+                    std::cout << "(" << pairs[i].a << "," << pairs[i].b << "," << pairs[i].t1 << "," << pairs[i].t2 << ")";
+                }
+                std::cout << "\n";
+            }
+
+            // Also log the ligand root origin (absolute position)
+            if (!lig->m->ligands.empty()) {
+                const vec& origin = lig->m->ligands[0].node.get_origin();
+                std::cout << "First ligand root origin (absolute): ("
+                          << origin[0] << "," << origin[1] << "," << origin[2] << ")\n";
+
+                // Log segment structure: which atoms belong to which segment
+                std::cout << "Segment structure (node -> atom range, atomic nums):\n";
+
+                // Helper to print atomic numbers for atom range
+                auto print_segment_atoms = [&atoms](sz begin, sz end) {
+                    std::cout << " [";
+                    for (sz i = begin; i < end && i < atoms.size(); i++) {
+                        if (i > begin) std::cout << ",";
+                        // Get atomic number from smina type
+                        std::cout << smina_atom_type::data[atoms[i].sm].anum;
+                    }
+                    std::cout << "]";
+                };
+
+                // Root segment
+                std::cout << "  Root: atoms [" << lig->m->ligands[0].node.begin
+                          << ", " << lig->m->ligands[0].node.end << ")";
+                print_segment_atoms(lig->m->ligands[0].node.begin, lig->m->ligands[0].node.end);
+                std::cout << "\n";
+
+                // Count torsion segments by traversing children
+                std::function<void(const branch&, int)> print_branch = [&](const branch& b, int depth) {
+                    std::cout << "  Torsion " << depth << ": atoms [" << b.node.begin
+                              << ", " << b.node.end << ")";
+                    print_segment_atoms(b.node.begin, b.node.end);
+                    std::cout << "\n";
+                    for (const auto& child : b.children) {
+                        print_branch(child, depth + 1);
+                    }
+                };
+                int torsion_idx = 0;
+                for (const auto& child : lig->m->ligands[0].children) {
+                    print_branch(child, torsion_idx++);
+                }
+            }
+        }
+    }
 
     // Launch BFGS
     launch_parallel_bfgs(batch, mem, max_iterations, box_min, box_max, seed, verbosity);

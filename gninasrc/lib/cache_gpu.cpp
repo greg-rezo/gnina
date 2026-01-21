@@ -1,5 +1,6 @@
 #include "cache_gpu.h"
 #include "device_buffer.h"
+#include <iostream>
 
 void cache_gpu::populate(const model& m, const precalculate& p,
     const std::vector<smt>& atom_types_needed, grid& user_grid,
@@ -15,6 +16,7 @@ void cache_gpu::populate(const model& m, const precalculate& p,
   VINA_FOR(i, info.num_movable_atoms) {
     movingtypes[i] = m.atoms[i].get();
   }
+
 
   definitelyPinnedMemcpy(info.types, &movingtypes[0],
       sizeof(unsigned[info.num_movable_atoms]), cudaMemcpyHostToDevice);
