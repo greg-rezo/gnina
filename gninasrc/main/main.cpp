@@ -2573,6 +2573,12 @@ Thank you!\n";
               return sorter(*a.pose, *b.pose);
             });
 
+          // Trim to max_to_refine (same as single-conformer path)
+          sz max_to_refine = settings.num_modes * 20;
+          if (poses.size() > max_to_refine) {
+            poses.resize(max_to_refine);
+          }
+
           // Cluster by RMSD (coords already computed in Phase 1)
           phase_timer.start();
           std::vector<PoseWithModel> clustered;

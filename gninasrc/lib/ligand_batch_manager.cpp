@@ -48,7 +48,8 @@ void LigandBatchGroup::compute_max_dimensions(const std::vector<LigandDescriptor
     max_nodes = 0;
     max_conf_size = 0;
     max_change_size = 0;
-    total_optimizers = 0;
+    // Note: total_optimizers is NOT computed here - it's managed by sort_and_group_ligands
+    // to correctly handle multi-conformer mode (count once per parent, not per conformer)
 
     for (size_t idx : ligand_indices) {
         const LigandDescriptor& lig = all_ligands[idx];
@@ -57,8 +58,6 @@ void LigandBatchGroup::compute_max_dimensions(const std::vector<LigandDescriptor
         if (lig.num_nodes > (unsigned)max_nodes) max_nodes = lig.num_nodes;
         if (lig.n_conf > max_conf_size) max_conf_size = lig.n_conf;
         if (lig.n_change > max_change_size) max_change_size = lig.n_change;
-
-        total_optimizers += exhaustiveness;
     }
 }
 
@@ -492,6 +491,7 @@ static std::unique_ptr<RDKit::RWMol> generate_3d_from_smiles_rdkit(
     RDKit::DGeomHelpers::EmbedParameters params = RDKit::DGeomHelpers::ETKDGv3;
     params.randomSeed = 42;  // Fixed seed for reproducibility
     params.useSmallRingTorsions = true;  // Important for ring puckering diversity
+    params.numThreads = 1;  // Single-threaded since we parallelize across molecules with OpenMP
 
     // Set RMSD pruning threshold if positive (skip conformers too similar to existing ones)
     if (prune_rms_thresh > 0) {
@@ -509,6 +509,7 @@ static std::unique_ptr<RDKit::RWMol> generate_3d_from_smiles_rdkit(
             RDKit::DGeomHelpers::EmbedParameters fallback;
             fallback.useRandomCoords = true;
             fallback.randomSeed = 42;
+            fallback.numThreads = 1;
             int result = RDKit::DGeomHelpers::EmbedMolecule(*mol, fallback);
             if (result == -1) {
                 return nullptr;
@@ -522,6 +523,7 @@ static std::unique_ptr<RDKit::RWMol> generate_3d_from_smiles_rdkit(
             RDKit::DGeomHelpers::EmbedParameters fallback;
             fallback.useRandomCoords = true;
             fallback.randomSeed = 42;
+            fallback.numThreads = 1;
             result = RDKit::DGeomHelpers::EmbedMolecule(*mol, fallback);
         }
 
@@ -827,44 +829,90 @@ void LigandBatchManager::sort_and_group_ligands(int verbosity) {
 
     if (all_ligands.empty()) return;
 
-    // Create sorted indices by (num_atoms, num_torsions)
-    std::vector<size_t> indices(all_ligands.size());
-    for (size_t i = 0; i < indices.size(); i++) {
-        indices[i] = i;
+    // Build parent groups: map parent_ligand_id -> list of ligand indices
+    // For single-conformer mode (parent_id == -1), each ligand is its own group
+    std::vector<std::vector<size_t>> parent_groups;
+    std::unordered_map<int, size_t> parent_to_group;  // parent_ligand_id -> group index
+
+    for (size_t i = 0; i < all_ligands.size(); i++) {
+        int parent_id = all_ligands[i].parent_ligand_id;
+
+        if (parent_id == -1) {
+            // Single-conformer: own group
+            parent_groups.push_back({i});
+        } else {
+            // Multi-conformer: group by parent
+            auto it = parent_to_group.find(parent_id);
+            if (it == parent_to_group.end()) {
+                parent_to_group[parent_id] = parent_groups.size();
+                parent_groups.push_back({i});
+            } else {
+                parent_groups[it->second].push_back(i);
+            }
+        }
     }
 
-    std::sort(indices.begin(), indices.end(), [this](size_t a, size_t b) {
-        const auto& la = all_ligands[a];
-        const auto& lb = all_ligands[b];
+    if (verbosity >= 1) {
+        int multi_conformer_parents = 0;
+        int total_conformers = 0;
+        for (const auto& pg : parent_groups) {
+            if (pg.size() > 1) {
+                multi_conformer_parents++;
+                total_conformers += pg.size();
+            }
+        }
+        if (multi_conformer_parents > 0) {
+            std::cerr << "Multi-conformer mode: " << multi_conformer_parents
+                      << " parent molecules with " << total_conformers << " total conformers\n";
+        }
+    }
+
+    // Sort parent groups by representative size (first conformer's size)
+    std::vector<size_t> group_order(parent_groups.size());
+    for (size_t i = 0; i < group_order.size(); i++) {
+        group_order[i] = i;
+    }
+
+    std::sort(group_order.begin(), group_order.end(), [this, &parent_groups](size_t a, size_t b) {
+        const auto& la = all_ligands[parent_groups[a][0]];
+        const auto& lb = all_ligands[parent_groups[b][0]];
         if (la.num_atoms != lb.num_atoms) {
             return la.num_atoms < lb.num_atoms;
         }
         return la.num_torsions < lb.num_torsions;
     });
 
-    // Group into batches
+    // Group into batches - add entire parent groups together
+    // Count exhaustiveness once per parent, not per conformer
     LigandBatchGroup current_batch;
     current_batch.exhaustiveness = exhaustiveness;
 
-    for (size_t idx : indices) {
-        const LigandDescriptor& lig = all_ligands[idx];
+    for (size_t group_idx : group_order) {
+        const auto& parent_group = parent_groups[group_idx];
+        const LigandDescriptor& rep_lig = all_ligands[parent_group[0]];
 
-        // Check if adding this ligand would exceed limits
+        // Check if adding this parent group would exceed limits
+        // Count exhaustiveness once per parent, not per conformer
         int new_total = current_batch.total_optimizers + exhaustiveness;
         bool would_exceed_poses = (new_total > target_total_poses && !current_batch.ligand_indices.empty());
 
-        // Estimate memory for potential new batch
+        // Estimate memory for potential new batch (need to add all conformers)
         LigandBatchGroup test_batch = current_batch;
-        test_batch.ligand_indices.push_back(idx);
+        for (size_t idx : parent_group) {
+            test_batch.ligand_indices.push_back(idx);
+        }
         test_batch.compute_max_dimensions(all_ligands);
+        // Don't use test_batch.total_optimizers from compute_max_dimensions
         bool would_exceed_memory = (max_gpu_memory > 0 && test_batch.estimate_memory() > max_gpu_memory);
 
-        // Check size compatibility
-        bool size_mismatch = !current_batch.is_compatible(lig, all_ligands, 2.0f);
+        // Check size compatibility with representative ligand
+        bool size_mismatch = !current_batch.is_compatible(rep_lig, all_ligands, 2.0f);
 
         if ((would_exceed_poses || would_exceed_memory || size_mismatch) && !current_batch.ligand_indices.empty()) {
-            // Finalize current batch
+            // Finalize current batch - compute max dimensions but preserve our total_optimizers
+            int saved_total = current_batch.total_optimizers;
             current_batch.compute_max_dimensions(all_ligands);
+            current_batch.total_optimizers = saved_total;
             batch_groups.push_back(std::move(current_batch));
 
             // Start new batch
@@ -872,13 +920,18 @@ void LigandBatchManager::sort_and_group_ligands(int verbosity) {
             current_batch.exhaustiveness = exhaustiveness;
         }
 
-        current_batch.ligand_indices.push_back(idx);
-        current_batch.total_optimizers += exhaustiveness;
+        // Add all conformers of this parent to the batch
+        for (size_t idx : parent_group) {
+            current_batch.ligand_indices.push_back(idx);
+        }
+        current_batch.total_optimizers += exhaustiveness;  // Count once per parent!
     }
 
     // Finalize last batch
     if (!current_batch.ligand_indices.empty()) {
+        int saved_total = current_batch.total_optimizers;
         current_batch.compute_max_dimensions(all_ligands);
+        current_batch.total_optimizers = saved_total;
         batch_groups.push_back(std::move(current_batch));
     }
 
@@ -941,11 +994,51 @@ void LigandBatchManager::process_batch(
                                 group.ligand_indices.size() * sizeof(ScoringContext),
                                 cudaMemcpyHostToDevice));
 
-    // Build optimizer-to-ligand mapping
+    // Build parent groups from ligand_indices to distribute poses correctly
+    // For multi-conformer mode: each parent molecule gets exhaustiveness poses total,
+    // distributed evenly across its conformers
+    std::vector<std::vector<size_t>> parent_groups;  // indices into ligand_indices (not all_ligands)
+    std::unordered_map<int, size_t> parent_to_group;
+
+    for (size_t i = 0; i < group.ligand_indices.size(); i++) {
+        const LigandDescriptor& lig = all_ligands[group.ligand_indices[i]];
+        int parent_id = lig.parent_ligand_id;
+
+        if (parent_id == -1) {
+            // Single-conformer: own group
+            parent_groups.push_back({i});
+        } else {
+            // Multi-conformer: group by parent
+            auto it = parent_to_group.find(parent_id);
+            if (it == parent_to_group.end()) {
+                parent_to_group[parent_id] = parent_groups.size();
+                parent_groups.push_back({i});
+            } else {
+                parent_groups[it->second].push_back(i);
+            }
+        }
+    }
+
+    // Calculate poses per conformer for each ligand
+    // poses_per_conformer[i] = number of poses for ligand_indices[i]
+    std::vector<int> poses_per_conformer(group.ligand_indices.size(), 0);
+
+    for (const auto& pg : parent_groups) {
+        int n_conformers = pg.size();
+        int base_poses = group.exhaustiveness / n_conformers;
+        int remainder = group.exhaustiveness % n_conformers;
+
+        for (size_t j = 0; j < pg.size(); j++) {
+            // First 'remainder' conformers get one extra pose
+            poses_per_conformer[pg[j]] = base_poses + (j < (size_t)remainder ? 1 : 0);
+        }
+    }
+
+    // Build optimizer-to-ligand mapping using poses_per_conformer
     std::vector<int> optimizer_to_ligand(group.total_optimizers);
     int offset = 0;
     for (size_t i = 0; i < group.ligand_indices.size(); i++) {
-        for (int j = 0; j < group.exhaustiveness; j++) {
+        for (int j = 0; j < poses_per_conformer[i]; j++) {
             optimizer_to_ligand[offset++] = i;
         }
     }
@@ -1099,13 +1192,15 @@ void LigandBatchManager::process_batch(
     collect_bfgs_results(mem, group.total_optimizers, all_energies, all_conformations);
 
     // Distribute results to ligands
+    // Use poses_per_conformer to handle multi-conformer mode correctly
     offset = 0;
     for (size_t i = 0; i < group.ligand_indices.size(); i++) {
         LigandDescriptor& lig = all_ligands[group.ligand_indices[i]];
-        lig.energies.resize(group.exhaustiveness);
-        lig.conformations.resize(group.exhaustiveness);
+        int n_poses = poses_per_conformer[i];
+        lig.energies.resize(n_poses);
+        lig.conformations.resize(n_poses);
 
-        for (int j = 0; j < group.exhaustiveness; j++) {
+        for (int j = 0; j < n_poses; j++) {
             lig.energies[j] = all_energies[offset];
             lig.conformations[j] = all_conformations[offset];
             offset++;
