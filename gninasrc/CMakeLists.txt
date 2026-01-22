@@ -57,6 +57,8 @@ lib/dl_scorer.cpp
 lib/everything.cpp
 lib/flexinfo.cpp
 lib/GninaConverter.cpp
+lib/RDKitConverter.cpp
+lib/RDKitTreeBuilder.cpp
 lib/grid.cpp
 lib/grid_gpu.cu
 lib/model.cpp
@@ -228,12 +230,12 @@ list(REMOVE_DUPLICATES CMAKE_PROPERTY_LIST)
 add_library(gninalib_static STATIC $<TARGET_OBJECTS:gninalibobj>)
 set_target_properties(gninalib_static PROPERTIES OUTPUT_NAME gnina)
 target_link_libraries(gninalib_static  ${Boost_LIBRARIES} ${OpenBabel3_LIBRARIES} ${LIBMOLGRID_LIBRARY} ${TORCH_LIBRARIES} jsoncpp_lib ZLIB::ZLIB gninalibobj
-    RDKitDistGeomHelpers RDKitForceFieldHelpers RDKitSmilesParse RDKitGraphMol RDKitRDGeneral RDKitRDGeometryLib)
+    RDKitDistGeomHelpers RDKitForceFieldHelpers RDKitSmilesParse RDKitGraphMol RDKitRDGeneral RDKitRDGeometryLib RDKitPartialCharges)
 
 add_library(gninalib SHARED $<TARGET_OBJECTS:gninalibobj>)
 set_target_properties(gninalib PROPERTIES OUTPUT_NAME gnina)
 target_link_libraries(gninalib  ${Boost_LIBRARIES} ${OpenBabel3_LIBRARIES} ${LIBMOLGRID_LIBRARY} ${TORCH_LIBRARIES} jsoncpp_lib ZLIB::ZLIB gninalibobj
-    RDKitDistGeomHelpers RDKitForceFieldHelpers RDKitSmilesParse RDKitGraphMol RDKitRDGeneral RDKitRDGeometryLib)
+    RDKitDistGeomHelpers RDKitForceFieldHelpers RDKitSmilesParse RDKitGraphMol RDKitRDGeneral RDKitRDGeometryLib RDKitPartialCharges)
 
 # MESSAGE(STATUS "variable is: " ${NVCC_FLAGS_EXTRA})
 
@@ -271,6 +273,7 @@ install(TARGETS gnina gninagrid gninatyper fromgnina tognina RUNTIME DESTINATION
 
 # Link RDKit libraries for symmetry-aware RMSD calculations and 3D generation
 # We need MolAlign for getBestRMS, DistGeomHelpers for EmbedMolecule, and dependencies
+# RDKitPartialCharges is needed for Gasteiger charges in RDKitConverter
 target_link_libraries(gnina
     RDKitMolAlign
     RDKitMolTransforms
@@ -283,6 +286,7 @@ target_link_libraries(gnina
     RDKitForceField
     RDKitRDGeneral
     RDKitRDGeometryLib
+    RDKitPartialCharges
 )
 
 add_executable(gninavis gninavis/gninavis.cpp lib/CommandLine2/CommandLine.cpp gninavis/cnn_visualization.cpp gninavis/cnn_visualization.hpp)

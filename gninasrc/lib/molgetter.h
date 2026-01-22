@@ -14,22 +14,30 @@
 #include "model.h"
 #include "obmolopener.h"
 
+// RDKit includes needed for SDMolSupplier (complete type required for unique_ptr destructor)
+#include <GraphMol/FileParsers/MolSupplier.h>
+
 // this class abstracts reading molecules from a file
-// we have three means of input:
-// openbabel for general molecular data (default)
+// we have five means of input:
+// RDKit for SDF/MOL2 ligands (preferred - better geometry)
+// openbabel for covalent docking and PDB ligands (still needed for flex residues)
 // vina parse_pdbqt for pdbqt files (one ligand, obey rotational bonds)
-// smina format
+// smina/gnina binary formats
 class MolGetter {
   model initm;
   tee *log;
   CovInfo cinfo;
-  enum Type { OB, PDBQT, SMINA, GNINA, NONE }; // different inputs
+  enum Type { RDKIT_SDF, OB, PDBQT, SMINA, GNINA, NONE }; // different inputs
 
   Type type;
   path lpath;
   bool add_hydrogens;   // add hydrogens before calculating atom types
   bool strip_hydrogens; // strip them after (more efficient)
-  // openbabel data structs
+
+  // RDKit data structs for SDF/MOL2 reading
+  std::unique_ptr<RDKit::SDMolSupplier> rdkit_supplier;
+
+  // openbabel data structs (for covalent docking and receptors)
   OpenBabel::OBConversion conv;
   obmol_opener infileopener;
 
@@ -39,7 +47,7 @@ class MolGetter {
   // pdbqt data
   bool pdbqtdone;
 
-  // covalent data
+  // covalent data (still uses OpenBabel)
   OpenBabel::OBMol covres;              // covalently bonding residue on receptor
   OpenBabel::OBAtom *covatom = nullptr; // covalently bonding atom within this residue
   vec covpos;                           // position for covalently bonding ligand atom
@@ -75,9 +83,13 @@ public:
 
 private:
   bool createCovalentMoleculeInModel(model &m);
+  bool readRDKitMoleculeIntoModel(model &m);
 };
 
 // Standalone function to convert OBMol to model (shared by SDF loading and RDKit SMILES paths)
 bool convertOBMolToModel(OpenBabel::OBMol& mol, model& m, bool add_hydrogens, bool strip_hydrogens);
+
+// Standalone function to convert RDKit mol to model (for RDKit-native loading)
+bool convertRDKitMolToModel(const RDKit::ROMol& mol, model& m, bool add_hydrogens, bool strip_hydrogens);
 
 #endif /* MOLGETTER_H_ */

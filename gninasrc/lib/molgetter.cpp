@@ -1,11 +1,12 @@
 /*
- * molgetter.h
+ * molgetter.cpp
  *
  *  Created on: Jun 5, 2014
  *      Author: dkoes
  */
 #include "molgetter.h"
 #include "GninaConverter.h"
+#include "RDKitConverter.h"
 #include "parse_pdbqt.h"
 #include "parsing.h"
 #include <boost/archive/binary_iarchive.hpp>
@@ -18,10 +19,18 @@
 #include <openbabel/obconversion.h>
 #include <sstream>
 
+// RDKit includes for ligand reading
+#include <GraphMol/GraphMol.h>
+#include <GraphMol/ROMol.h>
+#include <GraphMol/RWMol.h>
+#include <GraphMol/FileParsers/MolSupplier.h>
+#include <GraphMol/FileParsers/FileParsers.h>
+#include <GraphMol/MolOps.h>
+
 using namespace OpenBabel;
 
 // Convert an OpenBabel OBMol (with 3D coordinates) to a gnina model
-// This is the shared code path for both SDF file loading and RDKit SMILES conversion
+// This is for covalent docking and formats not yet supported by RDKit path
 // Returns true on success, false on failure
 bool convertOBMolToModel(OpenBabel::OBMol& mol, model& m, bool add_hydrogens, bool strip_hydrogens) {
     try {
@@ -45,6 +54,13 @@ bool convertOBMolToModel(OpenBabel::OBMol& mol, model& m, bool add_hydrogens, bo
                   << "\": " << e.reason << '\n';
         return false;
     }
+}
+
+// Convert an RDKit mol (with 3D coordinates) to a gnina model
+// This is the preferred path for ligands - uses pure RDKit with no OpenBabel
+// Returns true on success, false on failure
+bool convertRDKitMolToModel(const RDKit::ROMol& mol, model& m, bool add_hydrogens, bool strip_hydrogens) {
+    return RDKitConverter::convertRDKitToModel(mol, m, add_hydrogens, strip_hydrogens);
 }
 
 // remove a hydrogen from a
@@ -213,29 +229,89 @@ void MolGetter::create_init_model(const std::string &rigid_name, const std::stri
 
 // setup for reading from fname
 void MolGetter::setInputFile(const std::string &fname) {
-  if (fname.size() > 0) { // zer if no_lig
+  if (fname.size() > 0) { // zero if no_lig
     lpath = path(fname);
-    if (lpath.extension() == ".pdbqt") {
-      // built-in pdbqt parsing that respects rotabable bonds in pdbqt
+    std::string ext = lpath.extension().string();
+
+    // Reset previous state
+    rdkit_supplier.reset();
+    pdbqtdone = false;
+
+    if (ext == ".pdbqt") {
+      // built-in pdbqt parsing that respects rotatable bonds in pdbqt
       type = PDBQT;
-      pdbqtdone = false;
     } else if (infile.open(lpath, ".smina", true)) { // smina always gzipped
       type = SMINA;
     } else if (infile.open(lpath, ".gnina", true)) { // gnina always gzipped
       type = GNINA;
-    } else if (fname.length() > 0) // openbabel
-    {
+    } else if (ext == ".sdf" || ext == ".mol" || ext == ".sd") {
+      // Use RDKit for SDF/MOL files - better geometry handling
+      type = RDKIT_SDF;
+      rdkit_supplier = std::make_unique<RDKit::SDMolSupplier>(fname, true, false, false);
+    } else if (fname.length() > 0) {
+      // Fall back to OpenBabel for other formats (MOL2, PDB ligands, etc.)
+      // Covalent docking also uses OpenBabel path
       type = OB;
-      // clear in case we had previous file
       infileopener.clear();
       infileopener.openForInput(conv, fname);
       VINA_CHECK(conv.SetOutFormat("PDBQT"));
     }
 
+    // Covalent docking requires OpenBabel for the covalent bond manipulation
     if (cinfo.has_content() && type != OB) {
-      throw usage_error("Provided ligand file format not supported with covalent docking.");
+      // For covalent docking with SDF files, switch to OpenBabel
+      if (type == RDKIT_SDF) {
+        rdkit_supplier.reset();
+        type = OB;
+        infileopener.clear();
+        infileopener.openForInput(conv, fname);
+        VINA_CHECK(conv.SetOutFormat("PDBQT"));
+      } else {
+        throw usage_error("Provided ligand file format not supported with covalent docking.");
+      }
     }
   }
+}
+
+// Read next molecule using RDKit and convert to model
+bool MolGetter::readRDKitMoleculeIntoModel(model &m) {
+  while (!rdkit_supplier->atEnd()) {
+    std::unique_ptr<RDKit::ROMol> mol(rdkit_supplier->next());
+    if (!mol) {
+      continue;  // Failed to parse, skip to next
+    }
+
+    // Get molecule name
+    std::string name;
+    if (mol->hasProp("_Name")) {
+      mol->getProp("_Name", name);
+    }
+    m.set_name(name);
+
+    // Check for 3D coordinates
+    if (mol->getNumConformers() == 0) {
+      std::cerr << "\nMolecule '" << name << "' has no conformer. Skipping.\n";
+      continue;
+    }
+
+    // Initialize ring info if not already done (required for rotatable bond detection)
+    // SDMolSupplier may not initialize this automatically
+    try {
+      RDKit::RWMol rwmol(*mol);
+      if (!rwmol.getRingInfo()->isInitialized()) {
+        RDKit::MolOps::findSSSR(rwmol);
+      }
+      // Convert RDKit mol to gnina model
+      if (convertRDKitMolToModel(rwmol, m, add_hydrogens, strip_hydrogens)) {
+        return true;
+      }
+    } catch (const std::exception& e) {
+      std::cerr << "\nError processing molecule '" << name << "': " << e.what() << ". Skipping.\n";
+      continue;
+    }
+    // On failure, continue to next molecule
+  }
+  return false;
 }
 
 // identify a reasonable position for adding to atom a in molecule m
@@ -458,6 +534,7 @@ bool MolGetter::readMoleculeIntoModel(model &m) {
       return false;
     }
   } break;
+
   case PDBQT: {
     if (pdbqtdone)
       return false; // can only read one
@@ -467,16 +544,17 @@ bool MolGetter::readMoleculeIntoModel(model &m) {
     m.append(lig);
     pdbqtdone = true;
     return true;
-  }
+  } break;
 
-  break;
+  case RDKIT_SDF: {
+    // Use RDKit for SDF files - better geometry handling, no kekulization issues
+    return readRDKitMoleculeIntoModel(m);
+  } break;
 
   case OB: {
-
+    // OpenBabel path for covalent docking and formats not yet supported by RDKit
     if (cinfo.has_content()) {
-
       return createCovalentMoleculeInModel(m);
-
     } else { // not covalent
       OpenBabel::OBMol mol;
       while (conv.Read(&mol)) // will return after first success
@@ -511,7 +589,8 @@ bool MolGetter::readMoleculeIntoModel(model &m) {
     }
 
     return false; // no valid molecules read
-  }
+  } break;
+
   case NONE:
     return true; // nolig
     break;

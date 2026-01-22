@@ -5,9 +5,11 @@
  *      Author: dkoes
  *
  *  Convert internal molecular data (ie OBMol) into gnina parse tree.
+ *  RDKit molecules now use the pure RDKit path through RDKitConverter.
  */
 
 #include "GninaConverter.h"
+#include "RDKitConverter.h"
 #include "parsing.h"
 #include "PDBQTUtilities.h"
 
@@ -19,7 +21,7 @@
 #include <openbabel/bond.h>
 #include <openbabel/oberror.h>
 
-// RDKit includes for RDKit->OpenBabel conversion
+// RDKit includes for RDKit->OpenBabel conversion (still used for batch manager compatibility)
 #include <GraphMol/GraphMol.h>
 #include <GraphMol/Atom.h>
 #include <GraphMol/Bond.h>
@@ -285,14 +287,12 @@ void convertRDKitToOBMol(const RDKit::ROMol& rdmol, OpenBabel::OBMol& obmol) {
 }
 
 // Convert RDKit mol to smina parsing struct and context
+// This now uses the pure RDKit path through RDKitConverter
 unsigned convertParsing(const RDKit::ROMol& rdmol, parsing_struct& p, context& c,
     bool addH) {
-  // Convert RDKit to OpenBabel
-  OBMol obmol;
-  convertRDKitToOBMol(rdmol, obmol);
-
-  // Use existing OpenBabel conversion
-  return convertParsing(obmol, p, c, addH);
+  // Use pure RDKit conversion path (no OpenBabel dependency)
+  // This is imported from RDKitConverter.h
+  return RDKitConverter::convertRDKitParsing(rdmol, p, c, addH);
 }
 
 } //namespace GninaConverter
