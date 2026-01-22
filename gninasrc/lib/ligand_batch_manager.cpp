@@ -467,9 +467,10 @@ static std::unique_ptr<RDKit::RWMol> generate_3d_fast(
 // Process a single SMILES to RDKit RWMol with 3D coords (thread-safe)
 // Uses RDKit EmbedMolecule with ETKDGv3 - no force field optimization
 // num_conformers: if > 1, generates multiple conformers with different ring puckerings
+// prune_rms_thresh: if > 0, skip conformers within this RMSD of existing ones
 static std::unique_ptr<RDKit::RWMol> generate_3d_from_smiles_rdkit(
     const std::string& smiles, const std::string& name, bool fast_embed = false,
-    int num_conformers = 1) {
+    int num_conformers = 1, float prune_rms_thresh = -0.5f) {
 
     // Use fast template-based generation if requested (doesn't support multi-conformer)
     if (fast_embed) {
@@ -489,6 +490,11 @@ static std::unique_ptr<RDKit::RWMol> generate_3d_from_smiles_rdkit(
     RDKit::DGeomHelpers::EmbedParameters params = RDKit::DGeomHelpers::ETKDGv3;
     params.randomSeed = 42;  // Fixed seed for reproducibility
     params.useSmallRingTorsions = true;  // Important for ring puckering diversity
+
+    // Set RMSD pruning threshold if positive (skip conformers too similar to existing ones)
+    if (prune_rms_thresh > 0) {
+        params.pruneRmsThresh = prune_rms_thresh;
+    }
 
     if (num_conformers > 1) {
         // Generate multiple conformers in same mol
@@ -616,7 +622,11 @@ size_t LigandBatchManager::load_smiles_parallel(
             log << " (fast template-based)";
         }
         if (parallel_embed > 1) {
-            log << " (" << parallel_embed << " conformers/mol)";
+            log << " (" << parallel_embed << " conformers/mol";
+            if (prune_rms_thresh > 0) {
+                log << ", RMSD prune=" << std::fixed << std::setprecision(2) << prune_rms_thresh << " A";
+            }
+            log << ")";
         }
         log << "...\n";
     }
@@ -628,11 +638,12 @@ size_t LigandBatchManager::load_smiles_parallel(
 
     bool use_fast = fast_embed;  // Capture for OpenMP
     int n_conformers = parallel_embed;  // Capture for OpenMP
+    float rms_thresh = prune_rms_thresh;  // Capture for OpenMP
     #pragma omp parallel for num_threads(num_threads) schedule(dynamic, 10)
     for (size_t i = 0; i < entries.size(); i++) {
         const SmilesEntry& entry = entries[i];
         try {
-            rdkit_mols[i] = generate_3d_from_smiles_rdkit(entry.smiles, entry.name, use_fast, n_conformers);
+            rdkit_mols[i] = generate_3d_from_smiles_rdkit(entry.smiles, entry.name, use_fast, n_conformers, rms_thresh);
         } catch (...) {
             // Failed - leave as nullptr
         }

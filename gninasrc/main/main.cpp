@@ -1678,6 +1678,8 @@ Thank you!\n";
         "use fast template-based 3D coordinate generation for SMILES (skips distance geometry)")(
         "parallel_embed", value<int>(&settings.parallel_embed)->default_value(1),
         "generate N conformers per SMILES with different ring puckerings, each processed as separate ligand (default: 1)")(
+        "prune_rms_thresh", value<fl>(&settings.prune_rms_thresh)->default_value(-0.5),
+        "RMSD threshold for pruning similar conformers during parallel_embed (default: -0.5 = disabled, try 0.5-1.0 for diversity)")(
         "skip_torsion_randomize", bool_switch(&settings.skip_torsion_randomize)->default_value(false),
         "skip torsion randomization (for debugging, not recommended for production)")(
         "no_rdkit_smiles", bool_switch(&settings.no_rdkit_smiles)->default_value(false),
@@ -2154,6 +2156,7 @@ Thank you!\n";
       batch_mgr.fast_embed = settings.fast_embed;
       batch_mgr.parallel_embed = settings.parallel_embed;
       batch_mgr.skip_torsion_randomize = settings.skip_torsion_randomize;
+      batch_mgr.prune_rms_thresh = settings.prune_rms_thresh;
 
       // Check if all inputs are SMILES files - use parallel RDKit loader if so
       bool all_smiles = true;

@@ -109,6 +109,7 @@ public:
     bool fast_embed;           // Use fast template-based 3D generation (skips distance geometry)
     int parallel_embed;        // Number of conformers per SMILES (for --parallel_embed)
     bool skip_torsion_randomize; // Use embedded coords directly (preserve ring geometry)
+    float prune_rms_thresh;    // RMSD threshold for pruning similar conformers (negative = disabled)
 
     // Loaded ligands
     std::vector<LigandDescriptor> all_ligands;
@@ -119,7 +120,7 @@ public:
     LigandBatchManager()
         : target_total_poses(50000), exhaustiveness(1024),
           max_gpu_memory(0), fast_embed(false), parallel_embed(1),
-          skip_torsion_randomize(false) {}
+          skip_torsion_randomize(false), prune_rms_thresh(-0.5f) {}
 
     // Phase 1: Load all ligands from input files into CPU memory
     // Returns number of ligands loaded
