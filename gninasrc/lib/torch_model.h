@@ -49,6 +49,24 @@ public:
       const std::vector<vec> &centers_batch,
       bool rotate);
 
+  // Voxelize poses into grid tensors (for ensemble caching - voxelize once, run multiple models)
+  // Returns a vector of grid tensors, one per chunk (to manage GPU memory)
+  // Also returns timing info via output parameters
+  std::vector<torch::Tensor> voxelize_multi_ligand_batch(
+      const std::vector<float3> &rec_coords, const std::vector<smt> &rec_types,
+      const std::vector<std::vector<float3>> &lig_coords_batch,
+      const std::vector<std::vector<smt>> &lig_types_batch,
+      const std::vector<vec> &centers_batch,
+      bool rotate,
+      double& voxelize_time_ms);
+
+  // Run NN inference on pre-voxelized grids (for ensemble - reuse grids across models)
+  // Returns vector of {pose_score, affinity, loss} for each pose
+  std::vector<std::vector<float>> forward_from_grids(
+      const std::vector<torch::Tensor>& grid_chunks,
+      double& nn_time_ms,
+      double& extract_time_ms);
+
   //assumes forward was called with compute_gradient
   void getLigandGradient(std::vector<gfloat3>& grad);
   void getReceptorGradient(std::vector<gfloat3>& grad);

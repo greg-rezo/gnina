@@ -15,6 +15,8 @@
 #include <boost/iostreams/device/array.hpp>
 #include <boost/iostreams/stream.hpp>
 #include <torch/script.h>
+#include <iostream>
+#include <iomanip>
 
 using namespace std;
 using namespace boost::algorithm;
@@ -293,28 +295,74 @@ std::vector<std::tuple<float, float, float>> CNNTorchScorer<isCUDA>::score_multi
     }
   }
 
-  // Loop over models in the ensemble
-  for (auto &model : models) {
+  // Timing accumulators
+  double total_voxelize_ms = 0.0;
+  double total_nn_ms = 0.0;
+  double total_extract_ms = 0.0;
+
+  // Chunk size for memory management (must match torch_model.cpp)
+  const size_t MAX_CHUNK_SIZE = 256;
+
+  // Loop over rotations (if requested)
+  for (unsigned r = 0, n = max(cnnopts.cnn_rotations, 1U); r < n; r++) {
     torch::manual_seed(cnnopts.seed);
     libmolgrid::random_engine.seed(cnnopts.seed);
 
-    // Loop over rotations (if requested)
-    for (unsigned r = 0, n = max(cnnopts.cnn_rotations, 1U); r < n; r++) {
-      // Call multi-ligand batched forward pass
-      auto batch_results = model->forward_multi_ligand_batch(
-          receptor_coords, receptor_types,
-          lig_coords_batch, lig_types_batch,
-          centers_batch, r > 0);
+    // Process poses in chunks to avoid running out of GPU memory
+    // For each chunk: voxelize once, run all models, then free grids
+    for (size_t chunk_start = 0; chunk_start < batch_size; chunk_start += MAX_CHUNK_SIZE) {
+      size_t chunk_end = std::min(chunk_start + MAX_CHUNK_SIZE, batch_size);
+      size_t chunk_size = chunk_end - chunk_start;
 
-      // Accumulate results
-      for (size_t i = 0; i < batch_size; i++) {
-        scores_sum[i] += batch_results[i][0];  // pose score
-        affinities_sum[i] += batch_results[i][1];  // affinity
-        if (nscores_per_pose > 1) {
-          all_affinities[i].push_back(batch_results[i][1]);
+      // Create chunk data views
+      std::vector<std::vector<float3>> chunk_coords(lig_coords_batch.begin() + chunk_start,
+                                                     lig_coords_batch.begin() + chunk_end);
+      std::vector<std::vector<smt>> chunk_types(lig_types_batch.begin() + chunk_start,
+                                                 lig_types_batch.begin() + chunk_end);
+      std::vector<vec> chunk_centers(centers_batch.begin() + chunk_start,
+                                      centers_batch.begin() + chunk_end);
+
+      // Voxelize this chunk ONCE using first model
+      double vox_ms = 0.0;
+      auto grid_chunks = models[0]->voxelize_multi_ligand_batch(
+          receptor_coords, receptor_types,
+          chunk_coords, chunk_types,
+          chunk_centers, r > 0, vox_ms);
+      total_voxelize_ms += vox_ms;
+
+      // Run all models on this chunk's grids
+      for (auto &model : models) {
+        double nn_ms = 0.0, extract_ms = 0.0;
+        auto chunk_results = model->forward_from_grids(grid_chunks, nn_ms, extract_ms);
+        total_nn_ms += nn_ms;
+        total_extract_ms += extract_ms;
+
+        // Accumulate results for this chunk
+        for (size_t i = 0; i < chunk_size; i++) {
+          size_t global_idx = chunk_start + i;
+          scores_sum[global_idx] += chunk_results[i][0];
+          affinities_sum[global_idx] += chunk_results[i][1];
+          if (nscores_per_pose > 1) {
+            all_affinities[global_idx].push_back(chunk_results[i][1]);
+          }
         }
       }
+
+      // Clear grids to free GPU memory before next chunk
+      grid_chunks.clear();
     }
+  }
+
+  // Report timing breakdown
+  double total_ms = total_voxelize_ms + total_nn_ms + total_extract_ms;
+  if (total_ms > 0) {
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << "  CNN batch timing: voxelize=" << total_voxelize_ms/1000.0 << "s ("
+              << (100.0*total_voxelize_ms/total_ms) << "%), "
+              << "NN=" << total_nn_ms/1000.0 << "s ("
+              << (100.0*total_nn_ms/total_ms) << "%), "
+              << "extract=" << total_extract_ms/1000.0 << "s ("
+              << (100.0*total_extract_ms/total_ms) << "%)\n";
   }
 
   // Average and compute variance

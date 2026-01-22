@@ -814,7 +814,7 @@ void do_search(model &m, const boost::optional<model> &ref, const boost::optiona
       out_cont.sort();  // Default sort is by energy
 
       // Limit to reasonable number for refinement
-      sz max_to_refine = settings.num_modes * 20;  // Refine more than we need, then cluster
+      sz max_to_refine = settings.num_modes * settings.cnn_refine_mult;  // Refine more than we need, then cluster
       while (out_cont.size() > max_to_refine) {
         out_cont.pop_back();
       }
@@ -1758,6 +1758,8 @@ Thank you!\n";
         "explicit random seed")("exhaustiveness", value<int>(&settings.exhaustiveness)->default_value(8),
                                 "exhaustiveness of the global search (roughly proportional to time)")(
         "num_modes", value<sz>(&settings.num_modes)->default_value(9), "maximum number of binding modes to generate")(
+        "cnn_scoring_mult", value<sz>(&settings.cnn_refine_mult)->default_value(20),
+        "multiplier for num_modes to determine poses sent to CNN scoring (max_poses = num_modes * cnn_scoring_mult)")(
         "min_rmsd_filter", value<fl>(&settings.out_min_rmsd)->default_value(1.0),
         "rmsd value used to filter final poses to remove redundancy")("quiet,q", bool_switch(&quiet),
                                                                       "Suppress output messages")(
@@ -2373,7 +2375,7 @@ Thank you!\n";
 
         // Sort by energy and limit to top poses BEFORE expensive model.set() calls
         out_cont.sort();
-        sz max_to_refine = settings.num_modes * 20;
+        sz max_to_refine = settings.num_modes * settings.cnn_refine_mult;
         while (out_cont.size() > max_to_refine) {
           out_cont.pop_back();
         }
@@ -2574,7 +2576,7 @@ Thank you!\n";
             });
 
           // Trim to max_to_refine (same as single-conformer path)
-          sz max_to_refine = settings.num_modes * 20;
+          sz max_to_refine = settings.num_modes * settings.cnn_refine_mult;
           if (poses.size() > max_to_refine) {
             poses.resize(max_to_refine);
           }

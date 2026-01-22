@@ -269,7 +269,8 @@ std::vector<std::vector<float>> TorchModel<isCUDA>::forward_multi_ligand_batch(
   long gd = gmaker.get_first_dim();
 
   // Chunk size for memory management (each grid ~12MB for typical settings)
-  const size_t MAX_CHUNK_SIZE = 128;
+  // Note: Larger batches (512+) cause "double free" crashes - needs investigation
+  const size_t MAX_CHUNK_SIZE = 256;
 
   auto options = torch::TensorOptions()
       .dtype(torch::kFloat32)
@@ -373,6 +374,159 @@ std::vector<std::vector<float>> TorchModel<isCUDA>::forward_multi_ligand_batch(
   return all_scores;
 }
 
-// explicit instaniationsº
+// Voxelize poses into grid tensors (for ensemble caching)
+template <bool isCUDA>
+std::vector<torch::Tensor> TorchModel<isCUDA>::voxelize_multi_ligand_batch(
+    const std::vector<float3> &rec_coords, const std::vector<smt> &rec_types,
+    const std::vector<std::vector<float3>> &lig_coords_batch,
+    const std::vector<std::vector<smt>> &lig_types_batch,
+    const std::vector<vec> &centers_batch,
+    bool rotate,
+    double& voxelize_time_ms) {
+
+  size_t total_batch_size = lig_coords_batch.size();
+  if (total_batch_size == 0) {
+    voxelize_time_ms = 0.0;
+    return {};
+  }
+
+  torch::NoGradGuard no_grad;
+
+  if (isCUDA) {
+    at::globalContext().setBlasPreferredBackend(at::BlasBackend::Cublas);
+  }
+
+  // Create receptor CoordinateSet once (reused for all poses)
+  CoordinateSet rec = make_coordset(rec_coords, rec_types, rec_typer);
+
+  // Grid dimensions
+  long ntypes = rec_typer->num_types() + lig_typer->num_types();
+  long gd = gmaker.get_first_dim();
+
+  const size_t MAX_CHUNK_SIZE = 256;
+
+  auto options = torch::TensorOptions()
+      .dtype(torch::kFloat32)
+      .device(isCUDA ? torch::kCUDA : torch::kCPU);
+
+  std::vector<torch::Tensor> grid_chunks;
+  voxelize_time_ms = 0.0;
+
+  // Process in chunks
+  for (size_t chunk_start = 0; chunk_start < total_batch_size; chunk_start += MAX_CHUNK_SIZE) {
+    size_t chunk_end = std::min(chunk_start + MAX_CHUNK_SIZE, total_batch_size);
+    size_t chunk_size = chunk_end - chunk_start;
+
+    // Allocate grid tensor for this chunk
+    torch::Tensor gtensor = torch::zeros({(long)chunk_size, ntypes, gd, gd, gd}, options);
+
+    auto vox_start = std::chrono::high_resolution_clock::now();
+    for (size_t i = 0; i < chunk_size; i++) {
+      size_t global_idx = chunk_start + i;
+
+      // Create ligand CoordinateSet for this pose
+      CoordinateSet lig = make_coordset(lig_coords_batch[global_idx], lig_types_batch[global_idx], lig_typer);
+
+      // Calculate center
+      const vec& center = centers_batch[global_idx];
+      float3 gcenter;
+      if (!isfinite(center.x())) {
+        gcenter = lig.center();
+      } else {
+        gcenter = {center.x(), center.y(), center.z()};
+      }
+
+      // Combine receptor and ligand
+      CoordinateSet combined(rec, lig);
+
+      // Apply rotation if requested
+      libmolgrid::Transform transform(gcenter, 0, rotate);
+      if (rotate) {
+        transform.forward(combined, combined);
+      }
+
+      // Voxelize to grid slice
+      Grid<float, 4, isCUDA> out_slice(gtensor[i].data_ptr<float>(), ntypes, gd, gd, gd);
+      gmaker.forward(gcenter, combined, out_slice);
+    }
+    if (isCUDA) cudaDeviceSynchronize();
+    auto vox_end = std::chrono::high_resolution_clock::now();
+    voxelize_time_ms += std::chrono::duration<double, std::milli>(vox_end - vox_start).count();
+
+    grid_chunks.push_back(gtensor);
+  }
+
+  return grid_chunks;
+}
+
+// Run NN inference on pre-voxelized grids
+template <bool isCUDA>
+std::vector<std::vector<float>> TorchModel<isCUDA>::forward_from_grids(
+    const std::vector<torch::Tensor>& grid_chunks,
+    double& nn_time_ms,
+    double& extract_time_ms) {
+
+  if (grid_chunks.empty()) {
+    nn_time_ms = 0.0;
+    extract_time_ms = 0.0;
+    return {};
+  }
+
+  torch::NoGradGuard no_grad;
+
+  if (isCUDA) {
+    at::globalContext().setBlasPreferredBackend(at::BlasBackend::Cublas);
+  }
+
+  // Count total poses
+  size_t total_batch_size = 0;
+  for (const auto& chunk : grid_chunks) {
+    total_batch_size += chunk.size(0);
+  }
+
+  std::vector<std::vector<float>> all_scores(total_batch_size);
+  nn_time_ms = 0.0;
+  extract_time_ms = 0.0;
+
+  size_t global_offset = 0;
+  for (const auto& gtensor : grid_chunks) {
+    size_t chunk_size = gtensor.size(0);
+
+    // Run batched model inference
+    auto nn_start = std::chrono::high_resolution_clock::now();
+    vector<torch::jit::IValue> inputs{gtensor};
+    auto result = module.forward(inputs).toTuple()->elements();
+
+    auto pose_logits = result[0].toTensor();
+    auto affinities = result[1].toTensor();
+
+    torch::Tensor pose_scores;
+    if (skip_softmax) {
+      pose_scores = pose_logits.index({"...", 1});
+    } else {
+      pose_scores = torch::softmax(pose_logits, 1).index({"...", 1});
+    }
+
+    auto pose_scores_cpu = pose_scores.cpu();
+    auto affinities_cpu = affinities.cpu();
+    auto nn_end = std::chrono::high_resolution_clock::now();
+    nn_time_ms += std::chrono::duration<double, std::milli>(nn_end - nn_start).count();
+
+    auto extract_start = std::chrono::high_resolution_clock::now();
+    for (size_t i = 0; i < chunk_size; i++) {
+      float pose = pose_scores_cpu[i].item<float>();
+      float aff = affinities_cpu[i].item<float>();
+      all_scores[global_offset + i] = {pose, aff, 0.0f};
+    }
+    auto extract_end = std::chrono::high_resolution_clock::now();
+    extract_time_ms += std::chrono::duration<double, std::milli>(extract_end - extract_start).count();
+
+    global_offset += chunk_size;
+  }
+
+  return all_scores;
+}
+
+// explicit instantiations
 template class TorchModel<true>;
 template class TorchModel<false>;

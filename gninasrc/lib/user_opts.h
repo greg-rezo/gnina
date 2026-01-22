@@ -95,6 +95,7 @@ struct user_settings {
     int parallel_embed; //number of conformers to generate in parallel for SMILES
     bool skip_torsion_randomize; //skip torsion randomization (for debugging)
     fl prune_rms_thresh; //RMSD threshold for pruning similar conformers during embedding
+    sz cnn_refine_mult; //multiplier for num_modes to determine poses sent to CNN scoring
 
     cnn_options cnnopts;
 
@@ -109,7 +110,7 @@ struct user_settings {
             gpu(false), cpu_grid(false), bfgs_iterations(50), verbose_grad(false),
             direct_pairwise(false), batch_size(50000), no_batch(false), fast_embed(false),
             no_rdkit_smiles(false), parallel_embed(0), skip_torsion_randomize(false),
-            prune_rms_thresh(0) {
+            prune_rms_thresh(0), cnn_refine_mult(20) {
 
     }
 };
