@@ -42,7 +42,7 @@
 // LigandBatchGroup Methods
 // ============================================================================
 
-void LigandBatchGroup::compute_max_dimensions() {
+void LigandBatchGroup::compute_max_dimensions(const std::vector<LigandDescriptor>& all_ligands) {
     max_atoms = 0;
     max_torsions = 0;
     max_nodes = 0;
@@ -50,19 +50,20 @@ void LigandBatchGroup::compute_max_dimensions() {
     max_change_size = 0;
     total_optimizers = 0;
 
-    for (const LigandDescriptor* lig : ligands) {
-        if (lig->num_atoms > (unsigned)max_atoms) max_atoms = lig->num_atoms;
-        if (lig->num_torsions > (unsigned)max_torsions) max_torsions = lig->num_torsions;
-        if (lig->num_nodes > (unsigned)max_nodes) max_nodes = lig->num_nodes;
-        if (lig->n_conf > max_conf_size) max_conf_size = lig->n_conf;
-        if (lig->n_change > max_change_size) max_change_size = lig->n_change;
+    for (size_t idx : ligand_indices) {
+        const LigandDescriptor& lig = all_ligands[idx];
+        if (lig.num_atoms > (unsigned)max_atoms) max_atoms = lig.num_atoms;
+        if (lig.num_torsions > (unsigned)max_torsions) max_torsions = lig.num_torsions;
+        if (lig.num_nodes > (unsigned)max_nodes) max_nodes = lig.num_nodes;
+        if (lig.n_conf > max_conf_size) max_conf_size = lig.n_conf;
+        if (lig.n_change > max_change_size) max_change_size = lig.n_change;
 
         total_optimizers += exhaustiveness;
     }
 }
 
 size_t LigandBatchGroup::estimate_memory() const {
-    if (ligands.empty()) return 0;
+    if (ligand_indices.empty()) return 0;
 
     int n_opt = total_optimizers;
     int hess_size = max_change_size * (max_change_size + 1) / 2;
@@ -82,19 +83,20 @@ size_t LigandBatchGroup::estimate_memory() const {
     // Optimizer-to-ligand mapping
     size_t mapping_bytes = n_opt * sizeof(int);
 
-    return n_opt * per_optimizer + ligands.size() * per_ligand + mapping_bytes;
+    return n_opt * per_optimizer + ligand_indices.size() * per_ligand + mapping_bytes;
 }
 
-bool LigandBatchGroup::is_compatible(const LigandDescriptor& lig, float max_ratio) const {
-    if (ligands.empty()) return true;
+bool LigandBatchGroup::is_compatible(const LigandDescriptor& lig, const std::vector<LigandDescriptor>& all_ligands, float max_ratio) const {
+    if (ligand_indices.empty()) return true;
 
     // Check if size mismatch is too large
     // Compare atoms as primary metric
     int min_atoms = max_atoms;
     int max_atoms_new = max_atoms;
 
-    for (const LigandDescriptor* existing : ligands) {
-        if ((int)existing->num_atoms < min_atoms) min_atoms = existing->num_atoms;
+    for (size_t idx : ligand_indices) {
+        const LigandDescriptor& existing = all_ligands[idx];
+        if ((int)existing.num_atoms < min_atoms) min_atoms = existing.num_atoms;
     }
 
     if ((int)lig.num_atoms < min_atoms) min_atoms = lig.num_atoms;
@@ -845,24 +847,24 @@ void LigandBatchManager::sort_and_group_ligands(int verbosity) {
     current_batch.exhaustiveness = exhaustiveness;
 
     for (size_t idx : indices) {
-        LigandDescriptor* lig = &all_ligands[idx];
+        const LigandDescriptor& lig = all_ligands[idx];
 
         // Check if adding this ligand would exceed limits
         int new_total = current_batch.total_optimizers + exhaustiveness;
-        bool would_exceed_poses = (new_total > target_total_poses && !current_batch.ligands.empty());
+        bool would_exceed_poses = (new_total > target_total_poses && !current_batch.ligand_indices.empty());
 
         // Estimate memory for potential new batch
         LigandBatchGroup test_batch = current_batch;
-        test_batch.ligands.push_back(lig);
-        test_batch.compute_max_dimensions();
+        test_batch.ligand_indices.push_back(idx);
+        test_batch.compute_max_dimensions(all_ligands);
         bool would_exceed_memory = (max_gpu_memory > 0 && test_batch.estimate_memory() > max_gpu_memory);
 
         // Check size compatibility
-        bool size_mismatch = !current_batch.is_compatible(*lig, 2.0f);
+        bool size_mismatch = !current_batch.is_compatible(lig, all_ligands, 2.0f);
 
-        if ((would_exceed_poses || would_exceed_memory || size_mismatch) && !current_batch.ligands.empty()) {
+        if ((would_exceed_poses || would_exceed_memory || size_mismatch) && !current_batch.ligand_indices.empty()) {
             // Finalize current batch
-            current_batch.compute_max_dimensions();
+            current_batch.compute_max_dimensions(all_ligands);
             batch_groups.push_back(std::move(current_batch));
 
             // Start new batch
@@ -870,13 +872,13 @@ void LigandBatchManager::sort_and_group_ligands(int verbosity) {
             current_batch.exhaustiveness = exhaustiveness;
         }
 
-        current_batch.ligands.push_back(lig);
+        current_batch.ligand_indices.push_back(idx);
         current_batch.total_optimizers += exhaustiveness;
     }
 
     // Finalize last batch
-    if (!current_batch.ligands.empty()) {
-        current_batch.compute_max_dimensions();
+    if (!current_batch.ligand_indices.empty()) {
+        current_batch.compute_max_dimensions(all_ligands);
         batch_groups.push_back(std::move(current_batch));
     }
 
@@ -885,7 +887,7 @@ void LigandBatchManager::sort_and_group_ligands(int verbosity) {
         for (size_t i = 0; i < batch_groups.size(); i++) {
             const auto& batch = batch_groups[i];
             std::cerr << "  Batch " << i << ": "
-                      << batch.ligands.size() << " ligands, "
+                      << batch.ligand_indices.size() << " ligands, "
                       << batch.total_optimizers << " poses, "
                       << "max_atoms=" << batch.max_atoms
                       << ", max_torsions=" << batch.max_torsions
@@ -904,7 +906,7 @@ void LigandBatchManager::process_batch(
     unsigned int seed,
     int verbosity
 ) {
-    if (group.ligands.empty()) return;
+    if (group.ligand_indices.empty()) return;
 
     const GPUCacheInfo& cacheInfo = cgpu.get_info();
 
@@ -917,32 +919,32 @@ void LigandBatchManager::process_batch(
     CUDA_CHECK_GNINA(cudaEventRecord(start));
 
     // Initialize GPU for each ligand and create scoring contexts
-    std::vector<ScoringContext> host_contexts(group.ligands.size());
+    std::vector<ScoringContext> host_contexts(group.ligand_indices.size());
 
-    for (size_t i = 0; i < group.ligands.size(); i++) {
-        LigandDescriptor* lig = group.ligands[i];
+    for (size_t i = 0; i < group.ligand_indices.size(); i++) {
+        LigandDescriptor& lig = all_ligands[group.ligand_indices[i]];
 
         // Initialize GPU data for this ligand
-        if (!lig->gpu_initialized) {
-            lig->m->initialize_gpu();
-            lig->gpu_initialized = true;
+        if (!lig.gpu_initialized) {
+            lig.m->initialize_gpu();
+            lig.gpu_initialized = true;
         }
 
         // Create scoring context
-        create_scoring_context(host_contexts[i], lig->m->gdata, cacheInfo);
+        create_scoring_context(host_contexts[i], lig.m->gdata, cacheInfo);
     }
 
     // Upload contexts to GPU
     ScoringContext* d_contexts;
-    CUDA_CHECK_GNINA(cudaMalloc(&d_contexts, group.ligands.size() * sizeof(ScoringContext)));
+    CUDA_CHECK_GNINA(cudaMalloc(&d_contexts, group.ligand_indices.size() * sizeof(ScoringContext)));
     CUDA_CHECK_GNINA(cudaMemcpy(d_contexts, host_contexts.data(),
-                                group.ligands.size() * sizeof(ScoringContext),
+                                group.ligand_indices.size() * sizeof(ScoringContext),
                                 cudaMemcpyHostToDevice));
 
     // Build optimizer-to-ligand mapping
     std::vector<int> optimizer_to_ligand(group.total_optimizers);
     int offset = 0;
-    for (size_t i = 0; i < group.ligands.size(); i++) {
+    for (size_t i = 0; i < group.ligand_indices.size(); i++) {
         for (int j = 0; j < group.exhaustiveness; j++) {
             optimizer_to_ligand[offset++] = i;
         }
@@ -957,7 +959,7 @@ void LigandBatchManager::process_batch(
     LigandBatch batch;
     batch.ligand_contexts = d_contexts;
     batch.optimizer_to_ligand = d_optimizer_to_ligand;
-    batch.num_ligands = group.ligands.size();
+    batch.num_ligands = group.ligand_indices.size();
     batch.total_optimizers = group.total_optimizers;
 
     // Allocate batch memory
@@ -974,9 +976,9 @@ void LigandBatchManager::process_batch(
                   << ") max=(" << box_max.x << "," << box_max.y << "," << box_max.z << ")\n";
 
         // Compute and log center of mass for first ligand's reference coordinates
-        if (!group.ligands.empty()) {
-            LigandDescriptor* lig = group.ligands[0];
-            const atomv& atoms = lig->m->atoms;
+        if (!group.ligand_indices.empty()) {
+            LigandDescriptor& lig = all_ligands[group.ligand_indices[0]];
+            const atomv& atoms = lig.m->atoms;
             double cx = 0, cy = 0, cz = 0;
             int n_heavy = 0;
             for (size_t i = 0; i < atoms.size(); i++) {
@@ -993,7 +995,7 @@ void LigandBatchManager::process_batch(
                 cy /= n_heavy;
                 cz /= n_heavy;
             }
-            std::cout << "First ligand '" << lig->name << "' stored (local) coords centroid: ("
+            std::cout << "First ligand '" << lig.name << "' stored (local) coords centroid: ("
                       << cx << "," << cy << "," << cz << ") [" << n_heavy << " heavy atoms]\n";
 
             // Log first 5 atom local coords for debugging
@@ -1030,10 +1032,10 @@ void LigandBatchManager::process_batch(
             std::cout << std::defaultfloat;
 
             // Log number of intramolecular pairs
-            if (!lig->m->ligands.empty()) {
-                std::cout << "Intramolecular pairs: " << lig->m->ligands[0].pairs.size() << "\n";
+            if (!lig.m->ligands.empty()) {
+                std::cout << "Intramolecular pairs: " << lig.m->ligands[0].pairs.size() << "\n";
                 // Log first 5 pairs
-                const auto& pairs = lig->m->ligands[0].pairs;
+                const auto& pairs = lig.m->ligands[0].pairs;
                 std::cout << "First 5 pairs (a,b,t1,t2): ";
                 for (size_t i = 0; i < std::min((size_t)5, pairs.size()); i++) {
                     if (i > 0) std::cout << " | ";
@@ -1043,8 +1045,8 @@ void LigandBatchManager::process_batch(
             }
 
             // Also log the ligand root origin (absolute position)
-            if (!lig->m->ligands.empty()) {
-                const vec& origin = lig->m->ligands[0].node.get_origin();
+            if (!lig.m->ligands.empty()) {
+                const vec& origin = lig.m->ligands[0].node.get_origin();
                 std::cout << "First ligand root origin (absolute): ("
                           << origin[0] << "," << origin[1] << "," << origin[2] << ")\n";
 
@@ -1063,9 +1065,9 @@ void LigandBatchManager::process_batch(
                 };
 
                 // Root segment
-                std::cout << "  Root: atoms [" << lig->m->ligands[0].node.begin
-                          << ", " << lig->m->ligands[0].node.end << ")";
-                print_segment_atoms(lig->m->ligands[0].node.begin, lig->m->ligands[0].node.end);
+                std::cout << "  Root: atoms [" << lig.m->ligands[0].node.begin
+                          << ", " << lig.m->ligands[0].node.end << ")";
+                print_segment_atoms(lig.m->ligands[0].node.begin, lig.m->ligands[0].node.end);
                 std::cout << "\n";
 
                 // Count torsion segments by traversing children
@@ -1079,7 +1081,7 @@ void LigandBatchManager::process_batch(
                     }
                 };
                 int torsion_idx = 0;
-                for (const auto& child : lig->m->ligands[0].children) {
+                for (const auto& child : lig.m->ligands[0].children) {
                     print_branch(child, torsion_idx++);
                 }
             }
@@ -1098,14 +1100,14 @@ void LigandBatchManager::process_batch(
 
     // Distribute results to ligands
     offset = 0;
-    for (size_t i = 0; i < group.ligands.size(); i++) {
-        LigandDescriptor* lig = group.ligands[i];
-        lig->energies.resize(group.exhaustiveness);
-        lig->conformations.resize(group.exhaustiveness);
+    for (size_t i = 0; i < group.ligand_indices.size(); i++) {
+        LigandDescriptor& lig = all_ligands[group.ligand_indices[i]];
+        lig.energies.resize(group.exhaustiveness);
+        lig.conformations.resize(group.exhaustiveness);
 
         for (int j = 0; j < group.exhaustiveness; j++) {
-            lig->energies[j] = all_energies[offset];
-            lig->conformations[j] = all_conformations[offset];
+            lig.energies[j] = all_energies[offset];
+            lig.conformations[j] = all_conformations[offset];
             offset++;
         }
     }
@@ -1131,7 +1133,7 @@ void LigandBatchManager::process_batch(
         std::cerr << "  Total:           " << std::setprecision(2) << total_ms << " ms\n";
         std::cerr << "  Throughput:      " << std::setprecision(1)
                   << 1000.0f * group.total_optimizers / total_ms << " poses/sec, "
-                  << 1000.0f * group.ligands.size() / total_ms << " ligands/sec\n";
+                  << 1000.0f * group.ligand_indices.size() / total_ms << " ligands/sec\n";
     }
 
     // Cleanup timing events

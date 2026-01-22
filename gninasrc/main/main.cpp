@@ -2276,7 +2276,7 @@ Thank you!\n";
           LigandBatchGroup& group = batch_mgr.batch_groups[batch_idx];
 
           log << "Processing batch " << (batch_idx + 1) << "/" << batch_mgr.num_batches()
-              << " (" << group.ligands.size() << " ligands, "
+              << " (" << group.ligand_indices.size() << " ligands, "
               << group.total_optimizers << " poses)\n";
           log.endl();
 

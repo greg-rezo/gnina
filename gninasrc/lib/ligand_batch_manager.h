@@ -71,7 +71,7 @@ struct LigandDescriptor {
 
 // A group of ligands to be processed in a single GPU batch
 struct LigandBatchGroup {
-    std::vector<LigandDescriptor*> ligands;  // Pointers to ligands in this group (not owned)
+    std::vector<size_t> ligand_indices;  // Indices into all_ligands vector (safe across reallocation)
 
     // Max dimensions across all ligands in batch (for memory allocation)
     int max_atoms;
@@ -89,14 +89,14 @@ struct LigandBatchGroup {
           max_conf_size(0), max_change_size(0),
           total_optimizers(0), exhaustiveness(0) {}
 
-    // Compute max dimensions from ligands
-    void compute_max_dimensions();
+    // Compute max dimensions from ligands (needs all_ligands reference)
+    void compute_max_dimensions(const std::vector<LigandDescriptor>& all_ligands);
 
     // Estimate GPU memory needed for this batch
     size_t estimate_memory() const;
 
-    // Check if adding a ligand would cause too much size mismatch
-    bool is_compatible(const LigandDescriptor& lig, float max_ratio = 2.0f) const;
+    // Check if adding a ligand would cause too much size mismatch (needs all_ligands reference)
+    bool is_compatible(const LigandDescriptor& lig, const std::vector<LigandDescriptor>& all_ligands, float max_ratio = 2.0f) const;
 };
 
 // Manager class for multi-ligand batch docking
@@ -147,6 +147,7 @@ public:
 
     // Phase 3: Process a single batch on GPU
     // Sets energies and conformations on each LigandDescriptor in the group
+    // Uses all_ligands to resolve ligand_indices to actual LigandDescriptor objects
     void process_batch(
         LigandBatchGroup& group,
         cache_gpu& cgpu,
@@ -155,7 +156,7 @@ public:
         int max_iterations,
         unsigned int seed,
         int verbosity = 1
-    );
+    );  // Uses this->all_ligands internally
 
     // Get total number of ligands loaded
     size_t num_ligands() const { return all_ligands.size(); }
