@@ -1551,3 +1551,61 @@ Analysis of CNN ensemble scoring vs RMSD quality for 7R7R ligand from SMILES inp
 - Consider examining multiple top poses, not just rank 1
 - `--num_modes 32` (or higher) is important to ensure accurate poses are captured
 - For lead optimization where binding mode is known, visual inspection of top poses is recommended
+
+---
+
+## Large-Scale Benchmark: 1000 ChEMBL Molecules (2026-01-22 10:22)
+
+**Git commit**: `d85ce8f7`
+
+Benchmarking GPU batch docking with and without CNN scoring on 1000 drug-like molecules from ChEMBL.
+
+### Test Configuration
+- **Receptor**: 1dmp_rec.pdb
+- **Ligands**: 1000 SMILES from chembl_100k.smi
+- **Exhaustiveness**: 1000
+- **BFGS iterations**: 50
+- **Batch size**: 20000 (reduced from default 50000 to avoid memory corruption)
+- **GPU**: NVIDIA L4
+- **Seed**: 42
+
+### Results Summary
+
+| Test | Total Time | Ligands/sec | Time/Ligand | Notes |
+|------|------------|-------------|-------------|-------|
+| **No CNN** | **25.13s** | **39.8** | **25.1 ms** | GPU BFGS only |
+| **CNN Ensemble** | **661.94s** | **1.51** | **661.9 ms** | CNN dominates (96%) |
+
+**Speedup without CNN**: 26x faster
+
+### Timing Breakdown (CNN Ensemble)
+
+| Phase | Time | % of Total |
+|-------|------|------------|
+| RDKit 3D Embedding | 9.9s | 1.5% |
+| BFGS Docking (50 batches) | ~14s | 2.1% |
+| **CNN Scoring** | **636.5s** | **96.1%** |
+| Post-processing | 2.3s | 0.3% |
+
+### CNN Scoring Breakdown (180,000 poses)
+
+| Component | Time | % of CNN |
+|-----------|------|----------|
+| Voxelization | 113.9s | 17.9% |
+| **NN Inference (3 models)** | **478.1s** | **75.1%** |
+| Result Extraction | 1.6s | 0.3% |
+
+### Key Findings
+
+1. **CNN ensemble is the bottleneck**: 96% of runtime for CNN scoring
+2. **NN inference dominates CNN time**: 75% spent in neural network forward passes
+3. **GPU BFGS is fast**: Only 2% of total time with CNN, ~70k poses/sec throughput
+4. **Memory corruption bug**: Default `--batch_size 50000` crashes with 1000+ molecules; use `--batch_size 20000` as workaround
+
+### Recommendations
+
+| Use Case | Configuration | Expected Throughput |
+|----------|---------------|---------------------|
+| High-throughput screening | `--cnn_scoring none` | ~40 lig/s |
+| Production with CNN | Default ensemble | ~1.5 lig/s |
+| Faster CNN scoring | `--cnn fast` | ~4-5 lig/s (estimated) |
