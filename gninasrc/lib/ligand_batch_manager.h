@@ -120,7 +120,7 @@ public:
     LigandBatchManager()
         : target_total_poses(50000), exhaustiveness(1024),
           max_gpu_memory(0), fast_embed(false), parallel_embed(1),
-          skip_torsion_randomize(false), prune_rms_thresh(-0.5f) {}
+          skip_torsion_randomize(false), prune_rms_thresh(0.0f) {}
 
     // Phase 1: Load all ligands from input files into CPU memory
     // Returns number of ligands loaded

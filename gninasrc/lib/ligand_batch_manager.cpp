@@ -470,7 +470,7 @@ static std::unique_ptr<RDKit::RWMol> generate_3d_fast(
 // prune_rms_thresh: if > 0, skip conformers within this RMSD of existing ones
 static std::unique_ptr<RDKit::RWMol> generate_3d_from_smiles_rdkit(
     const std::string& smiles, const std::string& name, bool fast_embed = false,
-    int num_conformers = 1, float prune_rms_thresh = -0.5f) {
+    int num_conformers = 1, float prune_rms_thresh = 0.0f) {
 
     // Use fast template-based generation if requested (doesn't support multi-conformer)
     if (fast_embed) {

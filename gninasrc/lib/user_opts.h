@@ -109,7 +109,7 @@ struct user_settings {
             gpu(false), cpu_grid(false), bfgs_iterations(50), verbose_grad(false),
             direct_pairwise(false), batch_size(50000), no_batch(false), fast_embed(false),
             no_rdkit_smiles(false), parallel_embed(0), skip_torsion_randomize(false),
-            prune_rms_thresh(-0.5) {
+            prune_rms_thresh(0) {
 
     }
 };

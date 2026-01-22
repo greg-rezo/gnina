@@ -1508,3 +1508,46 @@ When no `--cnn` flag is specified, gnina uses these 3 models:
 | High-throughput screening | `--cnn fast` (8x faster) |
 | Pose quality matters | Default ensemble (better ranking) |
 | Best of both worlds | `--cnn fast` for initial screen, ensemble for top hits |
+
+---
+
+## 7R7R Scoring Analysis: Top Pose vs Best RMSD (2026-01-22)
+
+**Git commit**: `709b1cef`
+
+Analysis of CNN ensemble scoring vs RMSD quality for 7R7R ligand from SMILES input with `--parallel_embed 10`.
+
+### Test Configuration
+- **Receptor**: 7R7R receptor
+- **Ligand**: 7R7R aromatic SMILES
+- **Exhaustiveness**: 10,000
+- **num_modes**: 32
+- **parallel_embed**: 10
+- **CNN**: default ensemble (3 models)
+- **GPU**: NVIDIA L4
+
+### Key Finding: CNN Prefers Wrong Pose
+
+| Metric | Top Scored (Rank 1) | Best RMSD (Rank 8) | Winner |
+|--------|---------------------|---------------------|--------|
+| **RMSD** | 2.75 Å | **1.08 Å** | Best RMSD |
+| **Vina Affinity** | **-11.09** kcal/mol | -9.42 kcal/mol | Top Scored |
+| **CNN Score** | **0.9039** | 0.5197 | Top Scored |
+| **CNN Affinity** | **7.93** | 6.78 | Top Scored |
+
+### Analysis
+
+1. **CNN ensemble prefers non-native pose**: The top-scoring pose (0.9039) is 2.75 Å from native, while a much more accurate pose (1.08 Å RMSD) ranks 8th with CNN score of only 0.5197.
+
+2. **Vina also prefers wrong pose**: The Vina scoring function (-11.09 vs -9.42 kcal/mol) also ranks the non-native pose higher.
+
+3. **Both scoring functions favor the same wrong binding mode**: This suggests the CNN learned similar biases to the physics-based scoring function.
+
+4. **Best RMSD still available**: The 1.08 Å pose exists in the output - it's just not ranked highest.
+
+### Implications for Virtual Screening
+
+- When pose accuracy matters, sorting by CNN score may not give the most native-like pose
+- Consider examining multiple top poses, not just rank 1
+- `--num_modes 32` (or higher) is important to ensure accurate poses are captured
+- For lead optimization where binding mode is known, visual inspection of top poses is recommended
