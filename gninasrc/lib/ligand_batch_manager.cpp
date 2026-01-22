@@ -21,6 +21,7 @@
 #include "parsing.h"
 #include "parse_pdbqt.h"
 #include "GninaConverter.h"
+#include "RDKitConverter.h"
 #include "molgetter.h"
 
 // RDKit includes for parallel 3D generation (thread-safe)
@@ -700,22 +701,13 @@ size_t LigandBatchManager::load_smiles_parallel(
                     conf_name += "_conf" + std::to_string(cid);
                 }
 
-                // Convert RDKit mol directly to OpenBabel mol (preserves atom ordering)
-                // Using direct conversion instead of SDF round-trip to avoid atom reordering
-                OpenBabel::OBMol obmol;
-                GninaConverter::convertRDKitToOBMol(mol_copy, obmol);
-                obmol.SetTitle(conf_name.c_str());
-
-                if (obmol.NumAtoms() == 0) {
-                    std::cerr << "Warning: Empty molecule " << conf_name << std::endl;
-                    continue;
-                }
-
-                // Convert using same function as molgetter
+                // Convert RDKit mol directly to gnina model (no OpenBabel)
+                // This removes all hydrogens and preserves coordinates
                 auto m = std::make_unique<model>();
                 m->set_name(conf_name);
 
-                if (!convertOBMolToModel(obmol, *m, true, false)) {
+                // Use RDKitConverter which removes hydrogens properly
+                if (!RDKitConverter::convertRDKitToModel(mol_copy, *m, false, false)) {
                     std::cerr << "Warning: Failed to convert " << conf_name << " to model" << std::endl;
                     continue;
                 }
