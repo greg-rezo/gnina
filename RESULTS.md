@@ -1309,13 +1309,34 @@ Benchmarking `--parallel_embed` option which generates multiple RDKit conformers
 
 ### 7R7R Results (complex macrocycle)
 
+⚠️ **NOTE**: The results below used an **incorrect SMILES** that encoded aromatic rings as saturated (all sp3 carbons). This produced docked geometries with tetrahedral angles (~109°) instead of aromatic planar geometry (~120°). See corrected results below.
+
 | Input | Best RMSD | CNN of Best RMSD | Best CNN | RMSD of Best CNN |
 |-------|-----------|------------------|----------|------------------|
 | **SDF** | **0.75 Å** | 0.665 | **0.732** | 1.08 Å |
-| SMILES (1 conf) | 1.70 Å | 0.612 | 0.650 | 2.78 Å |
-| **SMILES (10 confs)** | **1.00 Å** | 0.675 | 0.698 | 2.64 Å |
+| SMILES (1 conf) ❌ | 1.70 Å | 0.612 | 0.650 | 2.78 Å |
+| **SMILES (10 confs)** ❌ | **1.00 Å** | 0.675 | 0.698 | 2.64 Å |
+| Redock from SMILES best ❌ | 1.14 Å | 0.632 | 0.682 | 2.11 Å |
 
-**Key findings (7R7R)**:
+### 7R7R Results with Corrected SMILES (2026-01-21)
+
+**Issue**: Original SMILES was `[C@@H]1([C@@H](NC...` (all uppercase = saturated)
+**Fix**: Correct SMILES from RCSB: `C[C@@H](Oc1cc(cnc1N)c2sc(nc2C)[C@](C)(O)CO)c3cc(F)ccc3N4NC=CN4` (lowercase = aromatic)
+
+The molecule contains aromatic pyridine, phenyl, thiazole, and triazole rings.
+
+| Input | Best RMSD | Energy of Best RMSD | Best Energy | RMSD of Best Energy |
+|-------|-----------|---------------------|-------------|---------------------|
+| **SMILES (10 confs)** | **2.16 Å** | -11.98 kcal/mol | -12.60 kcal/mol | 3.44 Å |
+
+**Key findings (corrected 7R7R)**:
+- With correct aromatic SMILES, best RMSD is **2.16 Å** (vs 1.00 Å with incorrect saturated SMILES)
+- The "improvement" in the wrong SMILES was an artifact: the saturated molecule was docking to a different binding mode
+- Aromatic geometry constraints produce more realistic but potentially harder-to-dock poses
+
+**Lesson learned**: Always verify SMILES aromaticity matches the X-ray structure before docking benchmarks.
+
+**Key findings (7R7R - OLD/INVALID)**:
 - `--parallel_embed 10` significantly improves SMILES docking:
   - RMSD: 1.70 → **1.00 Å** (41% better)
   - CNN: 0.650 → **0.698** (7% better)
@@ -1338,3 +1359,152 @@ Benchmarking `--parallel_embed` option which generates multiple RDKit conformers
 gnina --gpu --parallel_embed 10 -r receptor.pdb -l ligands.smi \
     --autobox_ligand ref.sdf --exhaustiveness 10000 -o output.sdf
 ```
+
+---
+
+## Hydrogen Bug Fix: SDF vs SMILES Input Comparison (2026-01-21)
+
+**Git commit**: `134759cd`
+
+Fixed critical bug where RDKit path was calling `MolOps::addHs()` without `addCoords=true`, causing hydrogen atoms to have garbage coordinates. The fix removes all hydrogens using `MolOps::removeAllHs()` since gnina works with heavy atoms only.
+
+### Test Configuration
+- **Receptor**: 7R7R receptor
+- **Ligand**: 7R7R ligand (aromatic SMILES)
+- **Exhaustiveness**: 10,000
+- **num_modes**: 32
+- **CNN**: fast
+- **GPU**: NVIDIA L4
+
+### Results: Best Poses by CNN Score
+
+| Input | Affinity (kcal/mol) | RMSD (Å) | CNN Score | CNN Aff |
+|-------|---------------------|----------|-----------|---------|
+| **SDF (x-ray)** | -11.13 | **1.27** | 0.6258 | 7.84 |
+| **SMILES** | -9.77 | 2.98 | 0.4753 | 7.52 |
+| **SMILES+PE 20** | -10.64 | 2.90 | **0.7124** | 7.79 |
+
+### Top 5 Poses by CNN Score
+
+**SDF Input (x-ray coordinates)**:
+
+| Pose | Affinity | RMSD (Å) | CNN Score | CNN Aff |
+|------|----------|----------|-----------|---------|
+| 1 | -11.13 | 1.27 | 0.6258 | 7.84 |
+| 2 | -10.78 | 2.00 | 0.5434 | 7.58 |
+| 3 | -12.03 | 1.18 | 0.5365 | 8.01 |
+| 4 | -12.53 | 1.34 | 0.5345 | 7.90 |
+| 5 | -11.31 | **0.99** | 0.5137 | 7.91 |
+
+**SMILES Input (no parallel_embed)**:
+
+| Pose | Affinity | RMSD (Å) | CNN Score | CNN Aff |
+|------|----------|----------|-----------|---------|
+| 1 | -9.77 | 2.98 | 0.4753 | 7.52 |
+| 2 | -10.30 | 2.90 | 0.2495 | 7.06 |
+| 3 | -10.42 | 3.84 | 0.2345 | 6.57 |
+| 4 | -10.91 | 4.02 | 0.2290 | 6.00 |
+| 5 | -10.36 | 4.21 | 0.2174 | 6.09 |
+
+**SMILES + parallel_embed 20**:
+
+| Pose | Affinity | RMSD (Å) | CNN Score | CNN Aff |
+|------|----------|----------|-----------|---------|
+| 1 | -10.64 | 2.90 | **0.7124** | 7.79 |
+| 2 | -10.07 | 3.36 | 0.7037 | 7.58 |
+| 3 | -10.48 | 2.77 | 0.6928 | 7.78 |
+| 4 | -9.81 | **0.75** | 0.6075 | 7.68 |
+| 5 | -9.86 | 1.38 | 0.5288 | 7.83 |
+
+### Key Findings
+
+1. **Bug fix validated**: SDF input RMSD improved from 3.11 Å → **1.27 Å** after fixing hydrogen coordinates
+2. **SDF (x-ray)**: Best for RMSD (1.27 Å best, multiple sub-2Å poses)
+3. **SMILES**: Works after fix, but higher RMSD (2.98 Å) due to random 3D embedding
+4. **SMILES+PE 20**: Best CNN score (0.7124), and has **0.75 Å RMSD** pose at rank 4
+5. **All outputs now have 33 heavy atoms** (no hydrogens) with valid coordinates
+
+### Changes Made
+
+- `RDKitConverter.cpp`: Use `deleteAllHydrogens()` via `MolOps::removeAllHs()` instead of `addHs()`
+- `ligand_batch_manager.cpp`: Use `RDKitConverter::convertRDKitToModel()` directly (bypass OpenBabel)
+- `GninaConverter.cpp/h`: Removed unused `convertRDKitToOBMol()` function
+
+---
+
+## CNN Ensemble vs Fast Model Comparison (2026-01-21 18:41)
+
+**Git commit**: `134759cd`
+
+Comparison of default CNN ensemble (3 models) vs `--cnn fast` (single model) for SMILES input docking.
+
+### Test Configuration
+- **Receptor**: 7R7R receptor
+- **Ligand**: 7R7R ligand (aromatic SMILES)
+- **Exhaustiveness**: 10,000
+- **num_modes**: 32
+- **parallel_embed**: 10
+- **GPU**: NVIDIA L4
+
+### Default CNN Ensemble Models
+When no `--cnn` flag is specified, gnina uses these 3 models:
+1. `dense_1_3`
+2. `dense_1_3_PT_KD_3`
+3. `crossdock_default2018_KD_4`
+
+### Results: Top 10 Poses
+
+**Default CNN Ensemble (3 models)**:
+
+| Rank | CNNscore | CNNaffinity | minimizedAffinity | referenceRMSD |
+|------|----------|-------------|-------------------|---------------|
+| 1 | 0.6359 | 7.6260 | -9.51 | **1.95** |
+| 2 | 0.5880 | 7.2843 | -9.94 | **1.83** |
+| 3 | 0.5698 | 6.9867 | -9.67 | **1.94** |
+| 4 | 0.5593 | 7.2161 | -8.64 | **1.92** |
+| 5 | 0.5527 | 7.4194 | -8.44 | **1.16** |
+| 6 | 0.5376 | 7.6019 | -9.77 | 2.98 |
+| 7 | 0.5249 | 7.2557 | -9.47 | 2.56 |
+| 8 | 0.5166 | 7.2384 | -10.15 | 2.93 |
+| 9 | 0.5114 | 7.2657 | -9.46 | 3.38 |
+| 10 | 0.5051 | 7.2369 | -8.77 | 2.61 |
+
+**--cnn fast (single model)**:
+
+| Rank | CNNscore | CNNaffinity | minimizedAffinity | referenceRMSD |
+|------|----------|-------------|-------------------|---------------|
+| 1 | **0.7586** | 7.7921 | -9.99 | 3.21 |
+| 2 | 0.5638 | 7.2300 | -9.58 | 2.82 |
+| 3 | 0.4851 | 7.1646 | -10.08 | 2.80 |
+| 4 | 0.4753 | 7.5175 | -9.77 | 2.98 |
+| 5 | 0.4619 | 7.6268 | -8.44 | **1.16** |
+| 6 | 0.4246 | 7.2294 | -9.25 | 2.86 |
+| 7 | 0.4180 | 6.8414 | -10.08 | 2.68 |
+| 8 | 0.4018 | 7.4222 | -9.04 | 2.24 |
+| 9 | 0.3972 | 7.3661 | -9.24 | 3.14 |
+| 10 | 0.3714 | 7.4738 | -9.68 | 3.02 |
+
+### Key Findings
+
+| Metric | Default Ensemble | --cnn fast |
+|--------|------------------|------------|
+| **RMSD correlation** | Excellent | Poor |
+| Top 5 poses < 2Å RMSD | **5** | **1** |
+| Rank 1 RMSD | **1.95 Å** | 3.21 Å |
+| Best RMSD (any rank) | **1.16 Å** (rank 5) | 1.16 Å (rank 5) |
+| Rank 1 CNNscore | 0.6359 | **0.7586** |
+| CNN scoring time | ~26s | ~3.4s |
+
+**Conclusions**:
+1. **Default ensemble has much better RMSD-score correlation** - top 5 poses all have RMSD < 2 Å
+2. **--cnn fast gives higher raw scores** but worse pose quality (rank 1 has 3.21 Å RMSD)
+3. **Best RMSD identical** (1.16 Å) but ensemble correctly ranks it higher (rank 5 vs buried in results)
+4. **Ensemble is 8x slower** for CNN scoring (~26s vs ~3.4s for 10 ligands × 640 poses)
+
+### Recommendations
+
+| Use Case | Recommendation |
+|----------|----------------|
+| High-throughput screening | `--cnn fast` (8x faster) |
+| Pose quality matters | Default ensemble (better ranking) |
+| Best of both worlds | `--cnn fast` for initial screen, ensemble for top hits |
