@@ -1,5 +1,6 @@
 # Dockerfile for building gnina from source with our modifications
 # Build the proper way: from top level with all dependencies
+# Rebuild trigger: 2026-01-22
 FROM --platform=linux/amd64 nvidia/cuda:12.2.0-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
