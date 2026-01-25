@@ -1960,6 +1960,22 @@ Thank you!\n";
           throw file_error(lname, true);
         }
       }
+
+      // Check for SMILES files without --gpu flag
+      // SMILES input requires GPU mode for proper 3D coordinate generation
+      if (!settings.gpu) {
+        for (const auto &lname : ligand_names) {
+          std::string ext = boost::filesystem::path(lname).extension().string();
+          if (ext == ".smi" || ext == ".smiles") {
+            throw usage_error(
+                "SMILES input files (.smi, .smiles) require --gpu flag.\n"
+                "Without GPU, GNINA cannot generate 3D coordinates from SMILES.\n"
+                "Please either:\n"
+                "  1. Use --gpu flag to enable GPU-accelerated docking with SMILES\n"
+                "  2. Pre-generate 3D structures and provide SDF/MOL2/PDB files");
+          }
+        }
+      }
     }
 
     if (settings.exhaustiveness < 1)
