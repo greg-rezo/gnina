@@ -38,17 +38,9 @@ struct BFGSResourceInfo {
     size_t per_thread_memory;
 };
 
-// Check GPU properties and report L2 cache info
+// Check GPU properties (no-op, logging removed)
 inline void check_gpu_properties(int verbosity = 1) {
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, 0);
-
-    if (verbosity >= 1) {
-        fprintf(stderr, "INFO: GPU %s\n", prop.name);
-        fprintf(stderr, "INFO:   L2 cache: %zu MB\n", (size_t)(prop.l2CacheSize / (1024 * 1024)));
-        fprintf(stderr, "INFO:   SMs: %d, registers/SM: %d\n",
-                prop.multiProcessorCount, prop.regsPerMultiprocessor);
-    }
+    (void)verbosity;  // unused
 }
 
 // Estimate grid memory from explicit dimensions
@@ -116,15 +108,6 @@ inline void check_optimizer_resources(
     const size_t WARN_THRESHOLD = 20 * 1024;   // 20 KB
     const size_t ERROR_THRESHOLD = 50 * 1024;  // 50 KB
 
-    if (verbosity >= 1) {
-        fprintf(stderr, "INFO: Per-optimizer memory: %.1f KB\n",
-                per_thread_bytes / 1024.0);
-        fprintf(stderr, "INFO:   Hessian: %d floats (%.1f KB)\n",
-                hessian_size, hessian_size * 4.0 / 1024.0);
-        fprintf(stderr, "INFO:   DOF: n_conf=%d, n_change=%d\n",
-                n_conf, n_change);
-    }
-
     // Warnings always appear regardless of verbosity
     if (per_thread_bytes > ERROR_THRESHOLD) {
         fprintf(stderr, "WARNING: Per-optimizer memory (%.1f KB) is very high.\n",
@@ -147,11 +130,7 @@ inline void check_kernel_registers(
     const int TARGET_REGS = 64;
     const int WARN_REGS = 96;   // Drops to 512 threads/SM
     const int ERROR_REGS = 128; // Drops to 256 threads/SM
-
-    if (verbosity >= 1) {
-        fprintf(stderr, "INFO: Kernel '%s' uses %d registers/thread\n",
-                kernel_name, num_regs);
-    }
+    (void)kernel_name;  // unused now
 
     // Warnings always appear regardless of verbosity
     if (num_regs > ERROR_REGS) {
@@ -193,15 +172,11 @@ inline void check_bfgs_resources(
     int verbosity = 0
 ) {
     if (verbosity >= 1) {
-        fprintf(stderr, "=== BFGS GPU Diagnostics ===\n");
         check_gpu_properties(verbosity);
     }
     check_optimizer_resources(n_conf, n_change, num_atoms, num_nodes, verbosity);
     if (grid_memory_bytes > 0) {
         warn_grid_l2_fit(grid_memory_bytes, verbosity);
-    }
-    if (verbosity >= 1) {
-        fprintf(stderr, "============================\n");
     }
 }
 

@@ -452,16 +452,6 @@ void model::initialize_gpu() {
       definitelyPinnedMemcpy(gdata.atom_coords, &acoords[0],
           sizeof(vec) * atoms.size(), cudaMemcpyHostToDevice));
 
-  // Debug: check if coords[i] 4th float (charge) matches atoms[i].charge
-  std::cout << "GPU upload - First 5 coords 'charge' values: [";
-  for (size_t i = 0; i < std::min((size_t)5, coords.size()); i++) {
-    if (i > 0) std::cout << ",";
-    // Reinterpret vec as float[4] to access the 4th element (pad[0])
-    const float* f = reinterpret_cast<const float*>(&coords[i]);
-    std::cout << f[3];
-  }
-  std::cout << "]\n";
-
   CUDA_CHECK_GNINA(
       definitelyPinnedMemcpy(gdata.coords, &coords[0],
           coords.size() * sizeof(atom_params), cudaMemcpyHostToDevice));

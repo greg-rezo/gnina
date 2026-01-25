@@ -1255,46 +1255,9 @@ __global__ void bfgs_parallel_kernel(
     // Initial energy and gradient
     set_conf_single_thread(ctx, state.x, state.coords, node_origins, node_orientations, node_axes);
 
-    // Debug: log centroid of actual atom coords for first optimizer
-    if (tid == 0) {
-        float cx = 0, cy = 0, cz = 0;
-        for (int a = 0; a < ctx.num_atoms; a++) {
-            cx += state.coords[a * 3 + 0];
-            cy += state.coords[a * 3 + 1];
-            cz += state.coords[a * 3 + 2];
-        }
-        cx /= ctx.num_atoms;
-        cy /= ctx.num_atoms;
-        cz /= ctx.num_atoms;
-        printf("BFGS tid=0: Initial atom coords centroid: (%.2f, %.2f, %.2f) [%d atoms]\n",
-               cx, cy, cz, ctx.num_atoms);
-        printf("BFGS tid=0: conf position: (%.2f, %.2f, %.2f), quat: (%.3f, %.3f, %.3f, %.3f)\n",
-               state.x[0], state.x[1], state.x[2], state.x[3], state.x[4], state.x[5], state.x[6]);
-        printf("BFGS tid=0: torsions (%d): ", ctx.num_nodes - ctx.nlig_roots);
-        for (int t = ctx.nlig_roots; t < ctx.num_nodes && t < ctx.nlig_roots + 7; t++) {
-            printf("%.2f ", state.x[t + 6 * ctx.nlig_roots]);
-        }
-        printf("\n");
-        // Print first 5 atom coords with high precision
-        printf("BFGS tid=0: First 5 atom coords (high prec):\n");
-        for (int a = 0; a < 5 && a < ctx.num_atoms; a++) {
-            printf("  atom %d: (%.10f, %.10f, %.10f) type=%u\n", a,
-                   state.coords[a*3], state.coords[a*3+1], state.coords[a*3+2],
-                   ctx.atom_types[a]);
-        }
-        // Print grid info
-        printf("BFGS tid=0: Grid info: ngrids=%d, bounds=(%.6f,%.6f,%.6f)-(%.6f,%.6f,%.6f)\n",
-               ctx.ngrids, ctx.gridbegins.x, ctx.gridbegins.y, ctx.gridbegins.z,
-               ctx.gridends.x, ctx.gridends.y, ctx.gridends.z);
-    }
-
     float inter_e = eval_intermolecular_energy(ctx, state.coords, state.forces);
     float intra_e = eval_intramolecular_single_thread(ctx, state.coords, state.forces);
     state.energy = inter_e + intra_e;
-    // Debug: always print initial energy for tid=0
-    if (tid == 0) {
-        printf("BFGS tid=0: Initial energy: inter=%.4f, intra=%.4f, total=%.4f\n", inter_e, intra_e, state.energy);
-    }
 #ifdef BFGS_DEBUG
     if (tid == 0) {
         printf("GPU: eval_energy: inter=%f, intra=%f, total=%f\n", inter_e, intra_e, state.energy);
@@ -1569,24 +1532,12 @@ void launch_parallel_bfgs(
     unsigned int random_seed,
     int verbosity
 ) {
-    // Check and configure CUDA stack size
-    // Each thread needs ~8KB for local arrays (node_origins, node_orientations, node_axes)
-    // in both the main kernel and line_search function
+    // Configure CUDA stack size - each thread needs ~8KB for local arrays
     size_t currentStackSize;
     cudaDeviceGetLimit(&currentStackSize, cudaLimitStackSize);
-
     const size_t requiredStackSize = 16384;  // 16KB per thread
     if (currentStackSize < requiredStackSize) {
-        if (verbosity >= 1) {
-            fprintf(stderr, "INFO: Increasing CUDA stack size from %zu to %zu bytes/thread\n",
-                    currentStackSize, requiredStackSize);
-        }
-        cudaError_t err = cudaDeviceSetLimit(cudaLimitStackSize, requiredStackSize);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "WARNING: Failed to set CUDA stack size: %s\n", cudaGetErrorString(err));
-        }
-    } else if (verbosity >= 1) {
-        fprintf(stderr, "INFO: CUDA stack size: %zu bytes/thread (sufficient)\n", currentStackSize);
+        cudaDeviceSetLimit(cudaLimitStackSize, requiredStackSize);
     }
 
     // Run diagnostics - warnings always appear, INFO only with verbosity >= 1
@@ -1632,18 +1583,6 @@ void launch_parallel_bfgs(
         random_seed
     );
     CUDA_CHECK_GNINA(cudaDeviceSynchronize());
-
-    // Log first few random initial positions to verify they're in the box
-    if (verbosity >= 1) {
-        std::vector<float> first_confs(std::min(3, batch.total_optimizers) * mem.max_conf_size);
-        CUDA_CHECK_GNINA(cudaMemcpy(first_confs.data(), d_initial_confs,
-            first_confs.size() * sizeof(float), cudaMemcpyDeviceToHost));
-        printf("Random initial positions (first 3 optimizers):\n");
-        for (int i = 0; i < std::min(3, batch.total_optimizers); i++) {
-            float* conf = &first_confs[i * mem.max_conf_size];
-            printf("  Optimizer %d: position=(%.2f, %.2f, %.2f)\n", i, conf[0], conf[1], conf[2]);
-        }
-    }
 
     // Sort poses spatially for better L1 cache locality
     // Adjacent threads will process spatially-nearby poses, improving grid cache reuse

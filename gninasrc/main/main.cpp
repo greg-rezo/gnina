@@ -2141,8 +2141,14 @@ Thank you!\n";
     // them in batches of ~50k poses.
     if (settings.gpu && !settings.no_batch && !settings.score_only && !settings.local_only) {
       boost::timer::cpu_timer time;
+      boost::timer::cpu_timer phase_time;
+      double time_cuda_init = 0, time_ligand_load = 0, time_ref_data = 0;
+      double time_grid_cache = 0, time_cnn_load = 0, time_bfgs_total = 0;
+
+      phase_time.start();
       initializeCUDA(settings.device);
       thread_buffer.init(available_mem(settings.cpu));
+      time_cuda_init = phase_time.elapsed().wall / 1e9;
 
       log << "Using GPU batch docking mode\n";
       log << "  Exhaustiveness: " << settings.exhaustiveness << "\n";
@@ -2173,6 +2179,7 @@ Thank you!\n";
       size_t num_loaded;
       // Use parallel RDKit 3D generation for SMILES-only input (faster)
       // unless --no_rdkit_smiles is set (for debugging)
+      phase_time.start();
       if (all_smiles && !settings.no_rdkit_smiles) {
         log << "Using parallel RDKit 3D generation for SMILES input\n";
         num_loaded = batch_mgr.load_smiles_parallel(mols, ligand_names, log, 0, settings.verbosity);
@@ -2186,9 +2193,11 @@ Thank you!\n";
 
       // Sort and group into batches
       batch_mgr.sort_and_group_ligands(settings.verbosity);
+      time_ligand_load = phase_time.elapsed().wall / 1e9;
 
       // Create reference data for each ligand (for computing referenceRMSD in output)
       // Must be done before any processing modifies the coordinates
+      phase_time.start();
       std::map<unsigned int, reference_data> ligand_ref_data;
       for (const auto& lig : batch_mgr.all_ligands) {
         const model& m = *lig.m;
@@ -2228,6 +2237,7 @@ Thank you!\n";
           }
         }
       }
+      time_ref_data = phase_time.elapsed().wall / 1e9;
 
       // Setup precalculate for GPU
       precalculate_gpu* prec_gpu = dynamic_cast<precalculate_gpu*>(prec.get());
@@ -2255,6 +2265,7 @@ Thank you!\n";
       bool use_cnn = (cnnopts.cnn_scoring != CNNnone);
 
       // Load CNN model
+      phase_time.start();
       std::shared_ptr<DLScorer> dl_scorer;
       if (use_cnn) {
         if (torchgpu) {
@@ -2263,14 +2274,24 @@ Thank you!\n";
           dl_scorer = std::make_shared<CNNTorchScorer<false>>(cnnopts, &log);
         }
       }
+      time_cnn_load = phase_time.elapsed().wall / 1e9;
 
       // BFGS optimization
+      phase_time.start();
       {
         // Create cache_gpu ONCE and populate with all atom types
+        boost::timer::cpu_timer grid_timer;
         cache_gpu cgpu("scoring_function_version001", gd, 1000 /*slope*/, prec_gpu);
         cgpu.set_forcecap(settings.forcecap);
         cgpu.populate(*(batch_mgr.all_ligands[0].m), *prec, all_atom_types, user_grid);
-        log << "Grid cache populated with " << all_atom_types.size() << " atom types\n";
+        time_grid_cache = grid_timer.elapsed().wall / 1e9;
+
+        // Log grid dimensions
+        size_t grid_points = (gd[0].n + 1) * (gd[1].n + 1) * (gd[2].n + 1);
+        log << "Grid dimensions: " << (gd[0].n + 1) << " x " << (gd[1].n + 1) << " x " << (gd[2].n + 1)
+            << " = " << (grid_points / 1e6) << "M points\n";
+        log << "Box size: " << gd[0].span() << " x " << gd[1].span() << " x " << gd[2].span() << " Angstroms\n";
+        log << "Grid cache populated with " << all_atom_types.size() << " atom types in " << time_grid_cache << "s\n";
         log.endl();
 
         // Process each batch
@@ -2288,6 +2309,7 @@ Thank you!\n";
         }
         // cgpu destructor called here, freeing grid memory
       }
+      time_bfgs_total = phase_time.elapsed().wall / 1e9;
 
       // Free BFGS GPU memory before CNN scoring
       cudaDeviceSynchronize();
@@ -2314,6 +2336,7 @@ Thank you!\n";
 
       // ========================================================================
       // Phase 1: Validate poses and compute coordinates for all ligands
+      // For multi-conformer mode, pool poses by parent BEFORE trimming
       // ========================================================================
       struct LigandData {
         output_container out_cont;
@@ -2322,74 +2345,169 @@ Thank you!\n";
       std::vector<LigandData> all_ligand_data;
       all_ligand_data.reserve(batch_mgr.all_ligands.size());
 
+      // Check if we have multi-conformer ligands
+      bool has_multi_conformer = false;
       for (size_t lig_idx = 0; lig_idx < batch_mgr.all_ligands.size(); lig_idx++) {
-        LigandDescriptor& lig = batch_mgr.all_ligands[lig_idx];
-        model& m = *lig.m;
-
-        // Skip if no results
-        if (lig.energies.empty()) continue;
-
-        // Convert GPU results to output_container
-        output_container out_cont;
-        conf init_conf = m.get_initial_conf(false);
-
-        phase_timer.start();
-        for (size_t i = 0; i < lig.energies.size(); i++) {
-          float e = lig.energies[i];
-          const std::vector<float>& conformation = lig.conformations[i];
-
-          if (e >= 1e10 || !std::isfinite(e) || conformation.size() < 7) continue;
-
-          // Validate conformation
-          bool valid = true;
-          for (size_t j = 0; j < conformation.size() && valid; j++) {
-            if (!std::isfinite(conformation[j])) valid = false;
-          }
-          if (!valid) continue;
-
-          // Check bounds
-          float margin = 100.0f;
-          if (conformation[0] < box_min.x - margin || conformation[0] > box_max.x + margin ||
-              conformation[1] < box_min.y - margin || conformation[1] > box_max.y + margin ||
-              conformation[2] < box_min.z - margin || conformation[2] > box_max.z + margin) {
-            continue;
-          }
-
-          // Create conf from GPU result
-          conf c = init_conf;
-          if (c.ligands.empty()) continue;
-
-          c.ligands[0].rigid.position[0] = conformation[0];
-          c.ligands[0].rigid.position[1] = conformation[1];
-          c.ligands[0].rigid.position[2] = conformation[2];
-          c.ligands[0].rigid.orientation = qt(conformation[3], conformation[4],
-                                               conformation[5], conformation[6]);
-          for (size_t t = 0; t < c.ligands[0].torsions.size() && (t + 7) < conformation.size(); t++) {
-            c.ligands[0].torsions[t] = conformation[t + 7];
-          }
-
-          output_type out(c, e);
-          out_cont.push_back(new output_type(out));
+        if (batch_mgr.all_ligands[lig_idx].parent_ligand_id >= 0) {
+          has_multi_conformer = true;
+          break;
         }
-        time_pose_validation += phase_timer.elapsed().wall / 1e9;
+      }
 
-        // Sort by energy and limit to top poses BEFORE expensive model.set() calls
-        out_cont.sort();
-        sz max_to_refine = settings.num_modes * settings.cnn_refine_mult;
-        while (out_cont.size() > max_to_refine) {
-          out_cont.pop_back();
+      sz max_to_refine = settings.num_modes * settings.cnn_refine_mult;
+
+      if (has_multi_conformer) {
+        // Multi-conformer mode: pool poses by parent_ligand_id, then trim
+        struct PoseData {
+          output_type* pose;
+          size_t ligand_idx;
+        };
+        std::map<int, std::vector<PoseData>> parent_poses;
+
+        // Collect all valid poses grouped by parent
+        for (size_t lig_idx = 0; lig_idx < batch_mgr.all_ligands.size(); lig_idx++) {
+          LigandDescriptor& lig = batch_mgr.all_ligands[lig_idx];
+          model& m = *lig.m;
+          if (lig.energies.empty()) continue;
+
+          int parent_id = lig.parent_ligand_id;
+          if (parent_id < 0) parent_id = lig.ligand_id;
+
+          conf init_conf = m.get_initial_conf(false);
+
+          phase_timer.start();
+          for (size_t i = 0; i < lig.energies.size(); i++) {
+            float e = lig.energies[i];
+            const std::vector<float>& conformation = lig.conformations[i];
+
+            if (e >= 1e10 || !std::isfinite(e) || conformation.size() < 7) continue;
+
+            bool valid = true;
+            for (size_t j = 0; j < conformation.size() && valid; j++) {
+              if (!std::isfinite(conformation[j])) valid = false;
+            }
+            if (!valid) continue;
+
+            float margin = 100.0f;
+            if (conformation[0] < box_min.x - margin || conformation[0] > box_max.x + margin ||
+                conformation[1] < box_min.y - margin || conformation[1] > box_max.y + margin ||
+                conformation[2] < box_min.z - margin || conformation[2] > box_max.z + margin) {
+              continue;
+            }
+
+            conf c = init_conf;
+            if (c.ligands.empty()) continue;
+
+            c.ligands[0].rigid.position[0] = conformation[0];
+            c.ligands[0].rigid.position[1] = conformation[1];
+            c.ligands[0].rigid.position[2] = conformation[2];
+            c.ligands[0].rigid.orientation = qt(conformation[3], conformation[4],
+                                                 conformation[5], conformation[6]);
+            for (size_t t = 0; t < c.ligands[0].torsions.size() && (t + 7) < conformation.size(); t++) {
+              c.ligands[0].torsions[t] = conformation[t + 7];
+            }
+
+            output_type* out = new output_type(c, e);
+            parent_poses[parent_id].push_back({out, lig_idx});
+          }
+          time_pose_validation += phase_timer.elapsed().wall / 1e9;
         }
 
-        // Now compute coordinates only for the top poses (needed for RMSD clustering)
-        phase_timer.start();
-        VINA_FOR_IN(i, out_cont) {
-          m.set(out_cont[i].c);
-          out_cont[i].coords = m.get_heavy_atom_movable_coords();
-        }
-        time_model_set += phase_timer.elapsed().wall / 1e9;
+        // For each parent: sort by energy, trim to max_to_refine, compute coords
+        for (auto& [parent_id, poses] : parent_poses) {
+          // Sort by energy (lower is better)
+          std::sort(poses.begin(), poses.end(),
+            [](const PoseData& a, const PoseData& b) {
+              return a.pose->e < b.pose->e;
+            });
 
-        if (!out_cont.empty()) {
-          all_ligand_data.push_back({std::move(out_cont), lig_idx});
+          // Trim to max_to_refine total across all conformers of this parent
+          while (poses.size() > max_to_refine) {
+            delete poses.back().pose;
+            poses.pop_back();
+          }
+
+          // Compute coords and distribute to per-ligand containers
+          std::map<size_t, output_container> ligand_poses;
+          phase_timer.start();
+          for (PoseData& pd : poses) {
+            model& m = *batch_mgr.all_ligands[pd.ligand_idx].m;
+            m.set(pd.pose->c);
+            pd.pose->coords = m.get_heavy_atom_movable_coords();
+            ligand_poses[pd.ligand_idx].push_back(pd.pose);
+          }
+          time_model_set += phase_timer.elapsed().wall / 1e9;
+
+          // Add to all_ligand_data
+          for (auto& [lig_idx, out_cont] : ligand_poses) {
+            if (!out_cont.empty()) {
+              all_ligand_data.push_back({std::move(out_cont), lig_idx});
+            }
+          }
+        }
+      } else {
+        // Single-conformer mode: trim per ligand as before
+        for (size_t lig_idx = 0; lig_idx < batch_mgr.all_ligands.size(); lig_idx++) {
+          LigandDescriptor& lig = batch_mgr.all_ligands[lig_idx];
+          model& m = *lig.m;
+
+          if (lig.energies.empty()) continue;
+
+          output_container out_cont;
+          conf init_conf = m.get_initial_conf(false);
+
+          phase_timer.start();
+          for (size_t i = 0; i < lig.energies.size(); i++) {
+            float e = lig.energies[i];
+            const std::vector<float>& conformation = lig.conformations[i];
+
+            if (e >= 1e10 || !std::isfinite(e) || conformation.size() < 7) continue;
+
+            bool valid = true;
+            for (size_t j = 0; j < conformation.size() && valid; j++) {
+              if (!std::isfinite(conformation[j])) valid = false;
+            }
+            if (!valid) continue;
+
+            float margin = 100.0f;
+            if (conformation[0] < box_min.x - margin || conformation[0] > box_max.x + margin ||
+                conformation[1] < box_min.y - margin || conformation[1] > box_max.y + margin ||
+                conformation[2] < box_min.z - margin || conformation[2] > box_max.z + margin) {
+              continue;
+            }
+
+            conf c = init_conf;
+            if (c.ligands.empty()) continue;
+
+            c.ligands[0].rigid.position[0] = conformation[0];
+            c.ligands[0].rigid.position[1] = conformation[1];
+            c.ligands[0].rigid.position[2] = conformation[2];
+            c.ligands[0].rigid.orientation = qt(conformation[3], conformation[4],
+                                                 conformation[5], conformation[6]);
+            for (size_t t = 0; t < c.ligands[0].torsions.size() && (t + 7) < conformation.size(); t++) {
+              c.ligands[0].torsions[t] = conformation[t + 7];
+            }
+
+            output_type out(c, e);
+            out_cont.push_back(new output_type(out));
+          }
+          time_pose_validation += phase_timer.elapsed().wall / 1e9;
+
+          out_cont.sort();
+          while (out_cont.size() > max_to_refine) {
+            out_cont.pop_back();
+          }
+
+          phase_timer.start();
+          VINA_FOR_IN(i, out_cont) {
+            m.set(out_cont[i].c);
+            out_cont[i].coords = m.get_heavy_atom_movable_coords();
+          }
+          time_model_set += phase_timer.elapsed().wall / 1e9;
+
+          if (!out_cont.empty()) {
+            all_ligand_data.push_back({std::move(out_cont), lig_idx});
+          }
         }
       }
 
@@ -2528,15 +2646,7 @@ Thank you!\n";
         }
       };
 
-      // Check if we have multi-conformer ligands to aggregate
-      bool has_multi_conformer = false;
-      for (const LigandData& ld : all_ligand_data) {
-        if (batch_mgr.all_ligands[ld.ligand_idx].parent_ligand_id >= 0) {
-          has_multi_conformer = true;
-          break;
-        }
-      }
-
+      // Use has_multi_conformer from Phase 1 to decide aggregation
       if (has_multi_conformer) {
         // Group poses by parent_ligand_id
         // Pose with source model reference
@@ -2553,12 +2663,8 @@ Thank you!\n";
           int parent_id = lig.parent_ligand_id;
           if (parent_id < 0) parent_id = lig.ligand_id;  // No parent, use self
 
-          // Get parent name (strip _confN suffix if present)
+          // Get parent name (all conformers share the same name now)
           std::string parent_name = lig.name;
-          size_t conf_pos = parent_name.rfind("_conf");
-          if (conf_pos != std::string::npos) {
-            parent_name = parent_name.substr(0, conf_pos);
-          }
 
           for (sz i = 0; i < ld.out_cont.size(); i++) {
             parent_poses[parent_id].push_back({&ld.out_cont[i], lig.m.get(), parent_name, lig.ligand_id});
@@ -2627,7 +2733,7 @@ Thank you!\n";
             results.push_back(result_info(p.pose->e, p.pose->cnnscore,
                                           p.pose->cnnaffinity, p.pose->cnnvariance,
                                           -1, refrmsd, *p.source_model));
-            // Override name with parent name (strip _confN suffix)
+            // Use parent name for output (all conformers share the same name)
             results.back().setName(p.parent_name);
             if (atomoutfile.is_open() || settings.include_atom_info) {
               results.back().setAtomValues(*p.source_model, &wt);
@@ -2717,8 +2823,20 @@ Thank you!\n";
       }
 
       // Print post-processing timing breakdown
+      log << "\nSetup timing breakdown:\n";
+      log << std::fixed << std::setprecision(2);
+      log << "  CUDA initialization:               " << time_cuda_init << "s\n";
+      log << "  Ligand loading (3D gen + sorting): " << time_ligand_load << "s\n";
+      log << "  Reference data creation:           " << time_ref_data << "s\n";
+      log << "  CNN model loading:                 " << time_cnn_load << "s\n";
+      log << "  Grid cache population:             " << time_grid_cache << "s\n";
+      log << "  BFGS optimization (total):         " << time_bfgs_total << "s\n";
+      double total_setup = time_cuda_init + time_ligand_load + time_ref_data + time_cnn_load + time_bfgs_total;
+      log << "  Total setup + BFGS:                " << total_setup << "s\n";
+      log.endl();
+
       log << "\nPost-processing timing breakdown:\n";
-      log << "  Pose validation (incl. model.set): " << std::fixed << std::setprecision(2) << time_pose_validation << "s\n";
+      log << "  Pose validation (incl. model.set): " << time_pose_validation << "s\n";
       log << "    - model.set() calls:             " << time_model_set << "s\n";
       log << "  CNN scoring:                       " << time_cnn_scoring << "s\n";
       log << "  RMSD clustering:                   " << time_rmsd_clustering << "s\n";

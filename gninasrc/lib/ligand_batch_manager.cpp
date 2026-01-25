@@ -711,10 +711,8 @@ size_t LigandBatchManager::load_smiles_parallel(
                     }
                 }
 
+                // Use original name without conformer suffix - all conformers represent same molecule
                 std::string conf_name = entry.name;
-                if (parallel_embed > 1 && num_confs > 1) {
-                    conf_name += "_conf" + std::to_string(cid);
-                }
 
                 // Convert RDKit mol directly to gnina model (no OpenBabel)
                 // This removes all hydrogens and preserves coordinates
@@ -934,20 +932,6 @@ void LigandBatchManager::sort_and_group_ligands(int verbosity) {
         current_batch.total_optimizers = saved_total;
         batch_groups.push_back(std::move(current_batch));
     }
-
-    if (verbosity >= 1) {
-        std::cerr << "Created " << batch_groups.size() << " batch groups:\n";
-        for (size_t i = 0; i < batch_groups.size(); i++) {
-            const auto& batch = batch_groups[i];
-            std::cerr << "  Batch " << i << ": "
-                      << batch.ligand_indices.size() << " ligands, "
-                      << batch.total_optimizers << " poses, "
-                      << "max_atoms=" << batch.max_atoms
-                      << ", max_torsions=" << batch.max_torsions
-                      << ", est_mem=" << std::fixed << std::setprecision(1)
-                      << (float)batch.estimate_memory() / (1024 * 1024) << " MB\n";
-        }
-    }
 }
 
 void LigandBatchManager::process_batch(
@@ -1062,124 +1046,6 @@ void LigandBatchManager::process_batch(
                          group.max_atoms, group.max_nodes);
 
     CUDA_CHECK_GNINA(cudaEventRecord(end_setup));
-
-    // Log box and initial ligand centroid for debugging
-    if (verbosity >= 1) {
-        std::cout << "Docking box: min=(" << box_min.x << "," << box_min.y << "," << box_min.z
-                  << ") max=(" << box_max.x << "," << box_max.y << "," << box_max.z << ")\n";
-
-        // Compute and log center of mass for first ligand's reference coordinates
-        if (!group.ligand_indices.empty()) {
-            LigandDescriptor& lig = all_ligands[group.ligand_indices[0]];
-            const atomv& atoms = lig.m->atoms;
-            double cx = 0, cy = 0, cz = 0;
-            int n_heavy = 0;
-            for (size_t i = 0; i < atoms.size(); i++) {
-                if (!atoms[i].is_hydrogen()) {
-                    // atoms[i].coords are the LOCAL/RELATIVE coordinates stored in the model
-                    cx += atoms[i].coords[0];
-                    cy += atoms[i].coords[1];
-                    cz += atoms[i].coords[2];
-                    n_heavy++;
-                }
-            }
-            if (n_heavy > 0) {
-                cx /= n_heavy;
-                cy /= n_heavy;
-                cz /= n_heavy;
-            }
-            std::cout << "First ligand '" << lig.name << "' stored (local) coords centroid: ("
-                      << cx << "," << cy << "," << cz << ") [" << n_heavy << " heavy atoms]\n";
-
-            // Log first 5 atom local coords for debugging
-            std::cout << std::fixed << std::setprecision(6);
-            std::cout << "First 5 atom local coords (heavy atoms only):\n";
-            int count = 0;
-            for (size_t i = 0; i < atoms.size() && count < 5; i++) {
-                if (!atoms[i].is_hydrogen()) {
-                    std::cout << "  atom " << i << " (sm=" << atoms[i].sm
-                              << " Z=" << smina_atom_type::data[atoms[i].sm].anum
-                              << "): (" << atoms[i].coords[0] << ", " << atoms[i].coords[1]
-                              << ", " << atoms[i].coords[2] << ")\n";
-                    count++;
-                }
-            }
-            std::cout << std::defaultfloat;
-
-            // Log ALL atom smina types for debugging
-            std::cout << "All atom smina types: [";
-            for (size_t i = 0; i < atoms.size(); i++) {
-                if (i > 0) std::cout << ",";
-                std::cout << atoms[i].sm;
-            }
-            std::cout << "]\n";
-
-            // Log ALL atom charges for debugging
-            std::cout << std::fixed << std::setprecision(4);
-            std::cout << "All atom charges: [";
-            for (size_t i = 0; i < atoms.size(); i++) {
-                if (i > 0) std::cout << ",";
-                std::cout << atoms[i].charge;
-            }
-            std::cout << "]\n";
-            std::cout << std::defaultfloat;
-
-            // Log number of intramolecular pairs
-            if (!lig.m->ligands.empty()) {
-                std::cout << "Intramolecular pairs: " << lig.m->ligands[0].pairs.size() << "\n";
-                // Log first 5 pairs
-                const auto& pairs = lig.m->ligands[0].pairs;
-                std::cout << "First 5 pairs (a,b,t1,t2): ";
-                for (size_t i = 0; i < std::min((size_t)5, pairs.size()); i++) {
-                    if (i > 0) std::cout << " | ";
-                    std::cout << "(" << pairs[i].a << "," << pairs[i].b << "," << pairs[i].t1 << "," << pairs[i].t2 << ")";
-                }
-                std::cout << "\n";
-            }
-
-            // Also log the ligand root origin (absolute position)
-            if (!lig.m->ligands.empty()) {
-                const vec& origin = lig.m->ligands[0].node.get_origin();
-                std::cout << "First ligand root origin (absolute): ("
-                          << origin[0] << "," << origin[1] << "," << origin[2] << ")\n";
-
-                // Log segment structure: which atoms belong to which segment
-                std::cout << "Segment structure (node -> atom range, atomic nums):\n";
-
-                // Helper to print atomic numbers for atom range
-                auto print_segment_atoms = [&atoms](sz begin, sz end) {
-                    std::cout << " [";
-                    for (sz i = begin; i < end && i < atoms.size(); i++) {
-                        if (i > begin) std::cout << ",";
-                        // Get atomic number from smina type
-                        std::cout << smina_atom_type::data[atoms[i].sm].anum;
-                    }
-                    std::cout << "]";
-                };
-
-                // Root segment
-                std::cout << "  Root: atoms [" << lig.m->ligands[0].node.begin
-                          << ", " << lig.m->ligands[0].node.end << ")";
-                print_segment_atoms(lig.m->ligands[0].node.begin, lig.m->ligands[0].node.end);
-                std::cout << "\n";
-
-                // Count torsion segments by traversing children
-                std::function<void(const branch&, int)> print_branch = [&](const branch& b, int depth) {
-                    std::cout << "  Torsion " << depth << ": atoms [" << b.node.begin
-                              << ", " << b.node.end << ")";
-                    print_segment_atoms(b.node.begin, b.node.end);
-                    std::cout << "\n";
-                    for (const auto& child : b.children) {
-                        print_branch(child, depth + 1);
-                    }
-                };
-                int torsion_idx = 0;
-                for (const auto& child : lig.m->ligands[0].children) {
-                    print_branch(child, torsion_idx++);
-                }
-            }
-        }
-    }
 
     // Launch BFGS
     launch_parallel_bfgs(batch, mem, max_iterations, box_min, box_max, seed, verbosity);
